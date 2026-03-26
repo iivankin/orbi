@@ -1,0 +1,7 @@
+- [] Bootstrap modern interactive CLI.
+- [] Implement appleid auth like in EAS spec
+- [] Get compile working
+- [] Implement ad-hoc device management
+- [] Implement management for provisioning profiles, entitelments, certificates like in eas spec. Privkey created locally.
+- [] Implement run/build/submit
+- [] Cleanup

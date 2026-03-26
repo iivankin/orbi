@@ -1,0 +1,46 @@
+{
+  "name": "ExampleIOSApp",
+  "version": "0.1.0",
+  "platform": "apple",
+  "toolchain": {
+    "xcode_version": "26.3"
+  },
+  "platforms": {
+    "ios": {
+      "deployment_target": "18.0",
+      "profiles": {
+        "development": {
+          "configuration": "debug",
+          "distribution": "development"
+        },
+        "internal": {
+          "configuration": "release",
+          "distribution": "ad-hoc"
+        },
+        "release": {
+          "configuration": "release",
+          "distribution": "app-store"
+        }
+      }
+    }
+  },
+  "targets": [
+    {
+      "name": "ExampleIOSApp",
+      "kind": "app",
+      "bundle_id": "dev.orbit.examples.iossim",
+      "sources": [
+        "Sources/ExampleIOSApp"
+      ],
+      "swift_packages": [
+        {
+          "product": "OrbitGreeting",
+          "path": "Packages/OrbitGreeting"
+        }
+      ],
+      "resources": [
+        "Resources"
+      ]
+    }
+  ]
+}

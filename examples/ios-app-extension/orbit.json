@@ -1,0 +1,59 @@
+{
+  "name": "ExampleExtensionApp",
+  "version": "0.1.0",
+  "platform": "apple",
+  "source_roots": [
+    "Sources/Shared"
+  ],
+  "toolchain": {
+    "xcode_version": "26.3"
+  },
+  "platforms": {
+    "ios": {
+      "deployment_target": "18.0",
+      "profiles": {
+        "development": {
+          "configuration": "debug",
+          "distribution": "development"
+        },
+        "internal": {
+          "configuration": "release",
+          "distribution": "ad-hoc"
+        },
+        "release": {
+          "configuration": "release",
+          "distribution": "app-store"
+        }
+      }
+    }
+  },
+  "targets": [
+    {
+      "name": "ExampleExtensionApp",
+      "kind": "app",
+      "bundle_id": "dev.orbit.examples.extensionapp",
+      "sources": [
+        "Sources/App"
+      ],
+      "dependencies": [
+        "TunnelExtension"
+      ]
+    },
+    {
+      "name": "TunnelExtension",
+      "kind": "app-extension",
+      "platforms": [
+        "ios"
+      ],
+      "bundle_id": "dev.orbit.examples.extensionapp.tunnel",
+      "sources": [
+        "Sources/TunnelExtension"
+      ],
+      "entitlements": "TunnelExtension.entitlements",
+      "extension": {
+        "point_identifier": "com.apple.networkextension.packet-tunnel",
+        "principal_class": "PacketTunnelProvider"
+      }
+    }
+  ]
+}
