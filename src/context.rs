@@ -1,0 +1,158 @@
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
+use walkdir::WalkDir;
+
+use crate::manifest::Manifest;
+use crate::util::{ensure_dir, prompt_select, read_json_file_if_exists, resolve_path, write_json_file};
+
+#[derive(Debug, Clone)]
+pub struct AppContext {
+    pub cwd: PathBuf,
+    pub interactive: bool,
+    pub global_paths: GlobalPaths,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProjectContext {
+    pub app: AppContext,
+    pub root: PathBuf,
+    pub manifest_path: PathBuf,
+    pub manifest: Manifest,
+    pub project_paths: ProjectPaths,
+}
+
+#[derive(Debug, Clone)]
+pub struct GlobalPaths {
+    pub data_dir: PathBuf,
+    pub cache_dir: PathBuf,
+    pub auth_state_path: PathBuf,
+    pub device_cache_path: PathBuf,
+    pub signing_state_path: PathBuf,
+    pub keychain_path: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProjectPaths {
+    pub orbit_dir: PathBuf,
+    pub build_dir: PathBuf,
+    pub artifacts_dir: PathBuf,
+    pub receipts_dir: PathBuf,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DeviceCache {
+    pub devices: Vec<crate::apple::device::CachedDevice>,
+}
+
+impl AppContext {
+    pub fn new(non_interactive: bool) -> Result<Self> {
+        let cwd = std::env::current_dir().context("failed to resolve the current working directory")?;
+        let data_dir = dirs::data_local_dir()
+            .context("failed to resolve the user data directory")?
+            .join("orbit");
+        let cache_dir = dirs::cache_dir()
+            .unwrap_or_else(|| data_dir.join("cache"))
+            .join("orbit");
+        let keychain_path = data_dir.join("orbit.keychain-db");
+
+        ensure_dir(&data_dir)?;
+        ensure_dir(&cache_dir)?;
+
+        Ok(Self {
+            cwd,
+            interactive: !non_interactive,
+            global_paths: GlobalPaths {
+                auth_state_path: data_dir.join("auth.json"),
+                device_cache_path: data_dir.join("devices.json"),
+                signing_state_path: data_dir.join("signing.json"),
+                data_dir,
+                cache_dir,
+                keychain_path,
+            },
+        })
+    }
+
+    pub fn load_project(&self, requested_manifest: Option<&Path>) -> Result<ProjectContext> {
+        let manifest_path = self.resolve_manifest_path(requested_manifest)?;
+        let manifest_path = manifest_path
+            .canonicalize()
+            .with_context(|| format!("failed to canonicalize {}", manifest_path.display()))?;
+        let root = manifest_path
+            .parent()
+            .context("manifest path did not contain a parent directory")?
+            .to_path_buf();
+        let manifest = Manifest::load(&manifest_path)?;
+        let orbit_dir = root.join(".orbit");
+        let build_dir = orbit_dir.join("build");
+        let artifacts_dir = orbit_dir.join("artifacts");
+        let receipts_dir = orbit_dir.join("receipts");
+
+        ensure_dir(&orbit_dir)?;
+        ensure_dir(&build_dir)?;
+        ensure_dir(&artifacts_dir)?;
+        ensure_dir(&receipts_dir)?;
+
+        Ok(ProjectContext {
+            app: self.clone(),
+            root,
+            manifest_path,
+            manifest,
+            project_paths: ProjectPaths {
+                orbit_dir,
+                build_dir,
+                artifacts_dir,
+                receipts_dir,
+            },
+        })
+    }
+
+    pub fn read_device_cache(&self) -> Result<DeviceCache> {
+        Ok(read_json_file_if_exists(&self.global_paths.device_cache_path)?.unwrap_or_default())
+    }
+
+    pub fn write_device_cache(&self, cache: &DeviceCache) -> Result<()> {
+        write_json_file(&self.global_paths.device_cache_path, cache)
+    }
+
+    fn resolve_manifest_path(&self, requested_manifest: Option<&Path>) -> Result<PathBuf> {
+        if let Some(manifest) = requested_manifest {
+            return Ok(resolve_path(&self.cwd, manifest));
+        }
+
+        let direct_manifest = self.cwd.join("orbit.json");
+        if direct_manifest.exists() {
+            return Ok(direct_manifest);
+        }
+
+        let mut manifests = Vec::new();
+        for entry in WalkDir::new(&self.cwd).max_depth(4) {
+            let entry = entry?;
+            if entry.file_type().is_file() && entry.file_name() == "orbit.json" {
+                manifests.push(entry.into_path());
+            }
+        }
+        manifests.sort();
+
+        match manifests.len() {
+            0 => bail!(
+                "could not find `orbit.json` under {}; pass --manifest explicitly",
+                self.cwd.display()
+            ),
+            1 => Ok(manifests.remove(0)),
+            _ if !self.interactive => bail!(
+                "found multiple manifests under {}; pass --manifest explicitly",
+                self.cwd.display()
+            ),
+            _ => {
+                let display = manifests
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>();
+                let index = prompt_select("Select a manifest", &display)?;
+                Ok(manifests.remove(index))
+            }
+        }
+    }
+}
