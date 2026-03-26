@@ -5,17 +5,26 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.102"
+apple_srp_client = "0.1.0"
 base64 = "0.22.1"
 clap = { version = "4.6.0", features = ["derive"] }
+cookie_store = "0.22.1"
 dialoguer = "0.12.0"
 dirs = "6.0.0"
+getrandom = "0.3.4"
 globset = "0.4.18"
+indicatif = "=0.17.11"
 jsonwebtoken = { version = "10.3.0", default-features = false, features = ["use_pem"] }
+pbkdf2 = "0.12.2"
 plist = "1.8.0"
-reqwest = { version = "0.13.2", default-features = false, features = ["blocking", "json", "rustls"] }
+reqwest = { version = "0.13.2", default-features = false, features = ["blocking", "brotli", "cookies", "deflate", "gzip", "json", "rustls", "zstd"] }
+reqwest_cookie_store = { version = "0.10.0", features = ["serde"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
+sha1 = "0.10.6"
+sha2 = "0.10.9"
 tempfile = "3.27.0"
 thiserror = "2.0.18"
+time = { version = "0.3.44", features = ["formatting"] }
 uuid = { version = "1.22.0", features = ["v4"] }
 walkdir = "2.5.0"

@@ -5,7 +5,9 @@ use serde::{Deserialize, Serialize};
 use walkdir::WalkDir;
 
 use crate::manifest::Manifest;
-use crate::util::{ensure_dir, prompt_select, read_json_file_if_exists, resolve_path, write_json_file};
+use crate::util::{
+    ensure_dir, prompt_select, read_json_file_if_exists, resolve_path, write_json_file,
+};
 
 #[derive(Debug, Clone)]
 pub struct AppContext {
@@ -48,7 +50,8 @@ pub struct DeviceCache {
 
 impl AppContext {
     pub fn new(non_interactive: bool) -> Result<Self> {
-        let cwd = std::env::current_dir().context("failed to resolve the current working directory")?;
+        let cwd =
+            std::env::current_dir().context("failed to resolve the current working directory")?;
         let data_dir = dirs::data_local_dir()
             .context("failed to resolve the user data directory")?
             .join("orbit");

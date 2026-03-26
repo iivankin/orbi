@@ -7,7 +7,9 @@ use serde_json::Value;
 
 use crate::apple::asc_api::{AscClient, DeviceAttributes, Resource};
 use crate::apple::auth::resolve_api_key_auth;
-use crate::cli::{DevicePlatform, ImportDevicesArgs, ListDevicesArgs, RegisterDeviceArgs, RemoveDeviceArgs};
+use crate::cli::{
+    DevicePlatform, ImportDevicesArgs, ListDevicesArgs, RegisterDeviceArgs, RemoveDeviceArgs,
+};
 use crate::context::{AppContext, DeviceCache};
 use crate::util::prompt_input;
 
@@ -66,13 +68,19 @@ pub fn register_device(app: &AppContext, args: &RegisterDeviceArgs) -> Result<()
     if let Some(existing) = client.find_device_by_udid(&imported.udid)? {
         println!(
             "reused\t{}\t{}\t{}\t{}",
-            existing.id, existing.attributes.platform, existing.attributes.udid, existing.attributes.name
+            existing.id,
+            existing.attributes.platform,
+            existing.attributes.udid,
+            existing.attributes.name
         );
     } else {
         let created = client.create_device(&imported.name, &imported.udid, &imported.platform)?;
         println!(
             "created\t{}\t{}\t{}\t{}",
-            created.id, created.attributes.platform, created.attributes.udid, created.attributes.name
+            created.id,
+            created.attributes.platform,
+            created.attributes.udid,
+            created.attributes.name
         );
     }
 
@@ -84,7 +92,9 @@ pub fn import_devices(app: &AppContext, args: &ImportDevicesArgs) -> Result<()> 
     let client = asc_client(app)?;
     let file = match &args.file {
         Some(file) => file.clone(),
-        None if app.interactive => PathBuf::from(prompt_input("Path to JSON or CSV device list", None)?),
+        None if app.interactive => {
+            PathBuf::from(prompt_input("Path to JSON or CSV device list", None)?)
+        }
         None => bail!("--file is required in non-interactive mode"),
     };
 
@@ -94,7 +104,10 @@ pub fn import_devices(app: &AppContext, args: &ImportDevicesArgs) -> Result<()> 
             let created = client.create_device(&device.name, &device.udid, &device.platform)?;
             println!(
                 "created\t{}\t{}\t{}\t{}",
-                created.id, created.attributes.platform, created.attributes.udid, created.attributes.name
+                created.id,
+                created.attributes.platform,
+                created.attributes.udid,
+                created.attributes.name
             );
         }
     }
@@ -135,8 +148,8 @@ pub fn refresh_cache(app: &AppContext) -> Result<DeviceCache> {
 }
 
 fn load_import_file(path: &Path) -> Result<Vec<ImportedDevice>> {
-    let contents = fs::read_to_string(path)
-        .with_context(|| format!("failed to read {}", path.display()))?;
+    let contents =
+        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
     if path.extension().and_then(|value| value.to_str()) == Some("json") {
         if let Ok(items) = serde_json::from_str::<Vec<ImportedDevice>>(&contents) {
             return Ok(items);
@@ -168,8 +181,7 @@ fn load_import_file(path: &Path) -> Result<Vec<ImportedDevice>> {
 
 fn current_machine_device(platform: DevicePlatform) -> Result<ImportedDevice> {
     let output = crate::util::command_output(
-        std::process::Command::new("system_profiler")
-            .args(["-json", "SPHardwareDataType"]),
+        std::process::Command::new("system_profiler").args(["-json", "SPHardwareDataType"]),
     )?;
     let value: Value = serde_json::from_str(&output)?;
     let entry = value
@@ -194,7 +206,7 @@ fn current_machine_device(platform: DevicePlatform) -> Result<ImportedDevice> {
 
 fn asc_client(app: &AppContext) -> Result<AscClient> {
     let auth = resolve_api_key_auth(app)?
-        .context("device management requires App Store Connect API key auth; run `orbit apple auth login --mode api-key`")?;
+        .context("device management requires App Store Connect API key auth; set ORBIT_ASC_API_KEY_PATH, ORBIT_ASC_KEY_ID, and ORBIT_ASC_ISSUER_ID")?;
     AscClient::new(auth)
 }
 
@@ -204,7 +216,10 @@ fn cached_device_from_resource(resource: Resource<DeviceAttributes>) -> CachedDe
         name: resource.attributes.name,
         udid: resource.attributes.udid,
         platform: resource.attributes.platform,
-        status: resource.attributes.status.unwrap_or_else(|| "UNKNOWN".to_owned()),
+        status: resource
+            .attributes
+            .status
+            .unwrap_or_else(|| "UNKNOWN".to_owned()),
     }
 }
 

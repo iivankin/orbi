@@ -10,6 +10,8 @@ pub struct Manifest {
     pub name: String,
     pub version: String,
     pub platform: String,
+    pub team_id: Option<String>,
+    pub provider_id: Option<String>,
     #[serde(default)]
     pub source_roots: Vec<PathBuf>,
     #[serde(default)]
@@ -71,7 +73,9 @@ impl DistributionKind {
     pub fn supports_submit(self) -> bool {
         matches!(
             self,
-            DistributionKind::AppStore | DistributionKind::DeveloperId | DistributionKind::MacAppStore
+            DistributionKind::AppStore
+                | DistributionKind::DeveloperId
+                | DistributionKind::MacAppStore
         )
     }
 }
@@ -131,7 +135,10 @@ impl TargetKind {
     }
 
     pub fn is_bundle(self) -> bool {
-        !matches!(self, TargetKind::StaticLibrary | TargetKind::DynamicLibrary | TargetKind::Executable)
+        !matches!(
+            self,
+            TargetKind::StaticLibrary | TargetKind::DynamicLibrary | TargetKind::Executable
+        )
     }
 
     pub fn is_embeddable(self) -> bool {
@@ -200,8 +207,16 @@ impl Manifest {
         }
 
         for target in &self.targets {
-            if target.sources.is_empty() && !matches!(target.kind, TargetKind::Framework | TargetKind::StaticLibrary) {
-                bail!("target `{}` must declare at least one source root", target.name);
+            if target.sources.is_empty()
+                && !matches!(
+                    target.kind,
+                    TargetKind::Framework | TargetKind::StaticLibrary
+                )
+            {
+                bail!(
+                    "target `{}` must declare at least one source root",
+                    target.name
+                );
             }
             if target.bundle_id.trim().is_empty() {
                 bail!("target `{}` must declare a bundle_id", target.name);
@@ -215,7 +230,9 @@ impl Manifest {
                 }
             }
             match target.kind {
-                TargetKind::AppExtension | TargetKind::WatchExtension | TargetKind::WidgetExtension => {
+                TargetKind::AppExtension
+                | TargetKind::WatchExtension
+                | TargetKind::WidgetExtension => {
                     if target.extension.is_none() {
                         bail!(
                             "target `{}` of kind `{}` must define the `extension` block",
@@ -274,7 +291,10 @@ impl Manifest {
                 bail!("platform `{platform}` is not declared in the manifest");
             }
             if !target.supports_platform(platform) {
-                bail!("target `{}` does not support platform `{platform}`", target.name);
+                bail!(
+                    "target `{}` does not support platform `{platform}`",
+                    target.name
+                );
             }
             return Ok(platform);
         }
@@ -342,7 +362,13 @@ impl Manifest {
             Ok(())
         }
 
-        visit(root_target, &by_name, &mut ordered, &mut visiting, &mut visited)?;
+        visit(
+            root_target,
+            &by_name,
+            &mut ordered,
+            &mut visiting,
+            &mut visited,
+        )?;
         Ok(ordered)
     }
 
@@ -367,7 +393,10 @@ mod tests {
         let profile = manifest
             .profile_for(super::ApplePlatform::Ios, "development")
             .unwrap();
-        assert!(matches!(profile.distribution, DistributionKind::Development));
+        assert!(matches!(
+            profile.distribution,
+            DistributionKind::Development
+        ));
         assert_eq!(manifest.targets.len(), 1);
     }
 
@@ -380,6 +409,12 @@ mod tests {
             .into_iter()
             .map(|target| target.name.clone())
             .collect::<Vec<_>>();
-        assert_eq!(ordered, vec!["TunnelExtension".to_owned(), "ExampleExtensionApp".to_owned()]);
+        assert_eq!(
+            ordered,
+            vec![
+                "TunnelExtension".to_owned(),
+                "ExampleExtensionApp".to_owned()
+            ]
+        );
     }
 }

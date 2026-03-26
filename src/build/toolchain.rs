@@ -1,9 +1,9 @@
 use std::path::PathBuf;
 use std::process::Command;
 
-use anyhow::{Result, bail};
 use crate::manifest::ApplePlatform;
 use crate::util::command_output;
+use anyhow::{Result, bail};
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum DestinationKind {
@@ -49,10 +49,11 @@ impl Toolchain {
         }
         .to_owned();
 
-        let sdk_path = command_output(
-            Command::new("xcrun")
-                .args(["--sdk", sdk_name.as_str(), "--show-sdk-path"]),
-        )?;
+        let sdk_path = command_output(Command::new("xcrun").args([
+            "--sdk",
+            sdk_name.as_str(),
+            "--show-sdk-path",
+        ]))?;
         let sdk_path = PathBuf::from(sdk_path.trim());
 
         let architecture = host_architecture()?;

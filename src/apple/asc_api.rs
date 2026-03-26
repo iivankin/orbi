@@ -3,8 +3,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
-use reqwest::{Method, Url};
 use reqwest::blocking::{Client, Response};
+use reqwest::{Method, Url};
 use serde::Deserialize;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -218,10 +218,7 @@ impl AscClient {
             &[
                 ("limit", "200".to_owned()),
                 ("filter[identifier]", identifier.to_owned()),
-                (
-                    "include",
-                    "bundleIdCapabilities".to_owned(),
-                ),
+                ("include", "bundleIdCapabilities".to_owned()),
                 (
                     "fields[bundleIds]",
                     "name,platform,identifier,bundleIdCapabilities".to_owned(),
@@ -232,10 +229,14 @@ impl AscClient {
                 ),
             ],
         )?;
-        Ok(response.data.into_iter().next().map(|data| JsonApiDocument {
-            data,
-            included: response.included,
-        }))
+        Ok(response
+            .data
+            .into_iter()
+            .next()
+            .map(|data| JsonApiDocument {
+                data,
+                included: response.included,
+            }))
     }
 
     pub fn create_bundle_id(
@@ -320,7 +321,8 @@ impl AscClient {
                 }
             }
         });
-        let response: JsonApiDocument<CertificateAttributes> = self.post("/v1/certificates", &request)?;
+        let response: JsonApiDocument<CertificateAttributes> =
+            self.post("/v1/certificates", &request)?;
         Ok(response.data)
     }
 
@@ -500,7 +502,9 @@ where
     T: DeserializeOwned,
 {
     let status = response.status();
-    let body = response.text().context("failed to read App Store Connect response body")?;
+    let body = response
+        .text()
+        .context("failed to read App Store Connect response body")?;
     if !status.is_success() {
         if let Ok(errors) = serde_json::from_str::<AscErrorDocument>(&body) {
             let message = errors
@@ -529,7 +533,9 @@ fn handle_empty_response(response: Response) -> Result<()> {
     if status.is_success() {
         return Ok(());
     }
-    let body = response.text().context("failed to read App Store Connect response body")?;
+    let body = response
+        .text()
+        .context("failed to read App Store Connect response body")?;
     if let Ok(errors) = serde_json::from_str::<AscErrorDocument>(&body) {
         let message = errors
             .errors

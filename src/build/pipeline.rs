@@ -14,12 +14,12 @@ use crate::build::toolchain::{DestinationKind, Toolchain};
 use crate::cli::{BuildArgs, RunArgs, SubmitArgs};
 use crate::context::ProjectContext;
 use crate::manifest::{
-    ApplePlatform, DistributionKind, ExtensionManifest, ProfileManifest, SwiftPackageDependency, TargetKind,
-    TargetManifest,
+    ApplePlatform, DistributionKind, ExtensionManifest, ProfileManifest, SwiftPackageDependency,
+    TargetKind, TargetManifest,
 };
 use crate::util::{
-    collect_files_with_extensions, command_output, copy_dir_recursive, copy_file, ensure_dir, ensure_parent_dir,
-    prompt_select, resolve_path, run_command,
+    collect_files_with_extensions, command_output, copy_dir_recursive, copy_file, ensure_dir,
+    ensure_parent_dir, prompt_select, resolve_path, run_command,
 };
 
 #[derive(Debug, Clone)]
@@ -60,7 +60,12 @@ pub fn build_artifact(project: &ProjectContext, args: &BuildArgs) -> Result<()> 
 }
 
 pub fn run_on_destination(project: &ProjectContext, args: &RunArgs) -> Result<()> {
-    let profile_name = args.profile.clone().unwrap_or_else(|| "development".to_owned());
+    crate::apple::auth::best_effort_app_store_authenticate(project)?;
+
+    let profile_name = args
+        .profile
+        .clone()
+        .unwrap_or_else(|| "development".to_owned());
     let selected_device = if args.device {
         Some(select_physical_device(project, args.device_id.as_deref())?)
     } else {
@@ -101,6 +106,8 @@ pub fn submit_artifact(project: &ProjectContext, args: &SubmitArgs) -> Result<()
         .context("could not find a matching build receipt")?
     };
 
+    crate::apple::auth::best_effort_app_store_authenticate(project)?;
+
     if !receipt.submit_eligible {
         bail!(
             "receipt `{}` is not submit-eligible because it was built for `{:?}` distribution",
@@ -110,9 +117,10 @@ pub fn submit_artifact(project: &ProjectContext, args: &SubmitArgs) -> Result<()
     }
 
     match receipt.platform {
-        ApplePlatform::Ios | ApplePlatform::Tvos | ApplePlatform::Visionos | ApplePlatform::Watchos => {
-            submit_with_altool(project, &receipt, args.wait)
-        }
+        ApplePlatform::Ios
+        | ApplePlatform::Tvos
+        | ApplePlatform::Visionos
+        | ApplePlatform::Watchos => submit_with_altool(project, &receipt, args.wait),
         ApplePlatform::Macos => {
             bail!("macOS submit/notarization is not implemented yet")
         }
@@ -154,8 +162,11 @@ fn build_project(project: &ProjectContext, request: &BuildRequest) -> Result<Bui
 
     let ordered_targets = project.manifest.topological_targets(&root_target.name)?;
     let mut built_targets = HashMap::new();
-    let signing_required =
-        destination == DestinationKind::Device || !matches!(profile.distribution, DistributionKind::Development);
+    let signing_required = destination == DestinationKind::Device
+        || !matches!(profile.distribution, DistributionKind::Development);
+    if signing_required {
+        crate::apple::auth::best_effort_app_store_authenticate(project)?;
+    }
     for target in ordered_targets {
         let built = compile_target(
             project,
@@ -181,14 +192,13 @@ fn build_project(project: &ProjectContext, request: &BuildRequest) -> Result<Bui
             let built = built_targets
                 .get(&target.name)
                 .with_context(|| format!("missing built target `{}`", target.name))?;
-            let material =
-                crate::apple::signing::prepare_signing(
-                    project,
-                    target,
-                    platform,
-                    profile,
-                    request.provisioning_udids.clone(),
-                )?;
+            let material = crate::apple::signing::prepare_signing(
+                project,
+                target,
+                platform,
+                profile,
+                request.provisioning_udids.clone(),
+            )?;
             crate::apple::signing::sign_bundle(&built.bundle_path, &material)?;
         }
     }
@@ -255,8 +265,10 @@ fn compile_target(
     ensure_dir(&intermediates_dir)?;
     ensure_dir(&bundle_root)?;
 
-    let package_outputs = compile_swift_packages(project, toolchain, profile, &intermediates_dir, target)?;
-    let c_objects = compile_c_family_sources(project, toolchain, profile, &intermediates_dir, target)?;
+    let package_outputs =
+        compile_swift_packages(project, toolchain, profile, &intermediates_dir, target)?;
+    let c_objects =
+        compile_c_family_sources(project, toolchain, profile, &intermediates_dir, target)?;
     let swift_sources = resolve_target_sources(project, target, &["swift"])?;
     let executable_name = target.name.clone();
     let executable_path = bundle_root.join(&executable_name);
@@ -275,7 +287,10 @@ fn compile_target(
     } else if !c_objects.is_empty() {
         link_native_target(toolchain, profile, &c_objects, &executable_path)?;
     } else {
-        bail!("target `{}` did not resolve any compilable sources", target.name);
+        bail!(
+            "target `{}` did not resolve any compilable sources",
+            target.name
+        );
     }
 
     write_info_plist(project, toolchain, target, &bundle_root, profile_name)?;
@@ -454,12 +469,18 @@ fn write_info_plist(
     profile_name: &str,
 ) -> Result<()> {
     let mut plist = Dictionary::new();
-    plist.insert("CFBundleIdentifier".to_owned(), Value::String(target.bundle_id.clone()));
+    plist.insert(
+        "CFBundleIdentifier".to_owned(),
+        Value::String(target.bundle_id.clone()),
+    );
     plist.insert(
         "CFBundleExecutable".to_owned(),
         Value::String(target.name.clone()),
     );
-    plist.insert("CFBundleName".to_owned(), Value::String(target.name.clone()));
+    plist.insert(
+        "CFBundleName".to_owned(),
+        Value::String(target.name.clone()),
+    );
     plist.insert(
         "CFBundleDisplayName".to_owned(),
         Value::String(project.manifest.name.clone()),
@@ -485,17 +506,32 @@ fn write_info_plist(
 
     match target.kind {
         TargetKind::App | TargetKind::WatchApp => {
-            plist.insert("CFBundlePackageType".to_owned(), Value::String("APPL".to_owned()));
+            plist.insert(
+                "CFBundlePackageType".to_owned(),
+                Value::String("APPL".to_owned()),
+            );
             plist.insert("LSRequiresIPhoneOS".to_owned(), Value::Boolean(true));
-            plist.insert("MinimumOSVersion".to_owned(), Value::String(toolchain.deployment_target.clone()));
+            plist.insert(
+                "MinimumOSVersion".to_owned(),
+                Value::String(toolchain.deployment_target.clone()),
+            );
         }
         TargetKind::AppExtension | TargetKind::WatchExtension | TargetKind::WidgetExtension => {
-            plist.insert("CFBundlePackageType".to_owned(), Value::String("XPC!".to_owned()));
-            plist.insert("MinimumOSVersion".to_owned(), Value::String(toolchain.deployment_target.clone()));
+            plist.insert(
+                "CFBundlePackageType".to_owned(),
+                Value::String("XPC!".to_owned()),
+            );
+            plist.insert(
+                "MinimumOSVersion".to_owned(),
+                Value::String(toolchain.deployment_target.clone()),
+            );
             plist.insert(
                 "NSExtension".to_owned(),
                 Value::Dictionary(extension_plist(
-                    target.extension.as_ref().context("extension configuration missing")?,
+                    target
+                        .extension
+                        .as_ref()
+                        .context("extension configuration missing")?,
                 )),
             );
         }
@@ -550,7 +586,12 @@ fn process_resources(
                 target.name
             );
         }
-        discover_resources(&resource_path, &resource_path, &mut asset_catalogs, &mut copy_jobs)?;
+        discover_resources(
+            &resource_path,
+            &resource_path,
+            &mut asset_catalogs,
+            &mut copy_jobs,
+        )?;
     }
 
     if !asset_catalogs.is_empty() {
@@ -625,7 +666,9 @@ fn compile_asset_catalogs(
     let mut command = toolchain.actool_command();
     command.arg("actool");
     command.arg("--compile").arg(bundle_root);
-    command.arg("--platform").arg(toolchain.actool_platform_name());
+    command
+        .arg("--platform")
+        .arg(toolchain.actool_platform_name());
     command
         .arg("--minimum-deployment-target")
         .arg(&toolchain.deployment_target);
@@ -644,9 +687,7 @@ fn embed_dependencies(
     built_targets: &HashMap<String, BuiltTarget>,
     root_target: &mut BuiltTarget,
 ) -> Result<()> {
-    let root_manifest = project
-        .manifest
-        .resolve_target(Some(root_target_name))?;
+    let root_manifest = project.manifest.resolve_target(Some(root_target_name))?;
     for dependency_name in &root_manifest.dependencies {
         let built = built_targets
             .get(dependency_name)
@@ -654,13 +695,15 @@ fn embed_dependencies(
         let destination = match built.target_kind {
             TargetKind::AppExtension | TargetKind::WatchExtension | TargetKind::WidgetExtension => {
                 root_target.bundle_path.join("PlugIns").join(
-                    built.bundle_path
+                    built
+                        .bundle_path
                         .file_name()
                         .context("dependency bundle name missing")?,
                 )
             }
             TargetKind::Framework => root_target.bundle_path.join("Frameworks").join(
-                built.bundle_path
+                built
+                    .bundle_path
                     .file_name()
                     .context("framework bundle name missing")?,
             ),
@@ -695,18 +738,19 @@ fn export_artifact(
             Ok(built_target.bundle_path.clone())
         }
         DistributionKind::AdHoc | DistributionKind::AppStore => {
-            let artifact_name = explicit_output
-                .map(Path::to_path_buf)
-                .unwrap_or_else(|| {
-                    project.project_paths.artifacts_dir.join(format!(
-                        "{}-{:?}.ipa",
-                        built_target.target_name, profile.distribution
-                    ))
-                });
+            let artifact_name = explicit_output.map(Path::to_path_buf).unwrap_or_else(|| {
+                project.project_paths.artifacts_dir.join(format!(
+                    "{}-{:?}.ipa",
+                    built_target.target_name, profile.distribution
+                ))
+            });
             let artifact_path = resolve_path(&project.root, &artifact_name);
             if artifact_path.exists() {
                 fs::remove_file(&artifact_path).with_context(|| {
-                    format!("failed to remove existing artifact {}", artifact_path.display())
+                    format!(
+                        "failed to remove existing artifact {}",
+                        artifact_path.display()
+                    )
                 })?;
             }
             let payload_dir = tempdir()?;
@@ -742,13 +786,25 @@ fn export_artifact(
 
 fn run_on_simulator(project: &ProjectContext, receipt: &BuildReceipt) -> Result<()> {
     let device = select_simulator_device(project)?;
-    let mut boot = Command::new("xcrun");
-    boot.args(["simctl", "boot", &device.udid]);
-    let _ = boot.status();
+    if !device.is_booted() {
+        let mut boot = Command::new("xcrun");
+        boot.args(["simctl", "boot", &device.udid]);
+        run_command(&mut boot)?;
+    }
 
     let mut bootstatus = Command::new("xcrun");
     bootstatus.args(["simctl", "bootstatus", &device.udid, "-b"]);
     run_command(&mut bootstatus)?;
+
+    let mut open_simulator = Command::new("open");
+    open_simulator.args([
+        "-a",
+        "Simulator",
+        "--args",
+        "-CurrentDeviceUDID",
+        &device.udid,
+    ]);
+    run_command(&mut open_simulator)?;
 
     let mut install = Command::new("xcrun");
     install.args([
@@ -761,6 +817,11 @@ fn run_on_simulator(project: &ProjectContext, receipt: &BuildReceipt) -> Result<
             .context("bundle path contains invalid UTF-8")?,
     ]);
     run_command(&mut install)?;
+
+    println!(
+        "Launching {} on {}. Orbit will stay attached to the simulator console; press Ctrl-C to stop.",
+        receipt.bundle_id, device.name
+    );
 
     let mut launch = Command::new("xcrun");
     launch.args([
@@ -807,15 +868,15 @@ fn run_on_device(device: &PhysicalDevice, receipt: &BuildReceipt) -> Result<()> 
 }
 
 fn select_simulator_device(project: &ProjectContext) -> Result<SimulatorDevice> {
-    let output = command_output(
-        Command::new("xcrun").args(["simctl", "list", "devices", "available", "--json"]),
-    )?;
+    let output = command_output(Command::new("xcrun").args([
+        "simctl",
+        "list",
+        "devices",
+        "available",
+        "--json",
+    ]))?;
     let devices: SimctlList = serde_json::from_str(&output)?;
-    let mut flattened = devices
-        .devices
-        .into_values()
-        .flatten()
-        .collect::<Vec<_>>();
+    let mut flattened = devices.devices.into_values().flatten().collect::<Vec<_>>();
     flattened.sort_by(|left, right| left.name.cmp(&right.name));
 
     if flattened.is_empty() {
@@ -835,7 +896,7 @@ fn select_simulator_device(project: &ProjectContext) -> Result<SimulatorDevice> 
 }
 
 fn submit_with_altool(project: &ProjectContext, receipt: &BuildReceipt, wait: bool) -> Result<()> {
-    let auth = crate::apple::auth::resolve_submit_auth(&project.app)?;
+    let auth = crate::apple::auth::resolve_submit_auth(project)?;
     let mut command = Command::new("xcrun");
     let mut temp_root_guard = None;
     command.arg("altool");
@@ -989,8 +1050,12 @@ fn compile_swift_package(
         );
     }
 
-    let module_dir = intermediates_dir.join("swiftmodules").join(&dependency.product);
-    let library_dir = intermediates_dir.join("swiftlibs").join(&dependency.product);
+    let module_dir = intermediates_dir
+        .join("swiftmodules")
+        .join(&dependency.product);
+    let library_dir = intermediates_dir
+        .join("swiftlibs")
+        .join(&dependency.product);
     ensure_dir(&module_dir)?;
     ensure_dir(&library_dir)?;
 
@@ -1032,6 +1097,12 @@ struct SimulatorDevice {
     udid: String,
     name: String,
     state: String,
+}
+
+impl SimulatorDevice {
+    fn is_booted(&self) -> bool {
+        self.state.eq_ignore_ascii_case("Booted")
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]

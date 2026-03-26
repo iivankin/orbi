@@ -10,8 +10,8 @@ use plist::Value;
 use serde::{Deserialize, Serialize};
 
 use crate::apple::asc_api::{
-    AscClient, BundleIdAttributes, BundleIdCapabilityAttributes, JsonApiDocument, ProfileAttributes,
-    RelationshipData, Resource,
+    AscClient, BundleIdAttributes, BundleIdCapabilityAttributes, JsonApiDocument,
+    ProfileAttributes, RelationshipData, Resource,
 };
 use crate::apple::auth::resolve_api_key_auth;
 use crate::cli::SigningSyncArgs;
@@ -59,9 +59,7 @@ pub struct SigningMaterial {
 }
 
 pub fn sync_signing(project: &ProjectContext, args: &SigningSyncArgs) -> Result<()> {
-    let target = project
-        .manifest
-        .resolve_target(args.target.as_deref())?;
+    let target = project.manifest.resolve_target(args.target.as_deref())?;
     let platform = project.manifest.resolve_platform_for_target(target, None)?;
     let profile = project.manifest.profile_for(platform, &args.profile)?;
 
@@ -70,7 +68,10 @@ pub fn sync_signing(project: &ProjectContext, args: &SigningSyncArgs) -> Result<
         return Ok(());
     }
 
-    let device_udids = if matches!(profile.distribution, DistributionKind::Development | DistributionKind::AdHoc) {
+    let device_udids = if matches!(
+        profile.distribution,
+        DistributionKind::Development | DistributionKind::AdHoc
+    ) {
         Some(select_device_udids(project)?)
     } else {
         None
@@ -94,7 +95,7 @@ pub fn prepare_signing(
     device_udids: Option<Vec<String>>,
 ) -> Result<SigningMaterial> {
     let auth = resolve_api_key_auth(&project.app)?
-        .context("signing requires App Store Connect API key auth; run `orbit apple auth login --mode api-key`")?;
+        .context("signing requires App Store Connect API key auth; set ORBIT_ASC_API_KEY_PATH, ORBIT_ASC_KEY_ID, and ORBIT_ASC_ISSUER_ID")?;
     let client = AscClient::new(auth)?;
     let mut state = load_state(project)?;
 
@@ -104,7 +105,10 @@ pub fn prepare_signing(
     let certificate_type = certificate_type(platform, profile)?;
     let certificate = ensure_certificate(&client, project, &mut state, certificate_type)?;
     let profile_type = profile_type(platform, profile)?;
-    let device_ids = if matches!(profile.distribution, DistributionKind::Development | DistributionKind::AdHoc) {
+    let device_ids = if matches!(
+        profile.distribution,
+        DistributionKind::Development | DistributionKind::AdHoc
+    ) {
         let selected_udids = device_udids.unwrap_or_default();
         resolve_device_ids(&client, &selected_udids)?
     } else {
@@ -193,12 +197,16 @@ fn sync_capabilities(
         if resource.resource_type != "bundleIdCapabilities" {
             continue;
         }
-        let attributes: BundleIdCapabilityAttributes = serde_json::from_value(resource.attributes.clone())
-            .context("failed to parse bundle ID capability")?;
+        let attributes: BundleIdCapabilityAttributes =
+            serde_json::from_value(resource.attributes.clone())
+                .context("failed to parse bundle ID capability")?;
         existing.insert(attributes.capability_type.clone(), resource.id.clone());
     }
 
-    for capability in desired.iter().filter(|capability| !existing.contains_key(*capability)) {
+    for capability in desired
+        .iter()
+        .filter(|capability| !existing.contains_key(*capability))
+    {
         let _ = client.create_bundle_capability(&bundle_id.data.id, capability)?;
     }
 
@@ -268,9 +276,8 @@ fn ensure_certificate(
     let certificate_bytes = STANDARD
         .decode(certificate_content)
         .context("failed to decode certificateContent")?;
-    fs::write(&certificate_der_path, &certificate_bytes).with_context(|| {
-        format!("failed to write {}", certificate_der_path.display())
-    })?;
+    fs::write(&certificate_der_path, &certificate_bytes)
+        .with_context(|| format!("failed to write {}", certificate_der_path.display()))?;
 
     let p12_password = uuid::Uuid::new_v4().to_string();
     let mut openssl_pkcs12 = Command::new("openssl");
@@ -288,7 +295,9 @@ fn ensure_certificate(
         "-inform",
         "DER",
         "-out",
-        p12_path.to_str().context("P12 path contains invalid UTF-8")?,
+        p12_path
+            .to_str()
+            .context("P12 path contains invalid UTF-8")?,
         "-passout",
         &format!("pass:{p12_password}"),
     ]);
@@ -327,10 +336,14 @@ fn ensure_profile(
 ) -> Result<ManagedProfile> {
     let profiles = client.list_profiles(profile_type)?;
     for profile in profiles.data {
-        let Some(bundle_link) = profile.relationships.get("bundleId").and_then(|relationship| match &relationship.data {
-            Some(RelationshipData::One(link)) => Some(link.id.as_str()),
-            _ => None,
-        }) else {
+        let Some(bundle_link) = profile
+            .relationships
+            .get("bundleId")
+            .and_then(|relationship| match &relationship.data {
+                Some(RelationshipData::One(link)) => Some(link.id.as_str()),
+                _ => None,
+            })
+        else {
             continue;
         };
         if bundle_link != bundle_id.data.id {
@@ -341,7 +354,9 @@ fn ensure_profile(
             .relationships
             .get("certificates")
             .and_then(|relationship| match &relationship.data {
-                Some(RelationshipData::Many(links)) => Some(links.iter().map(|link| link.id.clone()).collect::<Vec<_>>()),
+                Some(RelationshipData::Many(links)) => {
+                    Some(links.iter().map(|link| link.id.clone()).collect::<Vec<_>>())
+                }
                 _ => None,
             })
             .unwrap_or_default();
@@ -349,7 +364,9 @@ fn ensure_profile(
             .relationships
             .get("devices")
             .and_then(|relationship| match &relationship.data {
-                Some(RelationshipData::Many(links)) => Some(links.iter().map(|link| link.id.clone()).collect::<Vec<_>>()),
+                Some(RelationshipData::Many(links)) => {
+                    Some(links.iter().map(|link| link.id.clone()).collect::<Vec<_>>())
+                }
                 _ => None,
             })
             .unwrap_or_default();
@@ -361,12 +378,25 @@ fn ensure_profile(
             continue;
         }
 
-        let managed = persist_profile(project, state, profile_type, &bundle_id.data.attributes.identifier, certificate, &device_links, profile)?;
+        let managed = persist_profile(
+            project,
+            state,
+            profile_type,
+            &bundle_id.data.attributes.identifier,
+            certificate,
+            &device_links,
+            profile,
+        )?;
         return Ok(managed);
     }
 
     let remote = client.create_profile(
-        &format!("*[orbit] {} {} {}", bundle_id.data.attributes.identifier, profile_type, crate::util::timestamp_slug()),
+        &format!(
+            "*[orbit] {} {} {}",
+            bundle_id.data.attributes.identifier,
+            profile_type,
+            crate::util::timestamp_slug()
+        ),
         profile_type,
         &bundle_id.data.id,
         &[certificate.id.clone()],
@@ -443,7 +473,11 @@ fn select_device_udids(project: &ProjectContext) -> Result<Vec<String>> {
     }
 
     if !project.app.interactive {
-        return Ok(cache.devices.into_iter().map(|device| device.udid).collect());
+        return Ok(cache
+            .devices
+            .into_iter()
+            .map(|device| device.udid)
+            .collect());
     }
 
     let labels = cache
@@ -524,7 +558,10 @@ fn validate_string_array(key: &str, value: &Value) -> Result<()> {
 fn validate_prefixed_array(key: &str, value: &Value, prefix: &str) -> Result<()> {
     validate_string_array(key, value)?;
     let values = value.as_array().expect("validated array");
-    if values.iter().all(|item| item.as_string().is_some_and(|value| value.starts_with(prefix))) {
+    if values.iter().all(|item| {
+        item.as_string()
+            .is_some_and(|value| value.starts_with(prefix))
+    }) {
         Ok(())
     } else {
         bail!("`{key}` must contain only values prefixed with `{prefix}`")
@@ -540,7 +577,10 @@ fn certificate_type(platform: ApplePlatform, profile: &ProfileManifest) -> Resul
         (ApplePlatform::Macos, DistributionKind::Development) => Ok("MAC_APP_DEVELOPMENT"),
         (ApplePlatform::Macos, DistributionKind::MacAppStore) => Ok("MAC_APP_DISTRIBUTION"),
         (ApplePlatform::Macos, DistributionKind::DeveloperId) => Ok("DEVELOPER_ID_APPLICATION"),
-        _ => bail!("signing is not implemented for {platform} with {:?}", profile.distribution),
+        _ => bail!(
+            "signing is not implemented for {platform} with {:?}",
+            profile.distribution
+        ),
     }
 }
 
@@ -605,7 +645,10 @@ fn load_p12_password(account: &str) -> Result<String> {
     crate::util::command_output(&mut command).map(|value| value.trim().to_owned())
 }
 
-fn import_certificate_into_keychain(project: &ProjectContext, certificate: &ManagedCertificate) -> Result<String> {
+fn import_certificate_into_keychain(
+    project: &ProjectContext,
+    certificate: &ManagedCertificate,
+) -> Result<String> {
     let keychain_path = &project.app.global_paths.keychain_path;
     if !keychain_path.exists() {
         let mut create = Command::new("security");
@@ -683,5 +726,8 @@ fn import_certificate_into_keychain(project: &ProjectContext, certificate: &Mana
     if let Some(display_name) = &certificate.display_name {
         return Ok(display_name.clone());
     }
-    bail!("failed to resolve imported signing identity for certificate {}", certificate.id)
+    bail!(
+        "failed to resolve imported signing identity for certificate {}",
+        certificate.id
+    )
 }

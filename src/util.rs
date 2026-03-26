@@ -7,6 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
 use dialoguer::{Confirm, Input, Password, Select, theme::ColorfulTheme};
+use indicatif::{ProgressBar, ProgressStyle};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use walkdir::WalkDir;
@@ -54,6 +55,59 @@ pub fn prompt_password(prompt: &str) -> Result<String> {
         .with_prompt(prompt)
         .interact()
         .context("failed to read password")
+}
+
+pub struct CliSpinner {
+    progress_bar: ProgressBar,
+}
+
+impl CliSpinner {
+    pub fn new(message: impl Into<String>) -> Self {
+        let progress_bar = ProgressBar::new_spinner();
+        progress_bar.set_style(
+            ProgressStyle::with_template("{spinner:.green} {msg}")
+                .expect("spinner template must be valid"),
+        );
+        progress_bar.enable_steady_tick(std::time::Duration::from_millis(80));
+        progress_bar.set_message(message.into());
+        progress_bar.tick();
+        Self { progress_bar }
+    }
+
+    pub fn finish_success(self, message: impl Into<String>) {
+        self.progress_bar.finish_and_clear();
+        print_success(message.into());
+    }
+
+    pub fn finish_clear(self) {
+        self.progress_bar.finish_and_clear();
+    }
+
+    pub fn finish_warning(self, message: impl Into<String>) {
+        self.progress_bar.finish_and_clear();
+        println!("{} {}", yellow_symbol("⚠"), message.into());
+    }
+
+    pub fn finish_failure(self, message: impl Into<String>) {
+        self.progress_bar.finish_and_clear();
+        println!("{} {}", red_symbol("✖"), message.into());
+    }
+}
+
+pub fn print_success(message: impl AsRef<str>) {
+    println!("{} {}", green_symbol("✔"), message.as_ref());
+}
+
+fn green_symbol(symbol: &str) -> String {
+    format!("\x1b[32m{symbol}\x1b[0m")
+}
+
+fn yellow_symbol(symbol: &str) -> String {
+    format!("\x1b[33m{symbol}\x1b[0m")
+}
+
+fn red_symbol(symbol: &str) -> String {
+    format!("\x1b[31m{symbol}\x1b[0m")
 }
 
 pub fn ensure_dir(path: &Path) -> Result<()> {
@@ -164,7 +218,10 @@ pub fn collect_files_with_extensions(root: &Path, extensions: &[&str]) -> Result
         let Some(extension) = entry.path().extension().and_then(OsStr::to_str) else {
             continue;
         };
-        if extensions.iter().any(|candidate| extension.eq_ignore_ascii_case(candidate)) {
+        if extensions
+            .iter()
+            .any(|candidate| extension.eq_ignore_ascii_case(candidate))
+        {
             files.push(entry.into_path());
         }
     }

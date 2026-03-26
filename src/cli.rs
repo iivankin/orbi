@@ -87,10 +87,6 @@ pub struct AppleArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum AppleCommand {
-    Auth {
-        #[command(subcommand)]
-        command: AppleAuthCommand,
-    },
     Device {
         #[command(subcommand)]
         command: AppleDeviceCommand,
@@ -99,47 +95,6 @@ pub enum AppleCommand {
         #[command(subcommand)]
         command: AppleSigningCommand,
     },
-}
-
-#[derive(Debug, Subcommand)]
-pub enum AppleAuthCommand {
-    Login(LoginArgs),
-    Status,
-    Logout,
-}
-
-#[derive(Debug, Args)]
-pub struct LoginArgs {
-    #[arg(long)]
-    pub mode: Option<AuthMode>,
-
-    #[arg(long)]
-    pub apple_id: Option<String>,
-
-    #[arg(long)]
-    pub team_id: Option<String>,
-
-    #[arg(long)]
-    pub provider_id: Option<String>,
-
-    #[arg(long)]
-    pub team_type: Option<String>,
-
-    #[arg(long)]
-    pub api_key_path: Option<PathBuf>,
-
-    #[arg(long)]
-    pub key_id: Option<String>,
-
-    #[arg(long)]
-    pub issuer_id: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq, ValueEnum)]
-pub enum AuthMode {
-    User,
-    #[value(name = "api-key")]
-    ApiKey,
 }
 
 #[derive(Debug, Subcommand)]

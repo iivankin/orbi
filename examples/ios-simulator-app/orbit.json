@@ -2,6 +2,9 @@
   "name": "ExampleIOSApp",
   "version": "0.1.0",
   "platform": "apple",
+  "team_id": "JZPJ2RGU5F",
+  "provider_id": "128120286",
+  "source_roots": [],
   "toolchain": {
     "xcode_version": "26.3"
   },
@@ -29,18 +32,22 @@
       "name": "ExampleIOSApp",
       "kind": "app",
       "bundle_id": "dev.orbit.examples.iossim",
+      "platforms": [],
       "sources": [
         "Sources/ExampleIOSApp"
       ],
+      "resources": [
+        "Resources"
+      ],
+      "dependencies": [],
       "swift_packages": [
         {
           "product": "OrbitGreeting",
           "path": "Packages/OrbitGreeting"
         }
       ],
-      "resources": [
-        "Resources"
-      ]
+      "entitlements": null,
+      "extension": null
     }
   ]
 }
