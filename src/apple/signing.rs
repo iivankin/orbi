@@ -17,7 +17,9 @@ use crate::apple::auth::resolve_api_key_auth;
 use crate::cli::SigningSyncArgs;
 use crate::context::ProjectContext;
 use crate::manifest::{ApplePlatform, DistributionKind, ProfileManifest, TargetManifest};
-use crate::util::{ensure_dir, prompt_select, read_json_file_if_exists, write_json_file};
+use crate::util::{
+    ensure_dir, prompt_multi_select, prompt_select, read_json_file_if_exists, write_json_file,
+};
 
 const P12_PASSWORD_SERVICE: &str = "dev.orbit.cli.codesign-p12";
 
@@ -59,9 +61,10 @@ pub struct SigningMaterial {
 }
 
 pub fn sync_signing(project: &ProjectContext, args: &SigningSyncArgs) -> Result<()> {
-    let target = project.manifest.resolve_target(args.target.as_deref())?;
+    let target = resolve_signing_target(project, args.target.as_deref())?;
     let platform = project.manifest.resolve_platform_for_target(target, None)?;
-    let profile = project.manifest.profile_for(platform, &args.profile)?;
+    let profile_name = resolve_profile_name(project, platform, args.profile.as_deref())?;
+    let profile = project.manifest.profile_for(platform, &profile_name)?;
 
     if !args.device && args.simulator {
         println!("simulator builds do not require signing");
@@ -72,7 +75,7 @@ pub fn sync_signing(project: &ProjectContext, args: &SigningSyncArgs) -> Result<
         profile.distribution,
         DistributionKind::Development | DistributionKind::AdHoc
     ) {
-        Some(select_device_udids(project)?)
+        Some(select_device_udids(project, profile.distribution)?)
     } else {
         None
     };
@@ -84,7 +87,59 @@ pub fn sync_signing(project: &ProjectContext, args: &SigningSyncArgs) -> Result<
         "provisioning_profile: {}",
         material.provisioning_profile_path.display()
     );
+    if let Some(entitlements_path) = &material.entitlements_path {
+        println!("entitlements: {}", entitlements_path.display());
+    }
     Ok(())
+}
+
+fn resolve_signing_target<'a>(
+    project: &'a ProjectContext,
+    requested_target: Option<&str>,
+) -> Result<&'a TargetManifest> {
+    if let Some(requested_target) = requested_target {
+        return project.manifest.resolve_target(Some(requested_target));
+    }
+
+    let mut candidates = project.manifest.selectable_root_targets();
+    if candidates.len() <= 1 || !project.app.interactive {
+        return candidates
+            .drain(..)
+            .next()
+            .context("manifest did not contain any targets");
+    }
+
+    let labels = candidates
+        .iter()
+        .map(|target| format!("{} ({})", target.name, target.bundle_id))
+        .collect::<Vec<_>>();
+    let index = prompt_select("Select a target to sync signing for", &labels)?;
+    Ok(candidates.remove(index))
+}
+
+fn resolve_profile_name(
+    project: &ProjectContext,
+    platform: ApplePlatform,
+    requested_profile: Option<&str>,
+) -> Result<String> {
+    if let Some(requested_profile) = requested_profile {
+        let _ = project.manifest.profile_for(platform, requested_profile)?;
+        return Ok(requested_profile.to_owned());
+    }
+
+    let profiles = project.manifest.profile_names(platform)?;
+    if profiles.len() == 1 {
+        return Ok(profiles[0].clone());
+    }
+    if !project.app.interactive {
+        bail!(
+            "multiple profiles are available for platform `{platform}`; pass --profile ({})",
+            profiles.join(", ")
+        );
+    }
+
+    let index = prompt_select("Select a signing profile", &profiles)?;
+    Ok(profiles[index].clone())
 }
 
 pub fn prepare_signing(
@@ -335,7 +390,12 @@ fn ensure_profile(
     device_ids: &[String],
 ) -> Result<ManagedProfile> {
     let profiles = client.list_profiles(profile_type)?;
+    let bundle_identifier = &bundle_id.data.attributes.identifier;
+    let mut remote_profile_ids = HashSet::new();
+    let mut stale_orbit_profiles = Vec::new();
+
     for profile in profiles.data {
+        remote_profile_ids.insert(profile.id.clone());
         let Some(bundle_link) = profile
             .relationships
             .get("bundleId")
@@ -371,29 +431,45 @@ fn ensure_profile(
             })
             .unwrap_or_default();
 
-        if !certificate_links.contains(&certificate.id) {
-            continue;
-        }
-        if !device_ids.is_empty() && canonical_ids(&device_links) != canonical_ids(device_ids) {
-            continue;
+        let matches_certificate = certificate_links.contains(&certificate.id);
+        let matches_devices = canonical_ids(&device_links) == canonical_ids(device_ids);
+
+        if matches_certificate && matches_devices {
+            let managed = persist_profile(
+                project,
+                state,
+                profile_type,
+                bundle_identifier,
+                certificate,
+                &device_links,
+                profile,
+            )?;
+            cleanup_stale_profile_state(
+                state,
+                bundle_identifier,
+                profile_type,
+                &remote_profile_ids,
+            );
+            return Ok(managed);
         }
 
-        let managed = persist_profile(
-            project,
-            state,
-            profile_type,
-            &bundle_id.data.attributes.identifier,
-            certificate,
-            &device_links,
-            profile,
-        )?;
-        return Ok(managed);
+        if is_orbit_managed_profile(state, &profile.id, bundle_identifier, profile_type) {
+            stale_orbit_profiles.push(profile.id.clone());
+        }
     }
+
+    for profile_id in stale_orbit_profiles {
+        client
+            .delete_profile(&profile_id)
+            .with_context(|| format!("failed to repair provisioning profile `{profile_id}`"))?;
+        state.profiles.retain(|profile| profile.id != profile_id);
+    }
+    cleanup_stale_profile_state(state, bundle_identifier, profile_type, &remote_profile_ids);
 
     let remote = client.create_profile(
         &format!(
             "*[orbit] {} {} {}",
-            bundle_id.data.attributes.identifier,
+            bundle_identifier,
             profile_type,
             crate::util::timestamp_slug()
         ),
@@ -406,7 +482,7 @@ fn ensure_profile(
         project,
         state,
         profile_type,
-        &bundle_id.data.attributes.identifier,
+        bundle_identifier,
         certificate,
         device_ids,
         remote,
@@ -466,7 +542,10 @@ fn resolve_device_ids(client: &AscClient, udids: &[String]) -> Result<Vec<String
     Ok(device_ids)
 }
 
-fn select_device_udids(project: &ProjectContext) -> Result<Vec<String>> {
+fn select_device_udids(
+    project: &ProjectContext,
+    distribution: DistributionKind,
+) -> Result<Vec<String>> {
     let cache = crate::apple::device::refresh_cache(&project.app)?;
     if cache.devices.is_empty() {
         bail!("no registered Apple devices found; run `orbit apple device register` first");
@@ -485,8 +564,51 @@ fn select_device_udids(project: &ProjectContext) -> Result<Vec<String>> {
         .iter()
         .map(|device| format!("{} ({})", device.name, device.udid))
         .collect::<Vec<_>>();
+    if matches!(distribution, DistributionKind::AdHoc) {
+        let defaults = vec![true; labels.len()];
+        let selections = prompt_multi_select(
+            "Select devices to include in the ad-hoc provisioning profile",
+            &labels,
+            Some(&defaults),
+        )?;
+        if selections.is_empty() {
+            bail!("select at least one device for an ad-hoc provisioning profile");
+        }
+        return Ok(selections
+            .into_iter()
+            .map(|index| cache.devices[index].udid.clone())
+            .collect());
+    }
+
     let index = prompt_select("Select a device to provision", &labels)?;
     Ok(vec![cache.devices[index].udid.clone()])
+}
+
+fn is_orbit_managed_profile(
+    state: &SigningState,
+    profile_id: &str,
+    bundle_identifier: &str,
+    profile_type: &str,
+) -> bool {
+    state.profiles.iter().any(|profile| {
+        profile.id == profile_id
+            && profile.bundle_id == bundle_identifier
+            && profile.profile_type == profile_type
+    })
+}
+
+fn cleanup_stale_profile_state(
+    state: &mut SigningState,
+    bundle_identifier: &str,
+    profile_type: &str,
+    remote_profile_ids: &HashSet<String>,
+) {
+    state.profiles.retain(|profile| {
+        if profile.bundle_id != bundle_identifier || profile.profile_type != profile_type {
+            return true;
+        }
+        remote_profile_ids.contains(&profile.id)
+    });
 }
 
 fn desired_capabilities(path: &Path) -> Result<HashSet<String>> {

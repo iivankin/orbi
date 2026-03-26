@@ -324,6 +324,31 @@ impl Manifest {
             .with_context(|| format!("unknown profile `{name}` for platform `{platform}`"))
     }
 
+    pub fn profile_names(&self, platform: ApplePlatform) -> Result<Vec<String>> {
+        let mut names = self
+            .platforms
+            .get(&platform)
+            .context("platform missing from manifest")?
+            .profiles
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        names.sort();
+        Ok(names)
+    }
+
+    pub fn selectable_root_targets(&self) -> Vec<&TargetManifest> {
+        let mut targets = self
+            .targets
+            .iter()
+            .filter(|target| matches!(target.kind, TargetKind::App | TargetKind::WatchApp))
+            .collect::<Vec<_>>();
+        if targets.is_empty() {
+            targets = self.targets.iter().collect();
+        }
+        targets
+    }
+
     pub fn topological_targets<'a>(
         &'a self,
         root_target: &'a str,
@@ -416,5 +441,29 @@ mod tests {
                 "ExampleExtensionApp".to_owned()
             ]
         );
+    }
+
+    #[test]
+    fn exposes_sorted_profile_names() {
+        let manifest = Manifest::load(&fixture("examples/ios-simulator-app/orbit.json")).unwrap();
+        assert_eq!(
+            manifest.profile_names(super::ApplePlatform::Ios).unwrap(),
+            vec![
+                "development".to_owned(),
+                "internal".to_owned(),
+                "release".to_owned()
+            ]
+        );
+    }
+
+    #[test]
+    fn prefers_app_targets_for_root_selection() {
+        let manifest = Manifest::load(&fixture("examples/ios-app-extension/orbit.json")).unwrap();
+        let target_names = manifest
+            .selectable_root_targets()
+            .into_iter()
+            .map(|target| target.name.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(target_names, vec!["ExampleExtensionApp".to_owned()]);
     }
 }

@@ -1,11 +1,27 @@
 use std::path::PathBuf;
 
+use clap::builder::styling::{AnsiColor, Styles};
 use clap::{Args, Parser, Subcommand, ValueEnum};
+
+pub const CLAP_STYLING: Styles = Styles::styled()
+    .header(AnsiColor::Green.on_default().bold())
+    .usage(AnsiColor::Green.on_default().bold())
+    .literal(AnsiColor::Blue.on_default().bold())
+    .placeholder(AnsiColor::Cyan.on_default())
+    .valid(AnsiColor::Green.on_default())
+    .invalid(AnsiColor::Magenta.on_default().bold())
+    .error(AnsiColor::Red.on_default().bold())
+    .context(AnsiColor::Yellow.on_default().dimmed())
+    .context_value(AnsiColor::Yellow.on_default().italic());
 
 #[derive(Debug, Parser)]
 #[command(name = "orbit")]
 #[command(about = "Local-first Apple family build and signing CLI")]
 #[command(arg_required_else_help = true)]
+#[command(styles = CLAP_STYLING)]
+#[command(
+    after_help = "Examples:\n  orbit run --simulator\n  orbit build --profile release\n  orbit submit --wait\n  orbit apple device list --refresh"
+)]
 pub struct Cli {
     #[arg(long, global = true)]
     pub manifest: Option<PathBuf>,
@@ -33,10 +49,10 @@ pub struct RunArgs {
     #[arg(long)]
     pub profile: Option<String>,
 
-    #[arg(long)]
+    #[arg(long, conflicts_with = "device")]
     pub simulator: bool,
 
-    #[arg(long)]
+    #[arg(long, conflicts_with = "simulator")]
     pub device: bool,
 
     #[arg(long)]
@@ -52,12 +68,12 @@ pub struct BuildArgs {
     pub target: Option<String>,
 
     #[arg(long)]
-    pub profile: String,
+    pub profile: Option<String>,
 
-    #[arg(long)]
+    #[arg(long, conflicts_with = "device")]
     pub simulator: bool,
 
-    #[arg(long)]
+    #[arg(long, conflicts_with = "simulator")]
     pub device: bool,
 
     #[arg(long)]
@@ -122,7 +138,7 @@ pub struct RegisterDeviceArgs {
     #[arg(long, value_enum, default_value_t = DevicePlatform::Ios)]
     pub platform: DevicePlatform,
 
-    #[arg(long)]
+    #[arg(long, conflicts_with_all = ["name", "udid"])]
     pub current_machine: bool,
 }
 
@@ -162,11 +178,11 @@ pub struct SigningSyncArgs {
     pub target: Option<String>,
 
     #[arg(long)]
-    pub profile: String,
+    pub profile: Option<String>,
 
-    #[arg(long)]
+    #[arg(long, conflicts_with = "device")]
     pub simulator: bool,
 
-    #[arg(long)]
+    #[arg(long, conflicts_with = "simulator")]
     pub device: bool,
 }

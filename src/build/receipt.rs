@@ -66,13 +66,13 @@ pub fn load_receipt(path: &Path) -> Result<BuildReceipt> {
     read_json_file(path)
 }
 
-pub fn find_latest_receipt(
+pub fn list_receipts(
     receipts_dir: &Path,
     target: Option<&str>,
     profile: Option<&str>,
-) -> Result<Option<BuildReceipt>> {
+) -> Result<Vec<BuildReceipt>> {
     if !receipts_dir.exists() {
-        return Ok(None);
+        return Ok(Vec::new());
     }
 
     let mut receipts = Vec::new();
@@ -96,6 +96,15 @@ pub fn find_latest_receipt(
         receipts.push(receipt);
     }
     receipts.sort_by_key(|receipt| receipt.created_at_unix);
+    Ok(receipts)
+}
+
+pub fn find_latest_receipt(
+    receipts_dir: &Path,
+    target: Option<&str>,
+    profile: Option<&str>,
+) -> Result<Option<BuildReceipt>> {
+    let mut receipts = list_receipts(receipts_dir, target, profile)?;
     Ok(receipts.pop())
 }
 
@@ -103,7 +112,7 @@ pub fn find_latest_receipt(
 mod tests {
     use tempfile::tempdir;
 
-    use super::{BuildReceipt, find_latest_receipt, write_receipt};
+    use super::{BuildReceipt, find_latest_receipt, list_receipts, write_receipt};
     use crate::manifest::{ApplePlatform, DistributionKind};
 
     #[test]
@@ -134,5 +143,39 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(latest.id, "2");
+    }
+
+    #[test]
+    fn lists_receipts_sorted_oldest_to_newest() {
+        let temp = tempdir().unwrap();
+        let first = BuildReceipt {
+            id: "1".to_owned(),
+            target: "App".to_owned(),
+            platform: ApplePlatform::Ios,
+            profile: "development".to_owned(),
+            distribution: DistributionKind::Development,
+            destination: "simulator".to_owned(),
+            bundle_id: "dev.example.app".to_owned(),
+            bundle_path: temp.path().join("one.app"),
+            artifact_path: temp.path().join("one.app"),
+            created_at_unix: 1,
+            submit_eligible: false,
+        };
+        let second = BuildReceipt {
+            id: "2".to_owned(),
+            created_at_unix: 2,
+            ..first.clone()
+        };
+        write_receipt(temp.path(), &second).unwrap();
+        write_receipt(temp.path(), &first).unwrap();
+
+        let receipts = list_receipts(temp.path(), Some("App"), Some("development")).unwrap();
+        assert_eq!(
+            receipts
+                .into_iter()
+                .map(|receipt| receipt.id)
+                .collect::<Vec<_>>(),
+            vec!["1".to_owned(), "2".to_owned()]
+        );
     }
 }

@@ -6,7 +6,7 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
-use dialoguer::{Confirm, Input, Password, Select, theme::ColorfulTheme};
+use dialoguer::{Confirm, Input, MultiSelect, Password, Select, theme::ColorfulTheme};
 use indicatif::{ProgressBar, ProgressStyle};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -30,6 +30,32 @@ where
         .default(0)
         .interact()
         .context("failed to read selection from the terminal")
+}
+
+pub fn prompt_multi_select<T>(
+    prompt: &str,
+    items: &[T],
+    defaults: Option<&[bool]>,
+) -> Result<Vec<usize>>
+where
+    T: Display,
+{
+    if items.is_empty() {
+        bail!("cannot select from an empty list");
+    }
+
+    let rendered_items = items.iter().map(ToString::to_string).collect::<Vec<_>>();
+    let dialog_theme = theme();
+    let mut prompt_builder = MultiSelect::with_theme(&dialog_theme)
+        .with_prompt(prompt)
+        .items(&rendered_items)
+        .report(false);
+    if let Some(defaults) = defaults {
+        prompt_builder = prompt_builder.defaults(defaults);
+    }
+    prompt_builder
+        .interact()
+        .context("failed to read selections from the terminal")
 }
 
 pub fn prompt_confirm(prompt: &str, default: bool) -> Result<bool> {

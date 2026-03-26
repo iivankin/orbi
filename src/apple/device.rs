@@ -11,7 +11,7 @@ use crate::cli::{
     DevicePlatform, ImportDevicesArgs, ListDevicesArgs, RegisterDeviceArgs, RemoveDeviceArgs,
 };
 use crate::context::{AppContext, DeviceCache};
-use crate::util::prompt_input;
+use crate::util::{prompt_input, prompt_select};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CachedDevice {
@@ -29,14 +29,14 @@ struct ImportedDevice {
     platform: String,
 }
 
-pub fn list_devices(app: &AppContext, _args: &ListDevicesArgs) -> Result<()> {
-    let devices = refresh_cache(app)?;
-    if devices.devices.is_empty() {
+pub fn list_devices(app: &AppContext, args: &ListDevicesArgs) -> Result<()> {
+    let cache = load_cached_or_remote_devices(app, args.refresh)?;
+    if cache.devices.is_empty() {
         println!("no devices registered");
         return Ok(());
     }
 
-    for device in devices.devices {
+    for device in cache.devices {
         println!(
             "{}\t{}\t{}\t{}\t{}",
             device.id, device.platform, device.udid, device.status, device.name
@@ -98,6 +98,7 @@ pub fn import_devices(app: &AppContext, args: &ImportDevicesArgs) -> Result<()> 
         None => bail!("--file is required in non-interactive mode"),
     };
 
+    let mut created_count = 0usize;
     let devices = load_import_file(&file)?;
     for device in devices {
         if client.find_device_by_udid(&device.udid)?.is_none() {
@@ -109,10 +110,14 @@ pub fn import_devices(app: &AppContext, args: &ImportDevicesArgs) -> Result<()> 
                 created.attributes.udid,
                 created.attributes.name
             );
+            created_count += 1;
         }
     }
 
     let _ = refresh_cache(app)?;
+    if created_count == 0 {
+        println!("no new devices were imported");
+    }
     Ok(())
 }
 
@@ -125,6 +130,18 @@ pub fn remove_device(app: &AppContext, args: &RemoveDeviceArgs) -> Result<()> {
             bail!("no Apple device found for UDID `{udid}`");
         };
         device.id
+    } else if app.interactive {
+        let cache = refresh_cache(app)?;
+        if cache.devices.is_empty() {
+            bail!("no registered Apple devices found");
+        }
+        let labels = cache
+            .devices
+            .iter()
+            .map(|device| format!("{} [{}] {}", device.name, device.platform, device.udid))
+            .collect::<Vec<_>>();
+        let index = prompt_select("Select a device to remove", &labels)?;
+        cache.devices[index].id.clone()
     } else {
         bail!("pass --id or --udid");
     };
@@ -142,6 +159,13 @@ pub fn refresh_cache(app: &AppContext) -> Result<DeviceCache> {
         .into_iter()
         .map(cached_device_from_resource)
         .collect::<Vec<_>>();
+    let mut devices = devices;
+    devices.sort_by(|left, right| {
+        left.platform
+            .cmp(&right.platform)
+            .then_with(|| left.name.cmp(&right.name))
+            .then_with(|| left.udid.cmp(&right.udid))
+    });
     let cache = DeviceCache { devices };
     app.write_device_cache(&cache)?;
     Ok(cache)
@@ -157,6 +181,7 @@ fn load_import_file(path: &Path) -> Result<Vec<ImportedDevice>> {
     }
 
     let mut items = Vec::new();
+    let mut seen_udids = std::collections::HashSet::new();
     for (index, line) in contents.lines().enumerate() {
         let trimmed = line.trim();
         if trimmed.is_empty() || trimmed.starts_with('#') {
@@ -170,16 +195,30 @@ fn load_import_file(path: &Path) -> Result<Vec<ImportedDevice>> {
                 path.display()
             );
         }
-        items.push(ImportedDevice {
+        if index == 0
+            && parts[0].eq_ignore_ascii_case("udid")
+            && parts[1].eq_ignore_ascii_case("name")
+            && parts[2].eq_ignore_ascii_case("platform")
+        {
+            continue;
+        }
+        let device = ImportedDevice {
             udid: parts[0].to_owned(),
             name: parts[1].to_owned(),
             platform: parts[2].to_owned(),
-        });
+        };
+        if seen_udids.insert(device.udid.clone()) {
+            items.push(device);
+        }
     }
     Ok(items)
 }
 
 fn current_machine_device(platform: DevicePlatform) -> Result<ImportedDevice> {
+    if matches!(platform, DevicePlatform::Ios) {
+        bail!("`--current-machine` requires `--platform macos` or `--platform universal`");
+    }
+
     let output = crate::util::command_output(
         std::process::Command::new("system_profiler").args(["-json", "SPHardwareDataType"]),
     )?;
@@ -208,6 +247,19 @@ fn asc_client(app: &AppContext) -> Result<AscClient> {
     let auth = resolve_api_key_auth(app)?
         .context("device management requires App Store Connect API key auth; set ORBIT_ASC_API_KEY_PATH, ORBIT_ASC_KEY_ID, and ORBIT_ASC_ISSUER_ID")?;
     AscClient::new(auth)
+}
+
+fn load_cached_or_remote_devices(app: &AppContext, refresh: bool) -> Result<DeviceCache> {
+    if refresh {
+        return refresh_cache(app);
+    }
+
+    let cache = app.read_device_cache()?;
+    if cache.devices.is_empty() {
+        refresh_cache(app)
+    } else {
+        Ok(cache)
+    }
 }
 
 fn cached_device_from_resource(resource: Resource<DeviceAttributes>) -> CachedDevice {

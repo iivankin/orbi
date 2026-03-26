@@ -9,7 +9,7 @@ use plist::{Dictionary, Value};
 use serde::Deserialize;
 use tempfile::tempdir;
 
-use crate::build::receipt::{BuildReceipt, find_latest_receipt, write_receipt};
+use crate::build::receipt::{BuildReceipt, list_receipts, write_receipt};
 use crate::build::toolchain::{DestinationKind, Toolchain};
 use crate::cli::{BuildArgs, RunArgs, SubmitArgs};
 use crate::context::ProjectContext;
@@ -18,15 +18,16 @@ use crate::manifest::{
     TargetKind, TargetManifest,
 };
 use crate::util::{
-    collect_files_with_extensions, command_output, copy_dir_recursive, copy_file, ensure_dir,
-    ensure_parent_dir, prompt_select, resolve_path, run_command,
+    CliSpinner, collect_files_with_extensions, command_output, copy_dir_recursive, copy_file,
+    ensure_dir, ensure_parent_dir, prompt_select, resolve_path, run_command,
 };
 
 #[derive(Debug, Clone)]
 struct BuildRequest {
-    target_name: Option<String>,
+    target_name: String,
+    platform: ApplePlatform,
     profile_name: String,
-    destination: Option<DestinationKind>,
+    destination: DestinationKind,
     output: Option<PathBuf>,
     provisioning_udids: Option<Vec<String>>,
 }
@@ -45,43 +46,99 @@ pub struct BuildOutcome {
 }
 
 pub fn build_artifact(project: &ProjectContext, args: &BuildArgs) -> Result<()> {
+    let target = resolve_requested_target(project, args.target.as_deref())?;
+    let platform = project.manifest.resolve_platform_for_target(target, None)?;
+    let profile_name = resolve_profile_name(
+        project,
+        platform,
+        args.profile.as_deref(),
+        None,
+        "Select a build profile",
+    )?;
+    let profile = project.manifest.profile_for(platform, &profile_name)?;
     let request = BuildRequest {
-        target_name: args.target.clone(),
-        profile_name: args.profile.clone(),
-        destination: resolve_destination(args.simulator, args.device),
+        target_name: target.name.clone(),
+        platform,
+        profile_name,
+        destination: resolve_destination(project, platform, args.simulator, args.device, profile)?,
         output: args.output.clone(),
         provisioning_udids: None,
     };
 
-    let outcome = build_project(project, &request)?;
-    println!("{}", outcome.receipt.artifact_path.display());
-    println!("{}", outcome.receipt_path.display());
+    let spinner = CliSpinner::new(format!(
+        "Building {} for {} ({})",
+        request.target_name,
+        request.profile_name,
+        request.destination.as_str()
+    ));
+    let outcome = match build_project(project, &request) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            spinner.finish_clear();
+            return Err(error);
+        }
+    };
+    spinner.finish_success(format!(
+        "Built {} for {}.",
+        outcome.receipt.target, outcome.receipt.profile
+    ));
+    println!("artifact: {}", outcome.receipt.artifact_path.display());
+    println!("receipt: {}", outcome.receipt_path.display());
     Ok(())
 }
 
 pub fn run_on_destination(project: &ProjectContext, args: &RunArgs) -> Result<()> {
     crate::apple::auth::best_effort_app_store_authenticate(project)?;
 
-    let profile_name = args
-        .profile
-        .clone()
-        .unwrap_or_else(|| "development".to_owned());
-    let selected_device = if args.device {
+    let target = resolve_requested_target(project, args.target.as_deref())?;
+    let platform = project.manifest.resolve_platform_for_target(target, None)?;
+    validate_run_platform(platform)?;
+    let profile_name = resolve_profile_name(
+        project,
+        platform,
+        args.profile.as_deref(),
+        Some("development"),
+        "Select a run profile",
+    )?;
+    let profile = project.manifest.profile_for(platform, &profile_name)?;
+    validate_run_distribution(profile)?;
+    let destination = resolve_destination(project, platform, args.simulator, args.device, profile)?;
+    if args.device_id.is_some() && destination != DestinationKind::Device {
+        bail!("--device-id can only be used together with a physical-device run");
+    }
+    let selected_device = if destination == DestinationKind::Device {
         Some(select_physical_device(project, args.device_id.as_deref())?)
     } else {
         None
     };
     let request = BuildRequest {
-        target_name: args.target.clone(),
+        target_name: target.name.clone(),
+        platform,
         profile_name,
-        destination: resolve_destination(args.simulator, args.device),
+        destination,
         output: None,
         provisioning_udids: selected_device
             .as_ref()
             .map(|device| vec![device.hardware_properties.udid.clone()]),
     };
 
-    let outcome = build_project(project, &request)?;
+    let spinner = CliSpinner::new(format!(
+        "Building {} for {} ({})",
+        request.target_name,
+        request.profile_name,
+        request.destination.as_str()
+    ));
+    let outcome = match build_project(project, &request) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            spinner.finish_clear();
+            return Err(error);
+        }
+    };
+    spinner.finish_success(format!(
+        "Built {} for {}.",
+        outcome.receipt.target, outcome.receipt.profile
+    ));
     match outcome.receipt.destination.as_str() {
         "simulator" => run_on_simulator(project, &outcome.receipt),
         "device" => run_on_device(
@@ -95,26 +152,9 @@ pub fn run_on_destination(project: &ProjectContext, args: &RunArgs) -> Result<()
 }
 
 pub fn submit_artifact(project: &ProjectContext, args: &SubmitArgs) -> Result<()> {
-    let receipt = if let Some(receipt_path) = &args.receipt {
-        crate::build::receipt::load_receipt(receipt_path)?
-    } else {
-        find_latest_receipt(
-            &project.project_paths.receipts_dir,
-            args.target.as_deref(),
-            args.profile.as_deref(),
-        )?
-        .context("could not find a matching build receipt")?
-    };
+    let receipt = resolve_submit_receipt(project, args)?;
 
     crate::apple::auth::best_effort_app_store_authenticate(project)?;
-
-    if !receipt.submit_eligible {
-        bail!(
-            "receipt `{}` is not submit-eligible because it was built for `{:?}` distribution",
-            receipt.id,
-            receipt.distribution
-        );
-    }
 
     match receipt.platform {
         ApplePlatform::Ios
@@ -130,10 +170,8 @@ pub fn submit_artifact(project: &ProjectContext, args: &SubmitArgs) -> Result<()
 fn build_project(project: &ProjectContext, request: &BuildRequest) -> Result<BuildOutcome> {
     let root_target = project
         .manifest
-        .resolve_target(request.target_name.as_deref())?;
-    let platform = project
-        .manifest
-        .resolve_platform_for_target(root_target, None)?;
+        .resolve_target(Some(&request.target_name))?;
+    let platform = request.platform;
     let platform_manifest = project
         .manifest
         .platforms
@@ -143,13 +181,10 @@ fn build_project(project: &ProjectContext, request: &BuildRequest) -> Result<Bui
         .manifest
         .profile_for(platform, &request.profile_name)?;
 
-    let destination = request
-        .destination
-        .unwrap_or_else(|| default_destination_for_profile(profile));
     let toolchain = Toolchain::resolve(
         platform,
         platform_manifest.deployment_target.as_str(),
-        destination,
+        request.destination,
     )?;
 
     let build_root = project
@@ -162,7 +197,7 @@ fn build_project(project: &ProjectContext, request: &BuildRequest) -> Result<Bui
 
     let ordered_targets = project.manifest.topological_targets(&root_target.name)?;
     let mut built_targets = HashMap::new();
-    let signing_required = destination == DestinationKind::Device
+    let signing_required = request.destination == DestinationKind::Device
         || !matches!(profile.distribution, DistributionKind::Development);
     if signing_required {
         crate::apple::auth::best_effort_app_store_authenticate(project)?;
@@ -238,7 +273,7 @@ fn build_project(project: &ProjectContext, request: &BuildRequest) -> Result<Bui
         platform,
         &request.profile_name,
         profile.distribution,
-        destination.as_str(),
+        request.destination.as_str(),
         &root_target.bundle_id,
         root_target_built.bundle_path.clone(),
         artifact_path,
@@ -303,17 +338,108 @@ fn compile_target(
     })
 }
 
-fn resolve_destination(simulator: bool, device: bool) -> Option<DestinationKind> {
-    if device {
-        Some(DestinationKind::Device)
-    } else if simulator {
-        Some(DestinationKind::Simulator)
-    } else {
-        None
+fn resolve_requested_target<'a>(
+    project: &'a ProjectContext,
+    requested_target: Option<&str>,
+) -> Result<&'a TargetManifest> {
+    if let Some(requested_target) = requested_target {
+        return project.manifest.resolve_target(Some(requested_target));
     }
+
+    let mut candidates = project.manifest.selectable_root_targets();
+    if candidates.len() <= 1 || !project.app.interactive {
+        return candidates
+            .drain(..)
+            .next()
+            .context("manifest did not contain any targets");
+    }
+
+    let labels = candidates
+        .iter()
+        .map(|target| format!("{} ({})", target.name, target.bundle_id))
+        .collect::<Vec<_>>();
+    let index = prompt_select("Select a target", &labels)?;
+    Ok(candidates.remove(index))
 }
 
-fn default_destination_for_profile(profile: &ProfileManifest) -> DestinationKind {
+fn resolve_profile_name(
+    project: &ProjectContext,
+    platform: ApplePlatform,
+    requested_profile: Option<&str>,
+    default_profile: Option<&str>,
+    prompt: &str,
+) -> Result<String> {
+    if let Some(requested_profile) = requested_profile {
+        let _ = project.manifest.profile_for(platform, requested_profile)?;
+        return Ok(requested_profile.to_owned());
+    }
+
+    if let Some(default_profile) = default_profile {
+        if project
+            .manifest
+            .profile_for(platform, default_profile)
+            .is_ok()
+        {
+            return Ok(default_profile.to_owned());
+        }
+    }
+
+    let profiles = project.manifest.profile_names(platform)?;
+    if profiles.len() == 1 {
+        return Ok(profiles[0].clone());
+    }
+    if !project.app.interactive {
+        bail!(
+            "multiple profiles are available for platform `{platform}`; pass --profile ({})",
+            profiles.join(", ")
+        );
+    }
+
+    let index = prompt_select(prompt, &profiles)?;
+    Ok(profiles[index].clone())
+}
+
+fn resolve_destination(
+    project: &ProjectContext,
+    platform: ApplePlatform,
+    simulator: bool,
+    device: bool,
+    profile: &ProfileManifest,
+) -> Result<DestinationKind> {
+    if simulator && device {
+        bail!("--simulator and --device cannot be used together");
+    }
+    if platform == ApplePlatform::Macos {
+        if simulator {
+            bail!("macOS builds do not support `--simulator`");
+        }
+        return Ok(DestinationKind::Device);
+    }
+    if device {
+        return Ok(DestinationKind::Device);
+    }
+    if simulator {
+        return Ok(DestinationKind::Simulator);
+    }
+    if matches!(profile.distribution, DistributionKind::Development) && project.app.interactive {
+        let options = ["Simulator", "Physical device"];
+        let index = prompt_select("Select a destination", &options)?;
+        return Ok(match index {
+            0 => DestinationKind::Simulator,
+            _ => DestinationKind::Device,
+        });
+    }
+    Ok(default_destination_for_profile(platform, profile))
+}
+
+fn default_destination_for_profile(
+    platform: ApplePlatform,
+    profile: &ProfileManifest,
+) -> DestinationKind {
+    if platform == ApplePlatform::Macos {
+        return DestinationKind::Device;
+    }
+
     match profile.distribution {
         DistributionKind::Development => DestinationKind::Simulator,
         DistributionKind::AdHoc
@@ -321,6 +447,70 @@ fn default_destination_for_profile(profile: &ProfileManifest) -> DestinationKind
         | DistributionKind::DeveloperId
         | DistributionKind::MacAppStore => DestinationKind::Device,
     }
+}
+
+fn validate_run_distribution(profile: &ProfileManifest) -> Result<()> {
+    match profile.distribution {
+        DistributionKind::Development | DistributionKind::AdHoc => Ok(()),
+        DistributionKind::AppStore
+        | DistributionKind::DeveloperId
+        | DistributionKind::MacAppStore => {
+            bail!("`orbit run` only supports development or ad-hoc profiles")
+        }
+    }
+}
+
+fn validate_run_platform(platform: ApplePlatform) -> Result<()> {
+    match platform {
+        ApplePlatform::Ios => Ok(()),
+        ApplePlatform::Macos
+        | ApplePlatform::Tvos
+        | ApplePlatform::Visionos
+        | ApplePlatform::Watchos => bail!("`orbit run` is currently implemented for iOS targets"),
+    }
+}
+
+fn resolve_submit_receipt(project: &ProjectContext, args: &SubmitArgs) -> Result<BuildReceipt> {
+    if let Some(receipt_path) = &args.receipt {
+        let receipt = crate::build::receipt::load_receipt(receipt_path)?;
+        if !receipt.submit_eligible {
+            bail!(
+                "receipt `{}` is not submit-eligible because it was built for `{:?}` distribution",
+                receipt.id,
+                receipt.distribution
+            );
+        }
+        return Ok(receipt);
+    }
+
+    let mut receipts = list_receipts(
+        &project.project_paths.receipts_dir,
+        args.target.as_deref(),
+        args.profile.as_deref(),
+    )?;
+    receipts.retain(|receipt| receipt.submit_eligible);
+    receipts.sort_by(|left, right| right.created_at_unix.cmp(&left.created_at_unix));
+    if receipts.is_empty() {
+        bail!("could not find a submit-eligible build receipt");
+    }
+    if receipts.len() == 1 || !project.app.interactive {
+        return Ok(receipts.remove(0));
+    }
+
+    let labels = receipts.iter().map(receipt_label).collect::<Vec<_>>();
+    let index = prompt_select("Select a build receipt to submit", &labels)?;
+    Ok(receipts.remove(index))
+}
+
+fn receipt_label(receipt: &BuildReceipt) -> String {
+    format!(
+        "{} | {} | {} | {} | {}",
+        receipt.id,
+        receipt.target,
+        receipt.profile,
+        receipt.destination,
+        receipt.artifact_path.display()
+    )
 }
 
 fn resolve_target_sources(
