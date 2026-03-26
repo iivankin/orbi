@@ -13,10 +13,10 @@ Known gaps:
 - [ ] Fail clearly on unsupported entitlement/capability combinations instead of silently ignoring unknown keys.
 - [ ] Add provisioning profile and signing support for tvOS, visionOS, and watchOS distributions.
 - [ ] Implement end-to-end build/link/package support for `framework`, `static-library`, `dynamic-library`, and `executable` targets.
-- [ ] Implement complete watch target support, including watch app hosting, watch extension embedding/layout, and companion app rules.
-- [ ] Implement widget and other extension-specific Info.plist/settings payloads beyond `point_identifier` and `principal_class`.
-- [ ] Add Apple/system framework linking support.
-- [ ] Add XCFramework dependency resolution, slice selection, and embedding.
+- [x] Implement complete watch target support, including watch app hosting, watch extension embedding/layout, and companion app rules.
+- [x] Implement widget and other extension-specific Info.plist/settings payloads beyond `point_identifier` and `principal_class`.
+- [x] Add Apple/system framework linking support.
+- [x] Add XCFramework dependency resolution, slice selection, and embedding.
 - [ ] Expand SwiftPM dependency support beyond the current local-path single-product flow.
 - [ ] Expand the resource pipeline to compile storyboards/xibs, strings, privacy manifests, Core Data models, and other Apple-native bundle resources.
 - [ ] Support non-iOS `orbit run` flows where applicable, including macOS host run and other supported Apple platforms.

@@ -1,0 +1,75 @@
+{
+  "name": "ExampleWatchApp",
+  "version": "0.1.0",
+  "platform": "apple",
+  "platforms": {
+    "ios": {
+      "deployment_target": "18.0",
+      "profiles": {
+        "development": {
+          "configuration": "debug",
+          "distribution": "development"
+        }
+      }
+    },
+    "watchos": {
+      "deployment_target": "11.0",
+      "profiles": {
+        "development": {
+          "configuration": "debug",
+          "distribution": "development"
+        }
+      }
+    }
+  },
+  "targets": [
+    {
+      "name": "ExampleCompanionApp",
+      "kind": "app",
+      "bundle_id": "dev.orbit.examples.watchapp",
+      "platforms": [
+        "ios"
+      ],
+      "sources": [
+        "Sources/App"
+      ],
+      "dependencies": [
+        "ExampleWatchApp"
+      ]
+    },
+    {
+      "name": "ExampleWatchApp",
+      "kind": "watch-app",
+      "bundle_id": "dev.orbit.examples.watchapp.watchkitapp",
+      "platforms": [
+        "watchos"
+      ],
+      "sources": [
+        "Sources/WatchApp"
+      ],
+      "dependencies": [
+        "ExampleWatchExtension"
+      ]
+    },
+    {
+      "name": "ExampleWatchExtension",
+      "kind": "watch-extension",
+      "bundle_id": "dev.orbit.examples.watchapp.watchkitapp.watchkitextension",
+      "platforms": [
+        "watchos"
+      ],
+      "sources": [
+        "Sources/WatchExtension"
+      ],
+      "extension": {
+        "point_identifier": "com.apple.watchkit",
+        "principal_class": "WatchExtensionDelegate",
+        "NSExtensionAttributes": {
+          "WKBackgroundModes": [
+            "workout-processing"
+          ]
+        }
+      }
+    }
+  ]
+}

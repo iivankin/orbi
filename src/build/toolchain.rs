@@ -27,6 +27,7 @@ pub struct Toolchain {
     pub sdk_name: String,
     pub sdk_path: PathBuf,
     pub deployment_target: String,
+    pub architecture: String,
     pub target_triple: String,
 }
 
@@ -56,7 +57,14 @@ impl Toolchain {
         ]))?;
         let sdk_path = PathBuf::from(sdk_path.trim());
 
-        let architecture = host_architecture()?;
+        let host_architecture = host_architecture()?;
+        let architecture = match (platform, destination) {
+            (ApplePlatform::Ios, DestinationKind::Device)
+            | (ApplePlatform::Tvos, DestinationKind::Device)
+            | (ApplePlatform::Visionos, DestinationKind::Device) => "arm64".to_owned(),
+            (ApplePlatform::Watchos, DestinationKind::Device) => "arm64_32".to_owned(),
+            _ => host_architecture.clone(),
+        };
         let target_triple = match (platform, destination) {
             (ApplePlatform::Ios, DestinationKind::Simulator) => {
                 format!("{architecture}-apple-ios{deployment_target}-simulator")
@@ -91,6 +99,7 @@ impl Toolchain {
             sdk_name,
             sdk_path,
             deployment_target: deployment_target.to_owned(),
+            architecture,
             target_triple,
         })
     }
@@ -105,6 +114,12 @@ impl Toolchain {
         let tool = if cpp { "clang++" } else { "clang" };
         let mut command = Command::new("xcrun");
         command.args(["--sdk", self.sdk_name.as_str(), tool]);
+        command
+    }
+
+    pub fn libtool(&self) -> Command {
+        let mut command = Command::new("xcrun");
+        command.args(["--sdk", self.sdk_name.as_str(), "libtool"]);
         command
     }
 

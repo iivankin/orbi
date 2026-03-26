@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
+use serde_json::Value as JsonValue;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Manifest {
@@ -94,6 +95,14 @@ pub struct TargetManifest {
     #[serde(default)]
     pub dependencies: Vec<String>,
     #[serde(default)]
+    pub frameworks: Vec<String>,
+    #[serde(default)]
+    pub weak_frameworks: Vec<String>,
+    #[serde(default)]
+    pub system_libraries: Vec<String>,
+    #[serde(default)]
+    pub xcframeworks: Vec<XcframeworkDependency>,
+    #[serde(default)]
     pub swift_packages: Vec<SwiftPackageDependency>,
     pub entitlements: Option<PathBuf>,
     #[serde(default)]
@@ -161,9 +170,23 @@ pub struct SwiftPackageDependency {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct XcframeworkDependency {
+    pub path: PathBuf,
+    pub library: Option<String>,
+    #[serde(default = "default_xcframework_embed")]
+    pub embed: bool,
+}
+
+fn default_xcframework_embed() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExtensionManifest {
     pub point_identifier: String,
     pub principal_class: String,
+    #[serde(default, flatten)]
+    pub extra: BTreeMap<String, JsonValue>,
 }
 
 impl Manifest {
@@ -196,6 +219,7 @@ impl Manifest {
             .iter()
             .map(|target| target.name.as_str())
             .collect::<HashSet<_>>();
+        let mut dependents_by_target = HashMap::<&str, Vec<&TargetManifest>>::new();
 
         for (platform, manifest) in &self.platforms {
             if manifest.deployment_target.trim().is_empty() {
@@ -228,6 +252,10 @@ impl Manifest {
                         target.name
                     );
                 }
+                dependents_by_target
+                    .entry(dependency.as_str())
+                    .or_default()
+                    .push(target);
             }
             match target.kind {
                 TargetKind::AppExtension
@@ -243,6 +271,25 @@ impl Manifest {
                 }
                 _ => {}
             }
+
+            if matches!(target.kind, TargetKind::App)
+                && target
+                    .dependencies
+                    .iter()
+                    .filter(|dependency| {
+                        self.targets.iter().any(|candidate| {
+                            candidate.name == **dependency
+                                && matches!(candidate.kind, TargetKind::WatchApp)
+                        })
+                    })
+                    .count()
+                    > 1
+            {
+                bail!(
+                    "app target `{}` cannot host more than one watch app",
+                    target.name
+                );
+            }
         }
 
         let target_name_set = self
@@ -252,6 +299,40 @@ impl Manifest {
             .collect::<HashSet<_>>();
         if target_name_set.len() != self.targets.len() {
             bail!("target names must be unique");
+        }
+
+        for target in &self.targets {
+            match target.kind {
+                TargetKind::WatchApp => {
+                    let host_apps = dependents_by_target
+                        .get(target.name.as_str())
+                        .into_iter()
+                        .flatten()
+                        .filter(|dependent| matches!(dependent.kind, TargetKind::App))
+                        .count();
+                    if host_apps > 1 {
+                        bail!(
+                            "watch app target `{}` cannot be hosted by more than one app target",
+                            target.name
+                        );
+                    }
+                }
+                TargetKind::WatchExtension => {
+                    let host_watch_apps = dependents_by_target
+                        .get(target.name.as_str())
+                        .into_iter()
+                        .flatten()
+                        .filter(|dependent| matches!(dependent.kind, TargetKind::WatchApp))
+                        .count();
+                    if host_watch_apps != 1 {
+                        bail!(
+                            "watch extension target `{}` must be hosted by exactly one watch app target",
+                            target.name
+                        );
+                    }
+                }
+                _ => {}
+            }
         }
 
         Ok(())
@@ -465,5 +546,67 @@ mod tests {
             .map(|target| target.name.clone())
             .collect::<Vec<_>>();
         assert_eq!(target_names, vec!["ExampleExtensionApp".to_owned()]);
+    }
+
+    #[test]
+    fn sorts_watch_dependencies_inside_companion_graph() {
+        let manifest = Manifest::load(&fixture("examples/ios-watch-app/orbit.json")).unwrap();
+        let ordered = manifest
+            .topological_targets("ExampleCompanionApp")
+            .unwrap()
+            .into_iter()
+            .map(|target| target.name.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ordered,
+            vec![
+                "ExampleWatchExtension".to_owned(),
+                "ExampleWatchApp".to_owned(),
+                "ExampleCompanionApp".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_unhosted_watch_extension_targets() {
+        let manifest = serde_json::json!({
+            "name": "BrokenWatchApp",
+            "version": "0.1.0",
+            "platform": "apple",
+            "platforms": {
+                "watchos": {
+                    "deployment_target": "11.0",
+                    "profiles": {
+                        "development": {
+                            "configuration": "debug",
+                            "distribution": "development"
+                        }
+                    }
+                }
+            },
+            "targets": [
+                {
+                    "name": "OrphanWatchExtension",
+                    "kind": "watch-extension",
+                    "bundle_id": "dev.orbit.examples.orphan.watchkitextension",
+                    "platforms": ["watchos"],
+                    "sources": ["Sources/WatchExtension"],
+                    "extension": {
+                        "point_identifier": "com.apple.watchkit",
+                        "principal_class": "WatchExtensionDelegate"
+                    }
+                }
+            ]
+        });
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("orbit.json");
+        std::fs::write(&path, serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
+
+        let error = Manifest::load(&path).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("must be hosted by exactly one watch app target")
+        );
     }
 }

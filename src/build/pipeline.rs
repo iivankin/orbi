@@ -15,7 +15,7 @@ use crate::cli::{BuildArgs, RunArgs, SubmitArgs};
 use crate::context::ProjectContext;
 use crate::manifest::{
     ApplePlatform, DistributionKind, ExtensionManifest, ProfileManifest, SwiftPackageDependency,
-    TargetKind, TargetManifest,
+    TargetKind, TargetManifest, XcframeworkDependency,
 };
 use crate::util::{
     CliSpinner, collect_files_with_extensions, command_output, copy_dir_recursive, copy_file,
@@ -37,6 +37,17 @@ struct BuiltTarget {
     target_name: String,
     target_kind: TargetKind,
     bundle_path: PathBuf,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ExternalLinkInputs {
+    module_search_paths: Vec<PathBuf>,
+    framework_search_paths: Vec<PathBuf>,
+    library_search_paths: Vec<PathBuf>,
+    link_frameworks: Vec<String>,
+    weak_frameworks: Vec<String>,
+    link_libraries: Vec<String>,
+    embedded_payloads: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -202,7 +213,7 @@ fn build_project(project: &ProjectContext, request: &BuildRequest) -> Result<Bui
     if signing_required {
         crate::apple::auth::best_effort_app_store_authenticate(project)?;
     }
-    for target in ordered_targets {
+    for target in &ordered_targets {
         let built = compile_target(
             project,
             &toolchain,
@@ -214,17 +225,17 @@ fn build_project(project: &ProjectContext, request: &BuildRequest) -> Result<Bui
         built_targets.insert(target.name.clone(), built);
     }
 
-    if signing_required {
-        for target in project
-            .manifest
-            .topological_targets(&root_target.name)?
-            .into_iter()
-            .filter(|target| target.name != root_target.name)
-        {
-            if !target.kind.is_bundle() {
-                continue;
-            }
-            let built = built_targets
+    for target in &ordered_targets {
+        if target.kind.is_bundle() {
+            let built_targets_snapshot = built_targets.clone();
+            let built_target = built_targets
+                .get_mut(&target.name)
+                .with_context(|| format!("missing built target `{}`", target.name))?;
+            embed_dependencies(project, target, &built_targets_snapshot, built_target)?;
+        }
+
+        if signing_required && target.kind.is_bundle() {
+            let built_target = built_targets
                 .get(&target.name)
                 .with_context(|| format!("missing built target `{}`", target.name))?;
             let material = crate::apple::signing::prepare_signing(
@@ -234,32 +245,13 @@ fn build_project(project: &ProjectContext, request: &BuildRequest) -> Result<Bui
                 profile,
                 request.provisioning_udids.clone(),
             )?;
-            crate::apple::signing::sign_bundle(&built.bundle_path, &material)?;
+            crate::apple::signing::sign_bundle(&built_target.bundle_path, &material)?;
         }
     }
 
-    let built_targets_snapshot = built_targets.clone();
     let root_target_built = built_targets
-        .get_mut(&root_target.name)
+        .get(&root_target.name)
         .context("root target did not build")?;
-    embed_dependencies(
-        project,
-        &root_target.name,
-        &built_targets_snapshot,
-        root_target_built,
-    )?;
-
-    if signing_required {
-        let material = crate::apple::signing::prepare_signing(
-            project,
-            root_target,
-            platform,
-            profile,
-            request.provisioning_udids.clone(),
-        )?;
-        crate::apple::signing::sign_bundle(&root_target_built.bundle_path, &material)?;
-    }
-
     let artifact_path = export_artifact(
         project,
         root_target_built,
@@ -302,6 +294,8 @@ fn compile_target(
 
     let package_outputs =
         compile_swift_packages(project, toolchain, profile, &intermediates_dir, target)?;
+    let external_link_inputs =
+        resolve_external_link_inputs(project, toolchain, &intermediates_dir, target)?;
     let c_objects =
         compile_c_family_sources(project, toolchain, profile, &intermediates_dir, target)?;
     let swift_sources = resolve_target_sources(project, target, &["swift"])?;
@@ -315,12 +309,19 @@ fn compile_target(
             target.kind,
             &swift_sources,
             &package_outputs,
+            &external_link_inputs,
             &c_objects,
             &executable_name,
             &executable_path,
         )?;
     } else if !c_objects.is_empty() {
-        link_native_target(toolchain, profile, &c_objects, &executable_path)?;
+        link_native_target(
+            toolchain,
+            profile,
+            &external_link_inputs,
+            &c_objects,
+            &executable_path,
+        )?;
     } else {
         bail!(
             "target `{}` did not resolve any compilable sources",
@@ -330,6 +331,7 @@ fn compile_target(
 
     write_info_plist(project, toolchain, target, &bundle_root, profile_name)?;
     process_resources(project, toolchain, target, &bundle_root)?;
+    embed_external_payloads(&external_link_inputs, &bundle_root)?;
 
     Ok(BuiltTarget {
         target_name: target.name.clone(),
@@ -583,6 +585,7 @@ fn compile_swift_target(
     target_kind: TargetKind,
     swift_sources: &[PathBuf],
     package_outputs: &[PackageBuildOutput],
+    external_link_inputs: &ExternalLinkInputs,
     object_files: &[PathBuf],
     module_name: &str,
     executable_path: &Path,
@@ -611,6 +614,7 @@ fn compile_swift_target(
             command.arg("-l").arg(library);
         }
     }
+    apply_external_link_inputs(&mut command, external_link_inputs);
     for object_file in object_files {
         command.arg(object_file);
     }
@@ -623,6 +627,7 @@ fn compile_swift_target(
 fn link_native_target(
     toolchain: &Toolchain,
     profile: &ProfileManifest,
+    external_link_inputs: &ExternalLinkInputs,
     object_files: &[PathBuf],
     executable_path: &Path,
 ) -> Result<()> {
@@ -635,6 +640,7 @@ fn link_native_target(
     } else {
         command.arg("-O2");
     }
+    apply_external_link_inputs(&mut command, external_link_inputs);
     for object_file in object_files {
         command.arg(object_file);
     }
@@ -695,16 +701,37 @@ fn write_info_plist(
     );
 
     match target.kind {
-        TargetKind::App | TargetKind::WatchApp => {
+        TargetKind::App => {
             plist.insert(
                 "CFBundlePackageType".to_owned(),
                 Value::String("APPL".to_owned()),
             );
-            plist.insert("LSRequiresIPhoneOS".to_owned(), Value::Boolean(true));
+            if matches!(toolchain.platform, ApplePlatform::Ios) {
+                plist.insert("LSRequiresIPhoneOS".to_owned(), Value::Boolean(true));
+            }
             plist.insert(
                 "MinimumOSVersion".to_owned(),
                 Value::String(toolchain.deployment_target.clone()),
             );
+        }
+        TargetKind::WatchApp => {
+            plist.insert(
+                "CFBundlePackageType".to_owned(),
+                Value::String("APPL".to_owned()),
+            );
+            plist.insert(
+                "MinimumOSVersion".to_owned(),
+                Value::String(toolchain.deployment_target.clone()),
+            );
+            plist.insert("WKWatchKitApp".to_owned(), Value::Boolean(true));
+            if let Some(companion_bundle_id) =
+                parent_bundle_id(project, &target.name, TargetKind::App)
+            {
+                plist.insert(
+                    "WKCompanionAppBundleIdentifier".to_owned(),
+                    Value::String(companion_bundle_id),
+                );
+            }
         }
         TargetKind::AppExtension | TargetKind::WatchExtension | TargetKind::WidgetExtension => {
             plist.insert(
@@ -715,15 +742,24 @@ fn write_info_plist(
                 "MinimumOSVersion".to_owned(),
                 Value::String(toolchain.deployment_target.clone()),
             );
-            plist.insert(
-                "NSExtension".to_owned(),
-                Value::Dictionary(extension_plist(
-                    target
-                        .extension
-                        .as_ref()
-                        .context("extension configuration missing")?,
-                )),
-            );
+            let mut extension = extension_plist(
+                target
+                    .extension
+                    .as_ref()
+                    .context("extension configuration missing")?,
+            )?;
+            if matches!(target.kind, TargetKind::WatchExtension) {
+                let watch_bundle_id = parent_bundle_id(project, &target.name, TargetKind::WatchApp)
+                    .context("watch extension must be hosted by a watch app target")?;
+                merge_extension_attributes(
+                    &mut extension,
+                    Dictionary::from_iter([(
+                        "WKAppBundleIdentifier".to_owned(),
+                        Value::String(watch_bundle_id),
+                    )]),
+                );
+            }
+            plist.insert("NSExtension".to_owned(), Value::Dictionary(extension));
         }
         _ => {
             bail!(
@@ -745,8 +781,11 @@ fn write_info_plist(
         .with_context(|| format!("failed to write {}", path.display()))
 }
 
-fn extension_plist(config: &ExtensionManifest) -> Dictionary {
+fn extension_plist(config: &ExtensionManifest) -> Result<Dictionary> {
     let mut extension = Dictionary::new();
+    for (key, value) in &config.extra {
+        extension.insert(key.clone(), json_to_plist(value)?);
+    }
     extension.insert(
         "NSExtensionPointIdentifier".to_owned(),
         Value::String(config.point_identifier.clone()),
@@ -755,7 +794,71 @@ fn extension_plist(config: &ExtensionManifest) -> Dictionary {
         "NSExtensionPrincipalClass".to_owned(),
         Value::String(config.principal_class.clone()),
     );
-    extension
+    Ok(extension)
+}
+
+fn json_to_plist(value: &serde_json::Value) -> Result<Value> {
+    Ok(match value {
+        serde_json::Value::Null => bail!("null values are not supported in extension plist extras"),
+        serde_json::Value::Bool(value) => Value::Boolean(*value),
+        serde_json::Value::Number(value) => {
+            if let Some(integer) = value.as_i64() {
+                Value::Integer(integer.into())
+            } else if let Some(float) = value.as_f64() {
+                Value::Real(float)
+            } else {
+                bail!("JSON number `{value}` is not representable in a plist");
+            }
+        }
+        serde_json::Value::String(value) => Value::String(value.clone()),
+        serde_json::Value::Array(values) => Value::Array(
+            values
+                .iter()
+                .map(json_to_plist)
+                .collect::<Result<Vec<_>>>()?,
+        ),
+        serde_json::Value::Object(values) => Value::Dictionary(Dictionary::from_iter(
+            values
+                .iter()
+                .map(|(key, value)| Ok((key.clone(), json_to_plist(value)?)))
+                .collect::<Result<Vec<_>>>()?,
+        )),
+    })
+}
+
+fn merge_extension_attributes(extension: &mut Dictionary, attributes: Dictionary) {
+    if !extension.contains_key("NSExtensionAttributes") {
+        extension.insert(
+            "NSExtensionAttributes".to_owned(),
+            Value::Dictionary(Dictionary::new()),
+        );
+    }
+    let existing_attributes = extension
+        .get_mut("NSExtensionAttributes")
+        .and_then(Value::as_dictionary_mut)
+        .expect("NSExtensionAttributes must remain a dictionary");
+    for (key, value) in attributes {
+        existing_attributes.insert(key, value);
+    }
+}
+
+fn parent_bundle_id(
+    project: &ProjectContext,
+    target_name: &str,
+    parent_kind: TargetKind,
+) -> Option<String> {
+    project
+        .manifest
+        .targets
+        .iter()
+        .find(|candidate| {
+            candidate.kind == parent_kind
+                && candidate
+                    .dependencies
+                    .iter()
+                    .any(|name| name == target_name)
+        })
+        .map(|target| target.bundle_id.clone())
 }
 
 fn process_resources(
@@ -872,36 +975,50 @@ fn compile_asset_catalogs(
 }
 
 fn embed_dependencies(
-    project: &ProjectContext,
-    root_target_name: &str,
+    _project: &ProjectContext,
+    root_target: &TargetManifest,
     built_targets: &HashMap<String, BuiltTarget>,
-    root_target: &mut BuiltTarget,
+    built_root_target: &mut BuiltTarget,
 ) -> Result<()> {
-    let root_manifest = project.manifest.resolve_target(Some(root_target_name))?;
-    for dependency_name in &root_manifest.dependencies {
+    for dependency_name in &root_target.dependencies {
         let built = built_targets
             .get(dependency_name)
             .with_context(|| format!("missing built dependency `{dependency_name}`"))?;
-        let destination = match built.target_kind {
-            TargetKind::AppExtension | TargetKind::WatchExtension | TargetKind::WidgetExtension => {
-                root_target.bundle_path.join("PlugIns").join(
-                    built
-                        .bundle_path
-                        .file_name()
-                        .context("dependency bundle name missing")?,
-                )
-            }
-            TargetKind::Framework => root_target.bundle_path.join("Frameworks").join(
-                built
-                    .bundle_path
-                    .file_name()
-                    .context("framework bundle name missing")?,
-            ),
-            _ => continue,
+        let Some(destination_root) = embedded_dependency_root(root_target.kind, built.target_kind)
+        else {
+            continue;
         };
+        let destination = built_root_target.bundle_path.join(destination_root).join(
+            built
+                .bundle_path
+                .file_name()
+                .context("dependency bundle name missing")?,
+        );
         copy_dir_recursive(&built.bundle_path, &destination)?;
     }
     Ok(())
+}
+
+fn embedded_dependency_root(
+    parent_kind: TargetKind,
+    child_kind: TargetKind,
+) -> Option<&'static str> {
+    match (parent_kind, child_kind) {
+        (
+            TargetKind::App | TargetKind::WatchApp,
+            TargetKind::AppExtension | TargetKind::WatchExtension | TargetKind::WidgetExtension,
+        ) => Some("PlugIns"),
+        (TargetKind::App, TargetKind::WatchApp) => Some("Watch"),
+        (
+            TargetKind::App
+            | TargetKind::AppExtension
+            | TargetKind::WatchApp
+            | TargetKind::WatchExtension
+            | TargetKind::WidgetExtension,
+            TargetKind::Framework,
+        ) => Some("Frameworks"),
+        _ => None,
+    }
 }
 
 fn export_artifact(
@@ -1158,6 +1275,28 @@ struct PackageBuildOutput {
     link_libraries: Vec<String>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct XcframeworkInfoPlist {
+    #[serde(rename = "AvailableLibraries")]
+    available_libraries: Vec<XcframeworkLibrary>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct XcframeworkLibrary {
+    #[serde(rename = "LibraryIdentifier")]
+    library_identifier: String,
+    #[serde(rename = "LibraryPath")]
+    library_path: String,
+    #[serde(rename = "HeadersPath")]
+    headers_path: Option<String>,
+    #[serde(rename = "SupportedPlatform")]
+    supported_platform: String,
+    #[serde(rename = "SupportedPlatformVariant")]
+    supported_platform_variant: Option<String>,
+    #[serde(rename = "SupportedArchitectures")]
+    supported_architectures: Vec<String>,
+}
+
 fn compile_swift_packages(
     project: &ProjectContext,
     toolchain: &Toolchain,
@@ -1178,6 +1317,209 @@ fn compile_swift_packages(
     }
 
     Ok(outputs)
+}
+
+fn resolve_external_link_inputs(
+    project: &ProjectContext,
+    toolchain: &Toolchain,
+    intermediates_dir: &Path,
+    target: &TargetManifest,
+) -> Result<ExternalLinkInputs> {
+    let mut inputs = ExternalLinkInputs {
+        link_frameworks: target.frameworks.clone(),
+        weak_frameworks: target.weak_frameworks.clone(),
+        link_libraries: target.system_libraries.clone(),
+        ..ExternalLinkInputs::default()
+    };
+
+    for dependency in &target.xcframeworks {
+        merge_external_link_inputs(
+            &mut inputs,
+            resolve_xcframework_dependency(project, toolchain, intermediates_dir, dependency)?,
+        );
+    }
+
+    dedup_vec(&mut inputs.module_search_paths);
+    dedup_vec(&mut inputs.framework_search_paths);
+    dedup_vec(&mut inputs.library_search_paths);
+    dedup_vec(&mut inputs.link_frameworks);
+    dedup_vec(&mut inputs.weak_frameworks);
+    dedup_vec(&mut inputs.link_libraries);
+    dedup_vec(&mut inputs.embedded_payloads);
+
+    Ok(inputs)
+}
+
+fn resolve_xcframework_dependency(
+    project: &ProjectContext,
+    toolchain: &Toolchain,
+    _intermediates_dir: &Path,
+    dependency: &XcframeworkDependency,
+) -> Result<ExternalLinkInputs> {
+    let xcframework_root = resolve_path(&project.root, &dependency.path);
+    let info_path = xcframework_root.join("Info.plist");
+    let info: XcframeworkInfoPlist = plist::from_file(&info_path)
+        .with_context(|| format!("failed to parse {}", info_path.display()))?;
+    let library =
+        select_xcframework_library(toolchain, &info.available_libraries).with_context(|| {
+            format!(
+                "failed to select XCFramework slice for {}",
+                xcframework_root.display()
+            )
+        })?;
+    let slice_root = xcframework_root.join(&library.library_identifier);
+    let library_path = slice_root.join(&library.library_path);
+    let mut inputs = ExternalLinkInputs::default();
+
+    if let Some(headers_path) = &library.headers_path {
+        let headers_root = slice_root.join(headers_path);
+        inputs.module_search_paths.push(headers_root);
+    }
+
+    let explicit_name = dependency.library.as_ref().map(|name| name.as_str());
+    let file_name = library_path
+        .file_name()
+        .and_then(OsStr::to_str)
+        .context("XCFramework library path is missing a file name")?;
+    if file_name.ends_with(".framework") {
+        let framework_name = explicit_name
+            .map(ToOwned::to_owned)
+            .or_else(|| {
+                Path::new(file_name)
+                    .file_stem()
+                    .and_then(OsStr::to_str)
+                    .map(ToOwned::to_owned)
+            })
+            .context("failed to derive XCFramework framework name")?;
+        inputs.framework_search_paths.push(
+            library_path
+                .parent()
+                .context("framework path is missing a parent")?
+                .to_path_buf(),
+        );
+        inputs.link_frameworks.push(framework_name);
+        if dependency.embed {
+            inputs.embedded_payloads.push(library_path);
+        }
+    } else {
+        let library_name = explicit_name
+            .map(ToOwned::to_owned)
+            .or_else(|| {
+                file_name
+                    .strip_prefix("lib")
+                    .and_then(|value| {
+                        value
+                            .strip_suffix(".a")
+                            .or_else(|| value.strip_suffix(".dylib"))
+                    })
+                    .map(ToOwned::to_owned)
+            })
+            .context("failed to derive XCFramework library name")?;
+        inputs.library_search_paths.push(
+            library_path
+                .parent()
+                .context("library path is missing a parent")?
+                .to_path_buf(),
+        );
+        inputs.link_libraries.push(library_name);
+        if dependency.embed && file_name.ends_with(".dylib") {
+            inputs.embedded_payloads.push(library_path);
+        }
+    }
+
+    Ok(inputs)
+}
+
+fn select_xcframework_library<'a>(
+    toolchain: &Toolchain,
+    available_libraries: &'a [XcframeworkLibrary],
+) -> Option<&'a XcframeworkLibrary> {
+    let platform = match toolchain.platform {
+        ApplePlatform::Ios => "ios",
+        ApplePlatform::Macos => "macos",
+        ApplePlatform::Tvos => "tvos",
+        ApplePlatform::Visionos => "xros",
+        ApplePlatform::Watchos => "watchos",
+    };
+    let variant = match toolchain.destination {
+        DestinationKind::Simulator => Some("simulator"),
+        DestinationKind::Device => None,
+    };
+
+    available_libraries.iter().find(|library| {
+        library.supported_platform == platform
+            && library.supported_platform_variant.as_deref() == variant
+            && library
+                .supported_architectures
+                .iter()
+                .any(|architecture| architecture == &toolchain.architecture)
+    })
+}
+
+fn merge_external_link_inputs(target: &mut ExternalLinkInputs, source: ExternalLinkInputs) {
+    target
+        .module_search_paths
+        .extend(source.module_search_paths);
+    target
+        .framework_search_paths
+        .extend(source.framework_search_paths);
+    target
+        .library_search_paths
+        .extend(source.library_search_paths);
+    target.link_frameworks.extend(source.link_frameworks);
+    target.weak_frameworks.extend(source.weak_frameworks);
+    target.link_libraries.extend(source.link_libraries);
+    target.embedded_payloads.extend(source.embedded_payloads);
+}
+
+fn apply_external_link_inputs(command: &mut Command, inputs: &ExternalLinkInputs) {
+    for path in &inputs.module_search_paths {
+        command.arg("-I").arg(path);
+    }
+    for path in &inputs.framework_search_paths {
+        command.arg("-F").arg(path);
+    }
+    for path in &inputs.library_search_paths {
+        command.arg("-L").arg(path);
+    }
+    for framework in &inputs.link_frameworks {
+        command.arg("-framework").arg(framework);
+    }
+    for framework in &inputs.weak_frameworks {
+        command.arg("-weak_framework").arg(framework);
+    }
+    for library in &inputs.link_libraries {
+        command.arg("-l").arg(library);
+    }
+}
+
+fn embed_external_payloads(inputs: &ExternalLinkInputs, bundle_root: &Path) -> Result<()> {
+    if inputs.embedded_payloads.is_empty() {
+        return Ok(());
+    }
+
+    let frameworks_root = bundle_root.join("Frameworks");
+    ensure_dir(&frameworks_root)?;
+    for payload in &inputs.embedded_payloads {
+        let file_name = payload
+            .file_name()
+            .context("embedded payload path is missing a file name")?;
+        let destination = frameworks_root.join(file_name);
+        if payload.is_dir() {
+            copy_dir_recursive(payload, &destination)?;
+        } else {
+            copy_file(payload, &destination)?;
+        }
+    }
+    Ok(())
+}
+
+fn dedup_vec<T>(values: &mut Vec<T>)
+where
+    T: Ord,
+{
+    values.sort();
+    values.dedup();
 }
 
 fn compile_swift_package(
@@ -1382,4 +1724,136 @@ fn select_physical_device(
         .collect::<Vec<_>>();
     let index = prompt_select("Select a physical device", &labels)?;
     Ok(physical.remove(index))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use plist::Dictionary;
+    use serde_json::json;
+
+    use super::{
+        ApplePlatform, DestinationKind, ExtensionManifest, TargetKind, Toolchain,
+        XcframeworkLibrary, embedded_dependency_root, extension_plist, json_to_plist,
+        merge_extension_attributes, select_xcframework_library,
+    };
+
+    #[test]
+    fn embeds_watch_children_into_expected_subdirectories() {
+        assert_eq!(
+            embedded_dependency_root(TargetKind::App, TargetKind::WatchApp),
+            Some("Watch")
+        );
+        assert_eq!(
+            embedded_dependency_root(TargetKind::WatchApp, TargetKind::WatchExtension),
+            Some("PlugIns")
+        );
+        assert_eq!(
+            embedded_dependency_root(TargetKind::WatchApp, TargetKind::Framework),
+            Some("Frameworks")
+        );
+    }
+
+    #[test]
+    fn preserves_extra_extension_entries() {
+        let extension = ExtensionManifest {
+            point_identifier: "com.apple.widgetkit-extension".to_owned(),
+            principal_class: "WidgetPrincipal".to_owned(),
+            extra: BTreeMap::from([(
+                "NSExtensionAttributes".to_owned(),
+                json!({
+                    "WKBackgroundModes": ["workout-processing"]
+                }),
+            )]),
+        };
+        let mut plist = extension_plist(&extension).unwrap();
+        merge_extension_attributes(
+            &mut plist,
+            Dictionary::from_iter([(
+                "WKAppBundleIdentifier".to_owned(),
+                plist::Value::String("dev.orbit.examples.watch.watchkitapp".to_owned()),
+            )]),
+        );
+
+        let attributes = plist
+            .get("NSExtensionAttributes")
+            .and_then(plist::Value::as_dictionary)
+            .unwrap();
+        assert_eq!(
+            attributes
+                .get("WKBackgroundModes")
+                .and_then(plist::Value::as_array)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            attributes
+                .get("WKAppBundleIdentifier")
+                .and_then(plist::Value::as_string)
+                .unwrap(),
+            "dev.orbit.examples.watch.watchkitapp"
+        );
+    }
+
+    #[test]
+    fn converts_nested_json_values_into_plist_values() {
+        let value = json_to_plist(&json!({
+            "Enabled": true,
+            "Count": 3,
+            "Items": ["one", "two"]
+        }))
+        .unwrap();
+        let dictionary = value.as_dictionary().unwrap();
+        assert_eq!(
+            dictionary
+                .get("Enabled")
+                .and_then(plist::Value::as_boolean)
+                .unwrap(),
+            true
+        );
+        assert_eq!(
+            dictionary
+                .get("Items")
+                .and_then(plist::Value::as_array)
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn selects_matching_xcframework_slice_for_target_platform() {
+        let toolchain = Toolchain {
+            platform: ApplePlatform::Ios,
+            destination: DestinationKind::Simulator,
+            sdk_name: "iphonesimulator".to_owned(),
+            sdk_path: "/tmp/sdk".into(),
+            deployment_target: "18.0".to_owned(),
+            architecture: "arm64".to_owned(),
+            target_triple: "arm64-apple-ios18.0-simulator".to_owned(),
+        };
+        let slices = vec![
+            XcframeworkLibrary {
+                library_identifier: "ios-arm64".to_owned(),
+                library_path: "Orbit.framework".to_owned(),
+                headers_path: None,
+                supported_platform: "ios".to_owned(),
+                supported_platform_variant: None,
+                supported_architectures: vec!["arm64".to_owned()],
+            },
+            XcframeworkLibrary {
+                library_identifier: "ios-arm64_x86_64-simulator".to_owned(),
+                library_path: "Orbit.framework".to_owned(),
+                headers_path: None,
+                supported_platform: "ios".to_owned(),
+                supported_platform_variant: Some("simulator".to_owned()),
+                supported_architectures: vec!["arm64".to_owned(), "x86_64".to_owned()],
+            },
+        ];
+
+        let selected = select_xcframework_library(&toolchain, &slices).unwrap();
+        assert_eq!(selected.library_identifier, "ios-arm64_x86_64-simulator");
+    }
 }
