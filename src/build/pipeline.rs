@@ -7,7 +7,7 @@ use std::process::Command;
 use anyhow::{Context, Result, bail};
 use plist::{Dictionary, Value};
 use serde::Deserialize;
-use tempfile::tempdir;
+use tempfile::{NamedTempFile, tempdir};
 
 use crate::build::receipt::{BuildReceipt, list_receipts, write_receipt};
 use crate::build::toolchain::{DestinationKind, Toolchain};
@@ -165,16 +165,25 @@ pub fn run_on_destination(project: &ProjectContext, args: &RunArgs) -> Result<()
     match (
         outcome.receipt.platform,
         outcome.receipt.destination.as_str(),
+        args.debug,
     ) {
-        (ApplePlatform::Macos, _) => run_on_macos(&outcome.receipt),
-        (_, "simulator") => run_on_simulator(project, &outcome.receipt),
-        (_, "device") => run_on_device(
+        (ApplePlatform::Macos, _, false) => run_on_macos(&outcome.receipt),
+        (ApplePlatform::Macos, _, true) => debug_on_macos(&outcome.receipt),
+        (_, "simulator", false) => run_on_simulator(project, &outcome.receipt),
+        (_, "simulator", true) => debug_on_simulator(project, &outcome.receipt),
+        (_, "device", false) => run_on_device(
             selected_device
                 .as_ref()
                 .context("device run requested without a selected physical device")?,
             &outcome.receipt,
         ),
-        (_, other) => bail!("unsupported run destination `{other}`"),
+        (_, "device", true) => debug_on_device(
+            selected_device
+                .as_ref()
+                .context("device run requested without a selected physical device")?,
+            &outcome.receipt,
+        ),
+        (_, other, _) => bail!("unsupported run destination `{other}`"),
     }
 }
 
@@ -503,8 +512,8 @@ fn validate_run_platform(platform: ApplePlatform) -> Result<()> {
         ApplePlatform::Ios
         | ApplePlatform::Macos
         | ApplePlatform::Tvos
-        | ApplePlatform::Visionos => Ok(()),
-        ApplePlatform::Watchos => bail!("`orbit run` is not implemented for watchOS targets"),
+        | ApplePlatform::Visionos
+        | ApplePlatform::Watchos => Ok(()),
     }
 }
 
@@ -1277,16 +1286,18 @@ fn compiled_interface_relative(
 }
 
 fn embed_dependencies(
-    _project: &ProjectContext,
+    project: &ProjectContext,
     root_target: &TargetManifest,
     built_targets: &HashMap<String, BuiltTarget>,
     built_root_target: &mut BuiltTarget,
 ) -> Result<()> {
     for dependency_name in &root_target.dependencies {
+        let dependency_target = project.manifest.resolve_target(Some(dependency_name))?;
         let built = built_targets
             .get(dependency_name)
             .with_context(|| format!("missing built dependency `{dependency_name}`"))?;
-        let Some(destination_root) = embedded_dependency_root(root_target.kind, built.target_kind)
+        let Some(destination_root) =
+            embedded_dependency_root(project, root_target, dependency_target)?
         else {
             continue;
         };
@@ -1306,15 +1317,21 @@ fn embed_dependencies(
 }
 
 fn embedded_dependency_root(
-    parent_kind: TargetKind,
-    child_kind: TargetKind,
-) -> Option<&'static str> {
-    match (parent_kind, child_kind) {
+    project: &ProjectContext,
+    parent_target: &TargetManifest,
+    child_target: &TargetManifest,
+) -> Result<Option<&'static str>> {
+    Ok(match (parent_target.kind, child_target.kind) {
         (
             TargetKind::App | TargetKind::WatchApp,
             TargetKind::AppExtension | TargetKind::WatchExtension | TargetKind::WidgetExtension,
         ) => Some("PlugIns"),
         (TargetKind::App, TargetKind::WatchApp) => Some("Watch"),
+        (TargetKind::App, TargetKind::App)
+            if crate::apple::signing::target_is_app_clip(project, child_target)? =>
+        {
+            Some("AppClips")
+        }
         (
             TargetKind::App
             | TargetKind::AppExtension
@@ -1324,7 +1341,7 @@ fn embedded_dependency_root(
             TargetKind::Framework,
         ) => Some("Frameworks"),
         _ => None,
-    }
+    })
 }
 
 fn export_artifact(
@@ -1483,6 +1500,22 @@ fn run_on_macos(receipt: &BuildReceipt) -> Result<()> {
     run_command(&mut command)
 }
 
+fn debug_on_macos(receipt: &BuildReceipt) -> Result<()> {
+    let executable = macos_executable_path(receipt)?;
+    println!(
+        "Launching LLDB for {} on the local Mac. Orbit will stop at process entry so you can set breakpoints before continuing.",
+        receipt.bundle_id
+    );
+
+    let mut command = Command::new("lldb");
+    command.arg("--file").arg(&executable);
+    command.arg("-o").arg("process launch --stop-at-entry");
+    if let Some(bundle_root) = receipt.bundle_path.parent() {
+        command.current_dir(bundle_root);
+    }
+    run_command(&mut command)
+}
+
 fn macos_executable_path(receipt: &BuildReceipt) -> Result<PathBuf> {
     let standard_bundle_binary = receipt
         .bundle_path
@@ -1512,6 +1545,120 @@ fn macos_executable_path(receipt: &BuildReceipt) -> Result<PathBuf> {
 }
 
 fn run_on_simulator(project: &ProjectContext, receipt: &BuildReceipt) -> Result<()> {
+    let device = prepare_simulator_installation(project, receipt)?;
+
+    println!(
+        "Launching {} on {}. Orbit will stay attached to the simulator console; press Ctrl-C to stop.",
+        receipt.bundle_id, device.name
+    );
+
+    let mut launch = Command::new("xcrun");
+    launch.args([
+        "simctl",
+        "launch",
+        "--console-pty",
+        &device.udid,
+        &receipt.bundle_id,
+    ]);
+    run_command(&mut launch)?;
+
+    Ok(())
+}
+
+fn debug_on_simulator(project: &ProjectContext, receipt: &BuildReceipt) -> Result<()> {
+    let device = prepare_simulator_installation(project, receipt)?;
+    let executable = bundle_debug_executable_path(receipt)?;
+    let process_name = simulator_process_name(receipt);
+
+    println!(
+        "Launching {} on {} in debug mode. Orbit will open LLDB after the app is suspended at launch.",
+        receipt.bundle_id, device.name
+    );
+
+    let mut launch = Command::new("xcrun");
+    launch.args([
+        "simctl",
+        "launch",
+        "--wait-for-debugger",
+        "--terminate-running-process",
+        &device.udid,
+        &receipt.bundle_id,
+    ]);
+    run_command(&mut launch)?;
+
+    let mut command = Command::new("lldb");
+    command.arg("--file").arg(&executable);
+    command
+        .arg("-o")
+        .arg(format!("process attach -i -w -n {process_name}"));
+    if let Some(bundle_root) = receipt.bundle_path.parent() {
+        command.current_dir(bundle_root);
+    }
+    run_command(&mut command)
+}
+
+fn run_on_device(device: &PhysicalDevice, receipt: &BuildReceipt) -> Result<()> {
+    install_on_device(device, receipt)?;
+
+    let mut launch = Command::new("xcrun");
+    launch.args([
+        "devicectl",
+        "device",
+        "process",
+        "launch",
+        "--console",
+        "--terminate-existing",
+        "--device",
+        &device.identifier,
+        &receipt.bundle_id,
+    ]);
+    run_command(&mut launch)
+}
+
+fn debug_on_device(device: &PhysicalDevice, receipt: &BuildReceipt) -> Result<()> {
+    ensure_device_symbols_available(receipt.platform)?;
+    install_on_device(device, receipt)?;
+
+    let executable = bundle_debug_executable_path(receipt)?;
+    let process_name = simulator_process_name(receipt);
+
+    println!(
+        "Launching {} on {} in debug mode. Orbit will open LLDB after the app is suspended at launch.",
+        receipt.bundle_id, device.device_properties.name
+    );
+
+    let mut launch = Command::new("xcrun");
+    launch.args([
+        "devicectl",
+        "device",
+        "process",
+        "launch",
+        "--start-stopped",
+        "--terminate-existing",
+        "--device",
+        &device.identifier,
+        &receipt.bundle_id,
+    ]);
+    run_command(&mut launch)?;
+
+    let mut command = Command::new("lldb");
+    command.arg("--file").arg(&executable);
+    command
+        .arg("-o")
+        .arg(format!("device select {}", device.identifier));
+    command
+        .arg("-o")
+        .arg(format!("device process attach -i -w -n {process_name}"));
+    if let Some(bundle_root) = receipt.bundle_path.parent() {
+        command.current_dir(bundle_root);
+    }
+    run_command(&mut command)
+}
+
+fn prepare_simulator_installation(
+    project: &ProjectContext,
+    receipt: &BuildReceipt,
+) -> Result<SimulatorDevice> {
     let device = select_simulator_device(project, receipt.platform)?;
     if !device.is_booted() {
         let mut boot = Command::new("xcrun");
@@ -1545,25 +1692,10 @@ fn run_on_simulator(project: &ProjectContext, receipt: &BuildReceipt) -> Result<
     ]);
     run_command(&mut install)?;
 
-    println!(
-        "Launching {} on {}. Orbit will stay attached to the simulator console; press Ctrl-C to stop.",
-        receipt.bundle_id, device.name
-    );
-
-    let mut launch = Command::new("xcrun");
-    launch.args([
-        "simctl",
-        "launch",
-        "--console-pty",
-        &device.udid,
-        &receipt.bundle_id,
-    ]);
-    run_command(&mut launch)?;
-
-    Ok(())
+    Ok(device)
 }
 
-fn run_on_device(device: &PhysicalDevice, receipt: &BuildReceipt) -> Result<()> {
+fn install_on_device(device: &PhysicalDevice, receipt: &BuildReceipt) -> Result<()> {
     let mut install = Command::new("xcrun");
     install.args([
         "devicectl",
@@ -1577,21 +1709,19 @@ fn run_on_device(device: &PhysicalDevice, receipt: &BuildReceipt) -> Result<()> 
             .to_str()
             .context("bundle path contains invalid UTF-8")?,
     ]);
-    run_command(&mut install)?;
+    run_command(&mut install)
+}
 
-    let mut launch = Command::new("xcrun");
-    launch.args([
-        "devicectl",
-        "device",
-        "process",
-        "launch",
-        "--console",
-        "--terminate-existing",
-        "--device",
-        &device.identifier,
-        &receipt.bundle_id,
-    ]);
-    run_command(&mut launch)
+fn bundle_debug_executable_path(receipt: &BuildReceipt) -> Result<PathBuf> {
+    let path = receipt.bundle_path.join(&receipt.target);
+    if path.exists() {
+        return Ok(path);
+    }
+    macos_executable_path(receipt)
+}
+
+fn simulator_process_name(receipt: &BuildReceipt) -> &str {
+    receipt.target.as_str()
 }
 
 fn select_simulator_device(
@@ -2395,12 +2525,36 @@ struct PhysicalHardwareProperties {
     udid: String,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct PreferredDdiList {
+    result: PreferredDdiResult,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct PreferredDdiResult {
+    platforms: BTreeMap<String, Vec<PreferredDdiEntry>>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct PreferredDdiEntry {
+    #[serde(rename = "ddiMetadata")]
+    ddi_metadata: PreferredDdiMetadata,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct PreferredDdiMetadata {
+    #[serde(rename = "contentIsCompatible", default)]
+    content_is_compatible: Option<bool>,
+    #[serde(rename = "isUsable", default)]
+    is_usable: bool,
+}
+
 fn select_physical_device(
     project: &ProjectContext,
     requested_identifier: Option<&str>,
     platform: ApplePlatform,
 ) -> Result<PhysicalDevice> {
-    let output_path = tempfile::NamedTempFile::new()?;
+    let output_path = NamedTempFile::new()?;
     let mut list = Command::new("xcrun");
     list.args([
         "devicectl",
@@ -2455,6 +2609,76 @@ fn select_physical_device(
     Ok(physical.remove(index))
 }
 
+fn ensure_device_symbols_available(platform: ApplePlatform) -> Result<()> {
+    if preferred_ddi_is_usable(platform)? {
+        return Ok(());
+    }
+
+    let spinner = CliSpinner::new(format!("Preparing device symbols for {platform}"));
+    let result = (|| -> Result<()> {
+        let mut update = Command::new("xcrun");
+        update.args(["devicectl", "manage", "ddis", "update"]);
+        run_command(&mut update)?;
+        if !preferred_ddi_is_usable(platform)? {
+            bail!(
+                "the preferred Developer Disk Image for {platform} is still unusable after `devicectl manage ddis update`"
+            );
+        }
+        Ok(())
+    })();
+    match result {
+        Ok(()) => {
+            spinner.finish_success(format!("Prepared device symbols for {platform}."));
+            Ok(())
+        }
+        Err(error) => {
+            spinner.finish_clear();
+            Err(error)
+        }
+    }
+}
+
+fn preferred_ddi_is_usable(platform: ApplePlatform) -> Result<bool> {
+    let output_path = NamedTempFile::new()?;
+    let mut command = Command::new("xcrun");
+    command.args([
+        "devicectl",
+        "list",
+        "preferredDDI",
+        "--platform",
+        devicectl_platform_name(platform),
+        "--json-output",
+        output_path
+            .path()
+            .to_str()
+            .context("temporary path contains invalid UTF-8")?,
+    ]);
+    run_command(&mut command)?;
+    let contents = fs::read_to_string(output_path.path())
+        .with_context(|| format!("failed to read {}", output_path.path().display()))?;
+    let preferred: PreferredDdiList = serde_json::from_str(&contents)
+        .context("failed to parse `devicectl list preferredDDI` output")?;
+    Ok(preferred
+        .result
+        .platforms
+        .get(devicectl_platform_name(platform))
+        .into_iter()
+        .flatten()
+        .any(|entry| {
+            entry.ddi_metadata.is_usable && entry.ddi_metadata.content_is_compatible.unwrap_or(true)
+        }))
+}
+
+fn devicectl_platform_name(platform: ApplePlatform) -> &'static str {
+    match platform {
+        ApplePlatform::Ios => "iOS",
+        ApplePlatform::Macos => "macOS",
+        ApplePlatform::Tvos => "tvOS",
+        ApplePlatform::Visionos => "visionOS",
+        ApplePlatform::Watchos => "watchOS",
+    }
+}
+
 fn simulator_runtime_matches_platform(runtime_identifier: &str, platform: ApplePlatform) -> bool {
     match platform {
         ApplePlatform::Ios => runtime_identifier.contains(".SimRuntime.iOS-"),
@@ -2485,9 +2709,11 @@ fn physical_device_matches_platform(device: &PhysicalDevice, platform: ApplePlat
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::path::PathBuf;
 
     use plist::Dictionary;
     use serde_json::json;
+    use tempfile::TempDir;
 
     use super::{
         ApplePlatform, DestinationKind, ExtensionManifest, SwiftPackageManifest,
@@ -2495,20 +2721,117 @@ mod tests {
         Toolchain, XcframeworkLibrary, embedded_dependency_root, extension_plist, json_to_plist,
         merge_extension_attributes, ordered_package_targets, select_xcframework_library,
     };
+    use crate::context::{AppContext, GlobalPaths, ProjectContext, ProjectPaths};
+    use crate::manifest::Manifest;
+
+    fn fixture(path: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(path)
+    }
+
+    fn project_for_fixture(path: &str) -> (TempDir, ProjectContext) {
+        let temp = tempfile::tempdir().unwrap();
+        let manifest_path = fixture(path);
+        let root = manifest_path.parent().unwrap().to_path_buf();
+        let manifest = Manifest::load(&manifest_path).unwrap();
+        let data_dir = temp.path().join("data");
+        let cache_dir = temp.path().join("cache");
+        let orbit_dir = temp.path().join("orbit");
+        let build_dir = orbit_dir.join("build");
+        let artifacts_dir = orbit_dir.join("artifacts");
+        let receipts_dir = orbit_dir.join("receipts");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        std::fs::create_dir_all(&build_dir).unwrap();
+        std::fs::create_dir_all(&artifacts_dir).unwrap();
+        std::fs::create_dir_all(&receipts_dir).unwrap();
+
+        let project = ProjectContext {
+            app: AppContext {
+                cwd: root.clone(),
+                interactive: false,
+                global_paths: GlobalPaths {
+                    data_dir: data_dir.clone(),
+                    cache_dir,
+                    auth_state_path: data_dir.join("auth.json"),
+                    device_cache_path: data_dir.join("devices.json"),
+                    keychain_path: data_dir.join("orbit.keychain-db"),
+                },
+            },
+            root,
+            manifest_path,
+            manifest,
+            project_paths: ProjectPaths {
+                orbit_dir,
+                build_dir,
+                artifacts_dir,
+                receipts_dir,
+            },
+        };
+        (temp, project)
+    }
 
     #[test]
     fn embeds_watch_children_into_expected_subdirectories() {
+        let (_temp, project) = project_for_fixture("examples/ios-watch-app/orbit.json");
+        let app = project
+            .manifest
+            .resolve_target(Some("ExampleCompanionApp"))
+            .unwrap();
+        let watch_app = project
+            .manifest
+            .resolve_target(Some("ExampleWatchApp"))
+            .unwrap();
+        let watch_extension = project
+            .manifest
+            .resolve_target(Some("ExampleWatchExtension"))
+            .unwrap();
         assert_eq!(
-            embedded_dependency_root(TargetKind::App, TargetKind::WatchApp),
+            embedded_dependency_root(&project, app, watch_app).unwrap(),
             Some("Watch")
         );
         assert_eq!(
-            embedded_dependency_root(TargetKind::WatchApp, TargetKind::WatchExtension),
+            embedded_dependency_root(&project, watch_app, watch_extension).unwrap(),
             Some("PlugIns")
         );
         assert_eq!(
-            embedded_dependency_root(TargetKind::WatchApp, TargetKind::Framework),
+            embedded_dependency_root(&project, watch_app, watch_app).unwrap(),
+            None
+        );
+        let framework = crate::manifest::TargetManifest {
+            name: "OrbitFramework".to_owned(),
+            kind: TargetKind::Framework,
+            bundle_id: "dev.orbit.framework".to_owned(),
+            platforms: vec![ApplePlatform::Watchos],
+            sources: vec!["Sources/Framework".into()],
+            resources: Vec::new(),
+            dependencies: Vec::new(),
+            frameworks: Vec::new(),
+            weak_frameworks: Vec::new(),
+            system_libraries: Vec::new(),
+            xcframeworks: Vec::new(),
+            swift_packages: Vec::new(),
+            entitlements: None,
+            push: None,
+            extension: None,
+        };
+        assert_eq!(
+            embedded_dependency_root(&project, watch_app, &framework).unwrap(),
             Some("Frameworks")
+        );
+    }
+
+    #[test]
+    fn embeds_app_clips_into_appclips_directory() {
+        let (_temp, project) = project_for_fixture("examples/ios-app-clip/orbit.json");
+        let app = project.manifest.resolve_target(Some("ExampleApp")).unwrap();
+        let clip = project
+            .manifest
+            .resolve_target(Some("ExampleClip"))
+            .unwrap();
+
+        assert_eq!(
+            embedded_dependency_root(&project, app, clip).unwrap(),
+            Some("AppClips")
         );
     }
 

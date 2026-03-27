@@ -5,6 +5,7 @@ use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 use base64::Engine as _;
+use plist::{Dictionary, Value};
 use serde::{Deserialize, Serialize};
 
 use crate::apple::asc_api::{
@@ -16,18 +17,21 @@ use crate::apple::auth::{
     resolve_user_auth_metadata,
 };
 use crate::apple::capabilities::{
-    CapabilityRelationships, CapabilityUpdate, RemoteCapability,
-    capability_sync_plan_from_entitlements,
+    CapabilityRelationships, CapabilitySyncOptions, CapabilityUpdate, RemoteCapability,
+    capability_sync_plan_from_entitlements, capability_sync_plan_from_entitlements_with_options,
 };
 use crate::apple::portal::{
-    PortalAppId, PortalClient, PortalDeviceClass, PortalProfilePlatform, PortalProvisioningProfile,
+    PortalAppId, PortalAuthKey, PortalClient, PortalDeviceClass, PortalProfilePlatform,
+    PortalProvisioningProfile,
 };
 use crate::apple::provisioning::{
     ProvisioningCapabilityRelationships, ProvisioningCapabilityUpdate, ProvisioningClient,
 };
 use crate::cli::{SigningExportArgs, SigningImportArgs, SigningSyncArgs, TargetPlatform};
 use crate::context::ProjectContext;
-use crate::manifest::{ApplePlatform, DistributionKind, ProfileManifest, TargetManifest};
+use crate::manifest::{
+    ApplePlatform, DistributionKind, ProfileManifest, PushCredentialKind, TargetManifest,
+};
 use crate::util::{
     copy_file, ensure_dir, prompt_multi_select, prompt_password, prompt_select,
     read_json_file_if_exists, write_json_file,
@@ -76,11 +80,18 @@ const ASC_OPTION_DATA_PROTECTION_PROTECTED_UNLESS_OPEN: &str = "PROTECTED_UNLESS
 const ASC_OPTION_DATA_PROTECTION_PROTECTED_UNTIL_FIRST_USER_AUTH: &str =
     "PROTECTED_UNTIL_FIRST_USER_AUTH";
 const ASC_OPTION_PUSH_BROADCAST: &str = "PUSH_NOTIFICATION_FEATURE_BROADCAST";
+const ORBIT_PUSH_AUTH_KEY_NAME: &str = "@orbit/apns";
+const APP_IDENTIFIER_PREFIX_PLACEHOLDER: &str = "$(AppIdentifierPrefix)";
+const TEAM_IDENTIFIER_PREFIX_PLACEHOLDER: &str = "$(TeamIdentifierPrefix)";
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct SigningState {
     certificates: Vec<ManagedCertificate>,
     profiles: Vec<ManagedProfile>,
+    #[serde(default)]
+    push_keys: Vec<ManagedPushKey>,
+    #[serde(default)]
+    push_certificates: Vec<ManagedPushCertificate>,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize, Default)]
@@ -116,6 +127,29 @@ struct ManagedProfile {
     device_ids: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ManagedPushKey {
+    id: String,
+    name: String,
+    path: PathBuf,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ManagedPushCertificate {
+    id: String,
+    certificate_type: String,
+    serial_number: String,
+    bundle_id: String,
+    environment: PushEnvironment,
+    #[serde(default)]
+    origin: CertificateOrigin,
+    display_name: Option<String>,
+    private_key_path: PathBuf,
+    certificate_der_path: PathBuf,
+    p12_path: PathBuf,
+    p12_password_account: String,
+}
+
 #[derive(Debug, Clone)]
 struct AscCapabilityMutation {
     remote_id: Option<String>,
@@ -130,6 +164,7 @@ pub struct SigningMaterial {
     pub keychain_path: PathBuf,
     pub provisioning_profile_path: PathBuf,
     pub entitlements_path: Option<PathBuf>,
+    pub push_credential: Option<PushCredentialMaterial>,
 }
 
 #[derive(Debug, Clone)]
@@ -139,16 +174,49 @@ pub struct PackageSigningMaterial {
 }
 
 #[derive(Debug, Clone)]
+pub enum PushCredentialMaterial {
+    AuthKey {
+        key_id: String,
+        key_path: PathBuf,
+    },
+    Certificate {
+        certificate_id: String,
+        p12_path: PathBuf,
+        p12_password_account: String,
+        environment: PushEnvironment,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PushEnvironment {
+    Development,
+    Production,
+}
+
+impl std::fmt::Display for PushEnvironment {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Development => "development",
+            Self::Production => "production",
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
 struct TeamSigningPaths {
     state_path: PathBuf,
     certificates_dir: PathBuf,
     profiles_dir: PathBuf,
+    push_keys_dir: PathBuf,
+    push_certificates_dir: PathBuf,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct LocalSigningCleanSummary {
     pub removed_profiles: usize,
     pub removed_certificates: usize,
+    pub removed_push_certificates: usize,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -158,6 +226,7 @@ pub struct RemoteSigningCleanSummary {
     pub removed_app_groups: usize,
     pub removed_merchants: usize,
     pub removed_certificates: usize,
+    pub removed_push_certificates: usize,
     pub skipped_cloud_containers: Vec<String>,
 }
 
@@ -194,6 +263,25 @@ pub fn sync_signing(project: &ProjectContext, args: &SigningSyncArgs) -> Result<
     );
     if let Some(entitlements_path) = &material.entitlements_path {
         println!("entitlements: {}", entitlements_path.display());
+    }
+    if let Some(push_credential) = &material.push_credential {
+        match push_credential {
+            PushCredentialMaterial::AuthKey { key_id, key_path } => {
+                println!("push_auth_key_id: {key_id}");
+                println!("push_auth_key: {}", key_path.display());
+            }
+            PushCredentialMaterial::Certificate {
+                certificate_id,
+                p12_path,
+                p12_password_account,
+                environment,
+            } => {
+                println!("push_certificate_id: {certificate_id}");
+                println!("push_certificate_environment: {environment}");
+                println!("push_certificate: {}", p12_path.display());
+                println!("push_certificate_password_account: {p12_password_account}");
+            }
+        }
     }
     Ok(())
 }
@@ -451,6 +539,10 @@ pub fn prepare_signing(
     let provisioning = ProvisioningClient::from_session(&auth.session, team_id)?;
     let mut state = load_state(project, client.team_id())?;
 
+    ensure_host_app_bundle_id(project, target, platform, |host_target| {
+        ensure_bundle_id(&mut client, project, host_target, platform).map(|_| ())
+    })?;
+
     let bundle_id = ensure_bundle_id(&mut client, project, target, platform)?;
     sync_capabilities(
         &mut client,
@@ -483,18 +575,26 @@ pub fn prepare_signing(
         &certificate,
         &device_ids,
     )?;
+    let push_credential = ensure_push_setup(
+        &mut client,
+        project,
+        &mut state,
+        target,
+        platform,
+        &bundle_id,
+    )?;
 
     let signing_identity = import_certificate_into_keychain(project, &certificate)?;
+    let entitlements_path =
+        materialize_signing_entitlements(project, target, &provisioning_profile.path)?;
     save_state(project, client.team_id(), &state)?;
 
     Ok(SigningMaterial {
         signing_identity,
         keychain_path: project.app.global_paths.keychain_path.clone(),
         provisioning_profile_path: provisioning_profile.path,
-        entitlements_path: target
-            .entitlements
-            .as_ref()
-            .map(|path| project.root.join(path)),
+        entitlements_path,
+        push_credential,
     })
 }
 
@@ -537,12 +637,17 @@ fn prepare_signing_with_api_key(
     profile: &ProfileManifest,
     device_udids: Option<Vec<String>>,
 ) -> Result<SigningMaterial> {
+    validate_push_setup_with_api_key(project, target)?;
     let client = AscClient::new(
         resolve_api_key_auth(&project.app)?
             .context("App Store Connect API key auth is not configured")?,
     )?;
     let team_id = resolve_api_key_team_id(project)?;
     let mut state = load_state(project, &team_id)?;
+
+    ensure_host_app_bundle_id(project, target, platform, |host_target| {
+        ensure_bundle_id_with_api_key(&client, project, host_target, platform).map(|_| ())
+    })?;
 
     let bundle_id = ensure_bundle_id_with_api_key(&client, project, target, platform)?;
     sync_capabilities_with_api_key(&client, project, target, &bundle_id)?;
@@ -571,16 +676,16 @@ fn prepare_signing_with_api_key(
     )?;
 
     let signing_identity = import_certificate_into_keychain(project, &certificate)?;
+    let entitlements_path =
+        materialize_signing_entitlements(project, target, &provisioning_profile.path)?;
     save_state(project, &team_id, &state)?;
 
     Ok(SigningMaterial {
         signing_identity,
         keychain_path: project.app.global_paths.keychain_path.clone(),
         provisioning_profile_path: provisioning_profile.path,
-        entitlements_path: target
-            .entitlements
-            .as_ref()
-            .map(|path| project.root.join(path)),
+        entitlements_path,
+        push_credential: None,
     })
 }
 
@@ -608,6 +713,82 @@ fn prepare_package_signing_with_api_key(
 fn resolve_api_key_team_id(project: &ProjectContext) -> Result<String> {
     resolve_local_team_id_if_known(project)?.context(
         "API key signing state is scoped by Apple team; set `team_id` in orbit.json or export ORBIT_APPLE_TEAM_ID for CI runs",
+    )
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PushConfiguration {
+    credential: PushCredentialKind,
+    environment: PushEnvironment,
+    broadcast: bool,
+}
+
+fn push_configuration(
+    project: &ProjectContext,
+    target: &TargetManifest,
+) -> Result<Option<PushConfiguration>> {
+    let Some(entitlements_path) = &target.entitlements else {
+        if target.push.is_some() {
+            bail!(
+                "target `{}` defines a `push` block but does not declare an entitlements file",
+                target.name
+            );
+        }
+        return Ok(None);
+    };
+
+    let entitlements = load_plist_dictionary(&project.root.join(entitlements_path))?;
+    let push_entitlement = entitlements.get("aps-environment");
+    if push_entitlement.is_none() {
+        if target.push.is_some() {
+            bail!(
+                "target `{}` defines a `push` block but does not enable `aps-environment` in its entitlements",
+                target.name
+            );
+        }
+        return Ok(None);
+    }
+
+    let environment = match push_entitlement.and_then(Value::as_string) {
+        Some("development") => PushEnvironment::Development,
+        Some("production") => PushEnvironment::Production,
+        Some(other) => {
+            bail!("`aps-environment` must be `development` or `production`, got `{other}`")
+        }
+        None => bail!("`aps-environment` must be a string"),
+    };
+    let push = target.push.clone().unwrap_or_default();
+    Ok(Some(PushConfiguration {
+        credential: push.credential,
+        environment,
+        broadcast: push.broadcast,
+    }))
+}
+
+fn capability_sync_options_for_target(
+    project: &ProjectContext,
+    target: &TargetManifest,
+) -> Result<CapabilitySyncOptions> {
+    let push = push_configuration(project, target)?;
+    Ok(CapabilitySyncOptions {
+        uses_broadcast_push_notifications: push.is_some_and(|push| push.broadcast),
+    })
+}
+
+fn validate_push_setup_with_api_key(
+    project: &ProjectContext,
+    target: &TargetManifest,
+) -> Result<()> {
+    let Some(push) = push_configuration(project, target)? else {
+        return Ok(());
+    };
+    if target.push.is_none() && !push.broadcast {
+        return Ok(());
+    }
+
+    bail!(
+        "App Store Connect API key auth cannot manage push setup for target `{}`; log in with Apple ID so Orbit can configure broadcast push or APNs credentials through the Developer Portal",
+        target.name
     )
 }
 
@@ -649,9 +830,10 @@ fn sync_capabilities_with_api_key(
             )
         })?;
     let remote_capabilities = remote_capabilities_from_included(&remote_bundle.included)?;
-    let plan = capability_sync_plan_from_entitlements(
+    let plan = capability_sync_plan_from_entitlements_with_options(
         &project.root.join(entitlements_path),
         &remote_capabilities,
+        &capability_sync_options_for_target(project, target)?,
     )?;
     if plan.updates.is_empty() {
         return Ok(());
@@ -1109,6 +1291,329 @@ fn asc_device_matches_platform(device_platform: &str, platform: ApplePlatform) -
     }
 }
 
+fn ensure_host_app_bundle_id<F>(
+    project: &ProjectContext,
+    target: &TargetManifest,
+    platform: ApplePlatform,
+    mut ensure_bundle_id: F,
+) -> Result<()>
+where
+    F: FnMut(&TargetManifest) -> Result<()>,
+{
+    if platform != ApplePlatform::Ios {
+        return Ok(());
+    }
+    let Some(host_target) = host_app_for_app_clip(project, target)? else {
+        return Ok(());
+    };
+    ensure_bundle_id(host_target)
+}
+
+fn host_app_for_app_clip<'a>(
+    project: &'a ProjectContext,
+    target: &'a TargetManifest,
+) -> Result<Option<&'a TargetManifest>> {
+    if !is_app_clip_target(project, target)? {
+        return Ok(None);
+    }
+
+    let mut hosts = project
+        .manifest
+        .targets
+        .iter()
+        .filter(|candidate| {
+            candidate.name != target.name
+                && candidate.kind == crate::manifest::TargetKind::App
+                && candidate
+                    .dependencies
+                    .iter()
+                    .any(|dependency| dependency == &target.name)
+        })
+        .collect::<Vec<_>>();
+    match hosts.len() {
+        0 => Ok(None),
+        1 => Ok(hosts.pop()),
+        _ => bail!(
+            "App Clip target `{}` cannot be hosted by more than one app target",
+            target.name
+        ),
+    }
+}
+
+fn hosted_app_clip_targets<'a>(
+    project: &'a ProjectContext,
+    target: &'a TargetManifest,
+) -> Result<Vec<&'a TargetManifest>> {
+    let mut hosted = Vec::new();
+    for dependency_name in &target.dependencies {
+        let dependency = project.manifest.resolve_target(Some(dependency_name))?;
+        if is_app_clip_target(project, dependency)? {
+            hosted.push(dependency);
+        }
+    }
+    Ok(hosted)
+}
+
+fn is_app_clip_target(project: &ProjectContext, target: &TargetManifest) -> Result<bool> {
+    if target.kind != crate::manifest::TargetKind::App {
+        return Ok(false);
+    }
+    Ok(target_parent_application_identifiers(project, target)?.is_some())
+}
+
+pub fn target_is_app_clip(project: &ProjectContext, target: &TargetManifest) -> Result<bool> {
+    is_app_clip_target(project, target)
+}
+
+fn target_parent_application_identifiers(
+    project: &ProjectContext,
+    target: &TargetManifest,
+) -> Result<Option<Vec<String>>> {
+    let Some(entitlements_path) = &target.entitlements else {
+        return Ok(None);
+    };
+    let entitlements = load_plist_dictionary(&project.root.join(entitlements_path))?;
+    parent_application_identifiers_from_dictionary(&entitlements)
+}
+
+fn parent_application_identifiers_from_dictionary(
+    dictionary: &Dictionary,
+) -> Result<Option<Vec<String>>> {
+    let Some(value) = dictionary.get("com.apple.developer.parent-application-identifiers") else {
+        return Ok(None);
+    };
+    let values = string_array_value("com.apple.developer.parent-application-identifiers", value)?;
+    if values.len() != 1 {
+        bail!(
+            "`com.apple.developer.parent-application-identifiers` must contain exactly one application identifier"
+        );
+    }
+    Ok(Some(values))
+}
+
+fn materialize_signing_entitlements(
+    project: &ProjectContext,
+    target: &TargetManifest,
+    provisioning_profile_path: &Path,
+) -> Result<Option<PathBuf>> {
+    let original_path = target
+        .entitlements
+        .as_ref()
+        .map(|path| project.root.join(path));
+    let mut entitlements = match &original_path {
+        Some(path) => load_plist_dictionary(path)?,
+        None => Dictionary::new(),
+    };
+    let application_identifier_prefix =
+        provisioning_profile_application_identifier_prefix(provisioning_profile_path)?;
+    let mut changed = replace_entitlement_placeholders_in_dictionary(
+        &mut entitlements,
+        &application_identifier_prefix,
+    );
+
+    if let Some(parent_identifiers) = parent_application_identifiers_from_dictionary(&entitlements)?
+    {
+        let Some(host_target) = host_app_for_app_clip(project, target)? else {
+            bail!(
+                "App Clip target `{}` must be hosted by an app target in the manifest",
+                target.name
+            );
+        };
+        let expected_parent = format!("{application_identifier_prefix}{}", host_target.bundle_id);
+        if parent_identifiers[0] != expected_parent {
+            bail!(
+                "App Clip target `{}` must reference its host app application identifier `{expected_parent}`",
+                target.name
+            );
+        }
+        if !target
+            .bundle_id
+            .starts_with(&format!("{}.", host_target.bundle_id))
+        {
+            bail!(
+                "App Clip target `{}` bundle ID `{}` must use the host app bundle ID `{}` as its prefix",
+                target.name,
+                target.bundle_id,
+                host_target.bundle_id
+            );
+        }
+        changed |= set_dictionary_boolean(
+            &mut entitlements,
+            "com.apple.developer.on-demand-install-capable",
+            true,
+        );
+    }
+
+    let hosted_app_clip_identifiers = hosted_app_clip_targets(project, target)?
+        .into_iter()
+        .map(|hosted_target| format!("{application_identifier_prefix}{}", hosted_target.bundle_id))
+        .collect::<Vec<_>>();
+    if !hosted_app_clip_identifiers.is_empty() {
+        if hosted_app_clip_identifiers.len() != 1 {
+            bail!(
+                "app target `{}` cannot host more than one App Clip because `com.apple.developer.associated-appclip-app-identifiers` must contain exactly one entry",
+                target.name
+            );
+        }
+        changed |= set_dictionary_string_array(
+            &mut entitlements,
+            "com.apple.developer.associated-appclip-app-identifiers",
+            hosted_app_clip_identifiers,
+        );
+    }
+
+    if !changed {
+        return Ok(original_path);
+    }
+
+    let generated_dir = project
+        .project_paths
+        .orbit_dir
+        .join("signing")
+        .join("entitlements");
+    ensure_dir(&generated_dir)?;
+    let path = generated_dir.join(format!("{}.entitlements", target.name));
+    Value::Dictionary(entitlements)
+        .to_file_xml(&path)
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    Ok(Some(path))
+}
+
+fn load_plist_dictionary(path: &Path) -> Result<Dictionary> {
+    Value::from_file(path)
+        .with_context(|| format!("failed to parse plist {}", path.display()))?
+        .into_dictionary()
+        .context("plist must contain a top-level dictionary")
+}
+
+fn provisioning_profile_application_identifier_prefix(path: &Path) -> Result<String> {
+    let profile = load_provisioning_profile_dictionary(path)?;
+    if let Some(prefixes) = profile
+        .get("ApplicationIdentifierPrefix")
+        .and_then(Value::as_array)
+        && let Some(prefix) = prefixes.first().and_then(Value::as_string)
+    {
+        return Ok(normalize_application_identifier_prefix(prefix));
+    }
+
+    let application_identifier = profile
+        .get("Entitlements")
+        .and_then(Value::as_dictionary)
+        .and_then(|entitlements| entitlements.get("application-identifier"))
+        .and_then(Value::as_string)
+        .context("provisioning profile is missing an application identifier prefix")?;
+    let prefix = application_identifier
+        .split_once('.')
+        .map(|(prefix, _)| prefix)
+        .unwrap_or(application_identifier);
+    Ok(normalize_application_identifier_prefix(prefix))
+}
+
+fn load_provisioning_profile_dictionary(path: &Path) -> Result<Dictionary> {
+    if let Ok(value) = Value::from_file(path) {
+        if let Some(dictionary) = value.into_dictionary() {
+            return Ok(dictionary);
+        }
+    }
+
+    let output =
+        crate::util::command_output(Command::new("security").args(["cms", "-D", "-i"]).arg(path))?;
+    Value::from_reader_xml(output.as_bytes())
+        .context("failed to decode provisioning profile CMS payload")?
+        .into_dictionary()
+        .context("decoded provisioning profile did not contain a top-level dictionary")
+}
+
+fn normalize_application_identifier_prefix(prefix: &str) -> String {
+    if prefix.ends_with('.') {
+        prefix.to_owned()
+    } else {
+        format!("{prefix}.")
+    }
+}
+
+fn replace_entitlement_placeholders_in_dictionary(
+    dictionary: &mut Dictionary,
+    application_identifier_prefix: &str,
+) -> bool {
+    let mut changed = false;
+    for value in dictionary.values_mut() {
+        changed |= replace_entitlement_placeholders_in_value(value, application_identifier_prefix);
+    }
+    changed
+}
+
+fn replace_entitlement_placeholders_in_value(
+    value: &mut Value,
+    application_identifier_prefix: &str,
+) -> bool {
+    match value {
+        Value::Array(values) => values.iter_mut().fold(false, |changed, value| {
+            changed
+                || replace_entitlement_placeholders_in_value(value, application_identifier_prefix)
+        }),
+        Value::Dictionary(dictionary) => replace_entitlement_placeholders_in_dictionary(
+            dictionary,
+            application_identifier_prefix,
+        ),
+        Value::String(text) => {
+            let replaced = text
+                .replace(
+                    APP_IDENTIFIER_PREFIX_PLACEHOLDER,
+                    application_identifier_prefix,
+                )
+                .replace(
+                    TEAM_IDENTIFIER_PREFIX_PLACEHOLDER,
+                    application_identifier_prefix,
+                );
+            if replaced != *text {
+                *text = replaced;
+                true
+            } else {
+                false
+            }
+        }
+        _ => false,
+    }
+}
+
+fn set_dictionary_boolean(dictionary: &mut Dictionary, key: &str, value: bool) -> bool {
+    let next = Value::Boolean(value);
+    if dictionary.get(key) == Some(&next) {
+        return false;
+    }
+    dictionary.insert(key.to_owned(), next);
+    true
+}
+
+fn set_dictionary_string_array(
+    dictionary: &mut Dictionary,
+    key: &str,
+    values: Vec<String>,
+) -> bool {
+    let next = Value::Array(values.into_iter().map(Value::String).collect());
+    if dictionary.get(key) == Some(&next) {
+        return false;
+    }
+    dictionary.insert(key.to_owned(), next);
+    true
+}
+
+fn string_array_value(key: &str, value: &Value) -> Result<Vec<String>> {
+    let Some(values) = value.as_array() else {
+        bail!("`{key}` must be an array");
+    };
+    values
+        .iter()
+        .map(|value| {
+            value
+                .as_string()
+                .map(ToOwned::to_owned)
+                .with_context(|| format!("`{key}` must contain only strings"))
+        })
+        .collect()
+}
+
 pub fn sign_bundle(bundle_path: &Path, material: &SigningMaterial) -> Result<()> {
     let embedded_profile = bundle_path.join("embedded.mobileprovision");
     fs::copy(&material.provisioning_profile_path, &embedded_profile).with_context(|| {
@@ -1169,9 +1674,10 @@ fn sync_capabilities(
                 bundle_id.identifier
             )
         })?;
-    let plan = capability_sync_plan_from_entitlements(
+    let plan = capability_sync_plan_from_entitlements_with_options(
         &project.root.join(entitlements_path),
         &provisioning_bundle.capabilities,
+        &capability_sync_options_for_target(project, target)?,
     )?;
     if plan.updates.is_empty() {
         return Ok(());
@@ -1222,6 +1728,296 @@ fn sync_capabilities(
         .collect::<Result<Vec<_>>>()?;
     provisioning.update_bundle_capabilities(&provisioning_bundle, &updates)?;
     Ok(())
+}
+
+fn ensure_push_setup(
+    client: &mut PortalClient,
+    project: &ProjectContext,
+    state: &mut SigningState,
+    target: &TargetManifest,
+    platform: ApplePlatform,
+    bundle_id: &PortalAppId,
+) -> Result<Option<PushCredentialMaterial>> {
+    let Some(push) = push_configuration(project, target)? else {
+        return Ok(None);
+    };
+    match push.credential {
+        PushCredentialKind::AuthKey => ensure_push_auth_key(client, project, state).map(Some),
+        PushCredentialKind::Certificate => ensure_push_certificate(
+            client,
+            project,
+            state,
+            platform,
+            bundle_id,
+            push.environment,
+        )
+        .map(Some),
+    }
+}
+
+fn ensure_push_auth_key(
+    client: &mut PortalClient,
+    project: &ProjectContext,
+    state: &mut SigningState,
+) -> Result<PushCredentialMaterial> {
+    let paths = team_signing_paths(project, client.team_id());
+    ensure_dir(&paths.push_keys_dir)?;
+    let remote_keys = client.list_auth_keys()?;
+
+    if let Some(local) = state
+        .push_keys
+        .iter()
+        .find(|key| key.path.exists() && remote_keys.iter().any(|remote| remote.id == key.id))
+    {
+        return Ok(PushCredentialMaterial::AuthKey {
+            key_id: local.id.clone(),
+            key_path: local.path.clone(),
+        });
+    }
+
+    if let Some(remote) = remote_keys
+        .iter()
+        .find(|remote| remote.name == ORBIT_PUSH_AUTH_KEY_NAME)
+    {
+        if remote.can_download {
+            return download_push_auth_key(client, state, &paths, remote);
+        }
+        bail!(
+            "Orbit-managed APNs auth key `{}` already exists on Apple team `{}` but cannot be downloaded again; restore the local Orbit state for that team or revoke the key before retrying",
+            remote.id,
+            client.team_id()
+        );
+    }
+
+    let remote = client.create_auth_key(ORBIT_PUSH_AUTH_KEY_NAME)?;
+    download_push_auth_key(client, state, &paths, &remote)
+}
+
+fn download_push_auth_key(
+    client: &mut PortalClient,
+    state: &mut SigningState,
+    paths: &TeamSigningPaths,
+    remote: &PortalAuthKey,
+) -> Result<PushCredentialMaterial> {
+    let key_content = client.download_auth_key(&remote.id)?;
+    let key_path = paths.push_keys_dir.join(format!("{}.p8", remote.id));
+    fs::write(&key_path, key_content)
+        .with_context(|| format!("failed to write {}", key_path.display()))?;
+
+    state.push_keys.retain(|key| key.id != remote.id);
+    state.push_keys.push(ManagedPushKey {
+        id: remote.id.clone(),
+        name: remote.name.clone(),
+        path: key_path.clone(),
+    });
+    Ok(PushCredentialMaterial::AuthKey {
+        key_id: remote.id.clone(),
+        key_path,
+    })
+}
+
+fn ensure_push_certificate(
+    client: &mut PortalClient,
+    project: &ProjectContext,
+    state: &mut SigningState,
+    platform: ApplePlatform,
+    bundle_id: &PortalAppId,
+    environment: PushEnvironment,
+) -> Result<PushCredentialMaterial> {
+    let certificate_type = push_certificate_type(platform, environment)?;
+    let mac = matches!(platform, ApplePlatform::Macos);
+    let remote_certificates = client.list_certificates(&[certificate_type], mac)?;
+    let mut remote_certificate_ids = HashSet::new();
+    let mut stale_orbit_certificates = Vec::new();
+
+    for remote in remote_certificates {
+        remote_certificate_ids.insert(remote.id.clone());
+        let owned_by_bundle = remote.owner_id.as_deref() == Some(bundle_id.id.as_str())
+            || remote.owner_name.as_deref() == Some(bundle_id.identifier.as_str());
+        if !owned_by_bundle {
+            continue;
+        }
+
+        if let Some(local) = state.push_certificates.iter_mut().find(|certificate| {
+            certificate.bundle_id == bundle_id.identifier
+                && certificate.environment == environment
+                && certificate.certificate_type == certificate_type
+                && certificate.p12_path.exists()
+                && (certificate.id == remote.id
+                    || remote.serial_number.as_deref().is_some_and(|serial| {
+                        certificate.serial_number.eq_ignore_ascii_case(serial)
+                    }))
+        }) {
+            if local.id != remote.id {
+                local.id = remote.id.clone();
+            }
+            if local.display_name.is_none() {
+                local.display_name = remote.name.clone();
+            }
+            return Ok(PushCredentialMaterial::Certificate {
+                certificate_id: local.id.clone(),
+                p12_path: local.p12_path.clone(),
+                p12_password_account: local.p12_password_account.clone(),
+                environment,
+            });
+        }
+
+        if is_orbit_managed_push_certificate(state, &remote.id, &bundle_id.identifier, environment)
+        {
+            stale_orbit_certificates.push(remote.id.clone());
+        }
+    }
+
+    for certificate_id in stale_orbit_certificates {
+        client
+            .revoke_certificate(&certificate_id, certificate_type, mac)
+            .with_context(|| format!("failed to repair push certificate `{certificate_id}`"))?;
+        state
+            .push_certificates
+            .retain(|certificate| certificate.id != certificate_id);
+    }
+    cleanup_stale_push_certificate_state(
+        state,
+        &bundle_id.identifier,
+        environment,
+        &remote_certificate_ids,
+    );
+
+    let paths = team_signing_paths(project, client.team_id());
+    ensure_dir(&paths.push_certificates_dir)?;
+    let slug = crate::util::timestamp_slug();
+    let private_key_path = paths
+        .push_certificates_dir
+        .join(format!("{slug}-{environment}.push.key.pem"));
+    let csr_path = paths
+        .push_certificates_dir
+        .join(format!("{slug}-{environment}.push.csr.pem"));
+    let certificate_der_path = paths
+        .push_certificates_dir
+        .join(format!("{slug}-{environment}.push.cer"));
+    let p12_path = paths
+        .push_certificates_dir
+        .join(format!("{slug}-{environment}.push.p12"));
+
+    let mut openssl_req = Command::new("openssl");
+    openssl_req.args([
+        "req",
+        "-new",
+        "-newkey",
+        "rsa:2048",
+        "-nodes",
+        "-keyout",
+        private_key_path
+            .to_str()
+            .context("private key path contains invalid UTF-8")?,
+        "-subj",
+        &format!("/CN=Orbit Push {slug}"),
+        "-out",
+        csr_path
+            .to_str()
+            .context("CSR path contains invalid UTF-8")?,
+    ]);
+    crate::util::run_command(&mut openssl_req)?;
+
+    let csr_pem = fs::read_to_string(&csr_path)
+        .with_context(|| format!("failed to read {}", csr_path.display()))?;
+    let remote = client.create_certificate(certificate_type, &csr_pem, Some(&bundle_id.id), mac)?;
+    let certificate_bytes = client.download_certificate(&remote.id, certificate_type, mac)?;
+    fs::write(&certificate_der_path, &certificate_bytes)
+        .with_context(|| format!("failed to write {}", certificate_der_path.display()))?;
+
+    let p12_password = uuid::Uuid::new_v4().to_string();
+    let mut openssl_pkcs12 = Command::new("openssl");
+    openssl_pkcs12.args([
+        "pkcs12",
+        "-export",
+        "-inkey",
+        private_key_path
+            .to_str()
+            .context("private key path contains invalid UTF-8")?,
+        "-in",
+        certificate_der_path
+            .to_str()
+            .context("certificate path contains invalid UTF-8")?,
+        "-inform",
+        "DER",
+        "-out",
+        p12_path
+            .to_str()
+            .context("P12 path contains invalid UTF-8")?,
+        "-passout",
+        &format!("pass:{p12_password}"),
+    ]);
+    crate::util::run_command(&mut openssl_pkcs12)?;
+
+    let serial_number = match remote.serial_number.clone() {
+        Some(serial_number) => serial_number,
+        None => read_certificate_serial(&certificate_der_path)?,
+    };
+    let password_account = format!("push-{}-{serial_number}", remote.id);
+    store_p12_password(&password_account, &p12_password)?;
+
+    state
+        .push_certificates
+        .retain(|certificate| certificate.id != remote.id);
+    state.push_certificates.push(ManagedPushCertificate {
+        id: remote.id.clone(),
+        certificate_type: certificate_type.to_owned(),
+        serial_number,
+        bundle_id: bundle_id.identifier.clone(),
+        environment,
+        origin: CertificateOrigin::Generated,
+        display_name: remote.name.clone(),
+        private_key_path,
+        certificate_der_path,
+        p12_path: p12_path.clone(),
+        p12_password_account: password_account.clone(),
+    });
+    Ok(PushCredentialMaterial::Certificate {
+        certificate_id: remote.id,
+        p12_path,
+        p12_password_account: password_account,
+        environment,
+    })
+}
+
+fn push_certificate_type(
+    platform: ApplePlatform,
+    environment: PushEnvironment,
+) -> Result<&'static str> {
+    match (matches!(platform, ApplePlatform::Macos), environment) {
+        (false, PushEnvironment::Development) => Ok("JKG5JZ54H7"),
+        (false, PushEnvironment::Production) => Ok("UPV3DW712I"),
+        (true, PushEnvironment::Development) => Ok("HQ4KP3I34R"),
+        (true, PushEnvironment::Production) => Ok("CDZ7EMXIZ1"),
+    }
+}
+
+fn is_orbit_managed_push_certificate(
+    state: &SigningState,
+    certificate_id: &str,
+    bundle_id: &str,
+    environment: PushEnvironment,
+) -> bool {
+    state.push_certificates.iter().any(|certificate| {
+        certificate.id == certificate_id
+            && certificate.bundle_id == bundle_id
+            && certificate.environment == environment
+    })
+}
+
+fn cleanup_stale_push_certificate_state(
+    state: &mut SigningState,
+    bundle_id: &str,
+    environment: PushEnvironment,
+    remote_certificate_ids: &HashSet<String>,
+) {
+    state.push_certificates.retain(|certificate| {
+        if certificate.bundle_id != bundle_id || certificate.environment != environment {
+            return true;
+        }
+        remote_certificate_ids.contains(&certificate.id)
+    });
 }
 
 fn collect_identifier_values<F>(updates: &[CapabilityUpdate], select: F) -> Vec<String>
@@ -1406,6 +2202,7 @@ fn ensure_certificate(
     let remote = client.create_certificate(
         certificate_type,
         &csr_pem,
+        None,
         is_macos_certificate_type(certificate_type),
     )?;
     let certificate_bytes = client.download_certificate(
@@ -1897,6 +2694,8 @@ fn team_signing_paths(project: &ProjectContext, team_id: &str) -> TeamSigningPat
         state_path: team_dir.join("signing.json"),
         certificates_dir: team_dir.join("certificates"),
         profiles_dir: team_dir.join("profiles"),
+        push_keys_dir: team_dir.join("push-keys"),
+        push_certificates_dir: team_dir.join("push-certificates"),
     }
 }
 
@@ -1966,10 +2765,22 @@ pub fn clean_local_signing_state(project: &ProjectContext) -> Result<LocalSignin
         false
     });
 
+    let mut removed_push_certificates = 0usize;
+    state.push_certificates.retain(|certificate| {
+        if !bundle_ids.contains(&certificate.bundle_id) {
+            return true;
+        }
+        let _ = delete_push_certificate_files(certificate);
+        let _ = delete_p12_password(&certificate.p12_password_account);
+        removed_push_certificates += 1;
+        false
+    });
+
     save_state(project, &team_id, &state)?;
     Ok(LocalSigningCleanSummary {
         removed_profiles,
         removed_certificates,
+        removed_push_certificates,
     })
 }
 
@@ -2071,6 +2882,21 @@ pub fn clean_remote_signing_state(project: &ProjectContext) -> Result<RemoteSign
             is_macos_certificate_type(&certificate.certificate_type),
         )?;
         summary.removed_certificates += 1;
+    }
+
+    for certificate in &state.push_certificates {
+        if !bundle_ids.contains(&certificate.bundle_id)
+            || certificate.origin != CertificateOrigin::Generated
+        {
+            continue;
+        }
+        client.revoke_certificate(
+            &certificate.id,
+            &certificate.certificate_type,
+            certificate.certificate_type == "HQ4KP3I34R"
+                || certificate.certificate_type == "CDZ7EMXIZ1",
+        )?;
+        summary.removed_push_certificates += 1;
     }
 
     Ok(summary)
@@ -2281,6 +3107,12 @@ fn delete_certificate_files(certificate: &ManagedCertificate) -> Result<()> {
     delete_file_if_exists(&certificate.p12_path)
 }
 
+fn delete_push_certificate_files(certificate: &ManagedPushCertificate) -> Result<()> {
+    delete_file_if_exists(&certificate.private_key_path)?;
+    delete_file_if_exists(&certificate.certificate_der_path)?;
+    delete_file_if_exists(&certificate.p12_path)
+}
+
 fn import_certificate_into_keychain(
     project: &ProjectContext,
     certificate: &ManagedCertificate,
@@ -2379,8 +3211,9 @@ mod tests {
         ASC_OPTION_APPLE_ID_PRIMARY_CONSENT, ASC_OPTION_DATA_PROTECTION_COMPLETE,
         ASC_OPTION_PUSH_BROADCAST, CertificateOrigin, ManagedCertificate, ManagedProfile,
         ProfileManifest, ProjectEntitlementIdentifiers, SigningState, asc_capability_settings,
-        asc_profile_type, clean_local_signing_state, load_state, plan_asc_capability_mutations,
-        project_entitlement_identifiers, save_state, team_signing_paths,
+        asc_profile_type, clean_local_signing_state, load_state, materialize_signing_entitlements,
+        plan_asc_capability_mutations, project_entitlement_identifiers, save_state,
+        target_is_app_clip, team_signing_paths,
     };
     use crate::apple::capabilities::{CapabilityRelationships, CapabilityUpdate, RemoteCapability};
     use crate::context::{AppContext, GlobalPaths, ProjectContext, ProjectPaths};
@@ -2439,6 +3272,7 @@ mod tests {
                 xcframeworks: Vec::new(),
                 swift_packages: Vec::new(),
                 entitlements: None,
+                push: None,
                 extension: None,
             }],
         };
@@ -2550,6 +3384,8 @@ mod tests {
                     device_ids: Vec::new(),
                 },
             ],
+            push_keys: Vec::new(),
+            push_certificates: Vec::new(),
         };
         save_state(&project, team_id, &state).unwrap();
 
@@ -2600,6 +3436,95 @@ mod tests {
                 )]),
                 cloud_containers: vec!["iCloud.dev.orbit.fixture".to_owned()],
             }
+        );
+    }
+
+    #[test]
+    fn materializes_app_clip_entitlements_for_clip_and_host_app() {
+        let (_temp, mut project) = test_project();
+        let clip_entitlements_path = project.root.join("Clip.entitlements");
+        let profile_path = project.root.join("Clip.mobileprovision");
+
+        Value::Dictionary(plist::Dictionary::from_iter([(
+            "com.apple.developer.parent-application-identifiers".to_owned(),
+            Value::Array(vec![Value::String(
+                "$(AppIdentifierPrefix)dev.orbit.fixture".to_owned(),
+            )]),
+        )]))
+        .to_file_xml(&clip_entitlements_path)
+        .unwrap();
+        Value::Dictionary(plist::Dictionary::from_iter([(
+            "ApplicationIdentifierPrefix".to_owned(),
+            Value::Array(vec![Value::String("TEAM123456".to_owned())]),
+        )]))
+        .to_file_xml(&profile_path)
+        .unwrap();
+
+        project.manifest.targets[0]
+            .dependencies
+            .push("ExampleClip".to_owned());
+        project.manifest.targets.push(TargetManifest {
+            name: "ExampleClip".to_owned(),
+            kind: TargetKind::App,
+            bundle_id: "dev.orbit.fixture.clip".to_owned(),
+            platforms: vec![ApplePlatform::Ios],
+            sources: vec![project.root.join("Sources/Clip")],
+            resources: Vec::new(),
+            dependencies: Vec::new(),
+            frameworks: Vec::new(),
+            weak_frameworks: Vec::new(),
+            system_libraries: Vec::new(),
+            xcframeworks: Vec::new(),
+            swift_packages: Vec::new(),
+            entitlements: Some("Clip.entitlements".into()),
+            push: None,
+            extension: None,
+        });
+
+        let clip = project
+            .manifest
+            .resolve_target(Some("ExampleClip"))
+            .unwrap();
+        assert!(target_is_app_clip(&project, clip).unwrap());
+        let clip_entitlements = materialize_signing_entitlements(&project, clip, &profile_path)
+            .unwrap()
+            .unwrap();
+        let clip_dictionary = plist::Value::from_file(&clip_entitlements)
+            .unwrap()
+            .into_dictionary()
+            .unwrap();
+        assert_eq!(
+            clip_dictionary
+                .get("com.apple.developer.parent-application-identifiers")
+                .and_then(plist::Value::as_array)
+                .unwrap()[0]
+                .as_string()
+                .unwrap(),
+            "TEAM123456.dev.orbit.fixture"
+        );
+        assert_eq!(
+            clip_dictionary
+                .get("com.apple.developer.on-demand-install-capable")
+                .and_then(plist::Value::as_boolean),
+            Some(true)
+        );
+
+        let host = project.manifest.resolve_target(Some("ExampleApp")).unwrap();
+        let host_entitlements = materialize_signing_entitlements(&project, host, &profile_path)
+            .unwrap()
+            .unwrap();
+        let host_dictionary = plist::Value::from_file(&host_entitlements)
+            .unwrap()
+            .into_dictionary()
+            .unwrap();
+        assert_eq!(
+            host_dictionary
+                .get("com.apple.developer.associated-appclip-app-identifiers")
+                .and_then(plist::Value::as_array)
+                .unwrap()[0]
+                .as_string()
+                .unwrap(),
+            "TEAM123456.dev.orbit.fixture.clip"
         );
     }
 

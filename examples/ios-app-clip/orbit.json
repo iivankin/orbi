@@ -1,0 +1,44 @@
+{
+  "name": "ExampleAppClipHost",
+  "version": "0.1.0",
+  "platform": "apple",
+  "platforms": {
+    "ios": {
+      "deployment_target": "18.0",
+      "profiles": {
+        "development": {
+          "configuration": "debug",
+          "distribution": "development"
+        }
+      }
+    }
+  },
+  "targets": [
+    {
+      "name": "ExampleApp",
+      "kind": "app",
+      "bundle_id": "dev.orbit.examples.appclip",
+      "platforms": [
+        "ios"
+      ],
+      "sources": [
+        "Sources/App"
+      ],
+      "dependencies": [
+        "ExampleClip"
+      ]
+    },
+    {
+      "name": "ExampleClip",
+      "kind": "app",
+      "bundle_id": "dev.orbit.examples.appclip.clip",
+      "platforms": [
+        "ios"
+      ],
+      "sources": [
+        "Sources/Clip"
+      ],
+      "entitlements": "Clip.entitlements"
+    }
+  ]
+}

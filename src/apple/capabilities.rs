@@ -66,6 +66,11 @@ pub struct CapabilitySyncPlan {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CapabilitySyncOptions {
+    pub uses_broadcast_push_notifications: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CapabilityUpdate {
     pub capability_type: String,
     pub option: String,
@@ -668,17 +673,30 @@ pub fn capability_sync_plan_from_entitlements(
     path: &Path,
     remote: &[RemoteCapability],
 ) -> Result<CapabilitySyncPlan> {
+    capability_sync_plan_from_entitlements_with_options(
+        path,
+        remote,
+        &CapabilitySyncOptions::default(),
+    )
+}
+
+pub fn capability_sync_plan_from_entitlements_with_options(
+    path: &Path,
+    remote: &[RemoteCapability],
+    options: &CapabilitySyncOptions,
+) -> Result<CapabilitySyncPlan> {
     let value = Value::from_file(path)
         .with_context(|| format!("failed to parse entitlements {}", path.display()))?;
     let dictionary = value
         .into_dictionary()
         .context("entitlements file must contain a top-level dictionary")?;
-    capability_sync_plan_from_dictionary(&dictionary, remote)
+    capability_sync_plan_from_dictionary(&dictionary, remote, options)
 }
 
 fn capability_sync_plan_from_dictionary(
     dictionary: &Dictionary,
     remote: &[RemoteCapability],
+    options: &CapabilitySyncOptions,
 ) -> Result<CapabilitySyncPlan> {
     let mut updates = BTreeMap::<String, CapabilityUpdate>::new();
     let mut remaining_remote = remote.to_vec();
@@ -694,11 +712,6 @@ fn capability_sync_plan_from_dictionary(
         }
 
         let Some(descriptor) = descriptor_for_entitlement(key) else {
-            if key == "com.apple.developer.parent-application-identifiers" {
-                bail!(
-                    "entitlement `{key}` is recognized, but Orbit does not support App Clip bundle identifier creation yet"
-                );
-            }
             if key.starts_with("com.apple.") || key == "aps-environment" || key == "inter-app-audio"
             {
                 bail!(
@@ -714,7 +727,7 @@ fn capability_sync_plan_from_dictionary(
             let update = upsert_update(
                 &mut updates,
                 descriptor.capability_type,
-                descriptor.enable_option.resolve(key, value)?,
+                resolve_enable_option(descriptor, key, value, options)?,
             );
             update.relationships.merge(relationships);
         }
@@ -724,12 +737,12 @@ fn capability_sync_plan_from_dictionary(
                 .is_some_and(|capability_type| capability_type == descriptor.capability_type)
         });
         let existing = existing_index.map(|index| &remaining_remote[index]);
-        match compute_sync_operation(descriptor, key, value, existing)? {
+        match compute_sync_operation(descriptor, key, value, existing, options)? {
             SyncOperation::Enable => {
                 upsert_update(
                     &mut updates,
                     descriptor.capability_type,
-                    descriptor.enable_option.resolve(key, value)?,
+                    resolve_enable_option(descriptor, key, value, options)?,
                 );
             }
             SyncOperation::Skip => {
@@ -783,8 +796,9 @@ fn compute_sync_operation(
     key: &str,
     value: &Value,
     existing: Option<&RemoteCapability>,
+    options: &CapabilitySyncOptions,
 ) -> Result<SyncOperation> {
-    let desired_option = descriptor.enable_option.resolve(key, value)?;
+    let desired_option = resolve_enable_option(descriptor, key, value, options)?;
     match descriptor.sync_strategy {
         SyncStrategy::Boolean => {
             let desired_enabled = value
@@ -852,6 +866,22 @@ fn compute_sync_operation(
     }
 }
 
+fn resolve_enable_option(
+    descriptor: &CapabilityDescriptor,
+    key: &str,
+    value: &Value,
+    options: &CapabilitySyncOptions,
+) -> Result<String> {
+    let option = descriptor.enable_option.resolve(key, value)?;
+    if descriptor.capability_type == "PUSH_NOTIFICATIONS"
+        && option == OPTION_ON
+        && options.uses_broadcast_push_notifications
+    {
+        return Ok(OPTION_PUSH_BROADCAST.to_owned());
+    }
+    Ok(option)
+}
+
 fn upsert_update<'a>(
     updates: &'a mut BTreeMap<String, CapabilityUpdate>,
     capability_type: &str,
@@ -898,6 +928,18 @@ fn validate_supplemental_entitlement(key: &str, value: &Value) -> Result<bool> {
     match key {
         "com.apple.developer.icloud-services" => {
             Validator::AllowedStringArray(ICLOUD_SERVICE_OPTIONS).validate(key, value)?;
+            Ok(true)
+        }
+        "com.apple.developer.parent-application-identifiers"
+        | "com.apple.developer.associated-appclip-app-identifiers" => {
+            let values = string_array(key, value)?;
+            if values.len() != 1 {
+                bail!("`{key}` must contain exactly one application identifier");
+            }
+            Ok(true)
+        }
+        "com.apple.developer.on-demand-install-capable" => {
+            Validator::Boolean.validate(key, value)?;
             Ok(true)
         }
         _ => Ok(false),
@@ -1127,10 +1169,10 @@ mod tests {
     use plist::Value;
 
     use super::{
-        CapabilitySyncPlan, OPTION_APPLE_ID_PRIMARY_CONSENT, OPTION_DATA_PROTECTION_COMPLETE,
-        OPTION_DATA_PROTECTION_PROTECTED_UNLESS_OPEN, OPTION_OFF, OPTION_ON, OPTION_PUSH_BROADCAST,
-        RemoteCapability, RemoteCapabilityOption, RemoteCapabilitySetting,
-        capability_sync_plan_from_dictionary,
+        CapabilitySyncOptions, CapabilitySyncPlan, OPTION_APPLE_ID_PRIMARY_CONSENT,
+        OPTION_DATA_PROTECTION_COMPLETE, OPTION_DATA_PROTECTION_PROTECTED_UNLESS_OPEN, OPTION_OFF,
+        OPTION_ON, OPTION_PUSH_BROADCAST, RemoteCapability, RemoteCapabilityOption,
+        RemoteCapabilitySetting, capability_sync_plan_from_dictionary,
     };
 
     fn remote_capability(
@@ -1157,7 +1199,12 @@ mod tests {
     }
 
     fn plan(dictionary: plist::Dictionary, remote: Vec<RemoteCapability>) -> CapabilitySyncPlan {
-        capability_sync_plan_from_dictionary(&dictionary, &remote).unwrap()
+        capability_sync_plan_from_dictionary(
+            &dictionary,
+            &remote,
+            &CapabilitySyncOptions::default(),
+        )
+        .unwrap()
     }
 
     #[test]
@@ -1285,6 +1332,25 @@ mod tests {
     }
 
     #[test]
+    fn uses_broadcast_push_option_when_requested() {
+        let plan = capability_sync_plan_from_dictionary(
+            &plist::Dictionary::from_iter([(
+                "aps-environment".to_owned(),
+                Value::String("development".to_owned()),
+            )]),
+            &[],
+            &CapabilitySyncOptions {
+                uses_broadcast_push_notifications: true,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(plan.updates.len(), 1);
+        assert_eq!(plan.updates[0].capability_type, "PUSH_NOTIFICATIONS");
+        assert_eq!(plan.updates[0].option, OPTION_PUSH_BROADCAST);
+    }
+
+    #[test]
     fn rejects_data_protection_none() {
         let error = capability_sync_plan_from_dictionary(
             &plist::Dictionary::from_iter([(
@@ -1292,6 +1358,7 @@ mod tests {
                 Value::String("NSFileProtectionNone".to_owned()),
             )]),
             &[],
+            &CapabilitySyncOptions::default(),
         )
         .unwrap_err();
 

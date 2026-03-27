@@ -106,6 +106,8 @@ pub struct TargetManifest {
     pub swift_packages: Vec<SwiftPackageDependency>,
     pub entitlements: Option<PathBuf>,
     #[serde(default)]
+    pub push: Option<PushManifest>,
+    #[serde(default)]
     pub extension: Option<ExtensionManifest>,
 }
 
@@ -179,6 +181,22 @@ pub struct XcframeworkDependency {
 
 fn default_xcframework_embed() -> bool {
     true
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PushManifest {
+    #[serde(default)]
+    pub broadcast: bool,
+    #[serde(default)]
+    pub credential: PushCredentialKind,
+}
+
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PushCredentialKind {
+    #[default]
+    AuthKey,
+    Certificate,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -619,6 +637,7 @@ mod tests {
             "examples/mixed-language-app/orbit.json",
             "examples/compiled-resources-app/orbit.json",
             "examples/swiftpm-multi-target-app/orbit.json",
+            "examples/ios-app-clip/orbit.json",
         ];
 
         for path in fixture_paths {

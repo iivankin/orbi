@@ -573,7 +573,7 @@ impl AscClient {
     fn delete(&self, path: &str) -> Result<()> {
         let response = self
             .client
-            .request(Method::DELETE, format!("{ASC_BASE_URL}{path}"))
+            .request(Method::DELETE, format!("{}{}", asc_base_url(), path))
             .bearer_auth(self.jwt_token()?)
             .send()
             .with_context(|| format!("failed to call App Store Connect `{path}`"))?;
@@ -667,7 +667,7 @@ fn parse_remote_capability(resource: IncludedResource) -> Result<RemoteCapabilit
 }
 
 fn build_url(path: &str, query: &[(&str, String)]) -> Result<Url> {
-    let mut url = Url::parse(&format!("{ASC_BASE_URL}{path}"))
+    let mut url = Url::parse(&format!("{}{}", asc_base_url(), path))
         .with_context(|| format!("failed to build App Store Connect URL for `{path}`"))?;
     if !query.is_empty() {
         let mut pairs = url.query_pairs_mut();
@@ -677,6 +677,10 @@ fn build_url(path: &str, query: &[(&str, String)]) -> Result<Url> {
         drop(pairs);
     }
     Ok(url)
+}
+
+fn asc_base_url() -> String {
+    std::env::var("ORBIT_ASC_BASE_URL").unwrap_or_else(|_| ASC_BASE_URL.to_owned())
 }
 
 fn handle_json_response<T>(response: Response) -> Result<T>

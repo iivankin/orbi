@@ -10,7 +10,7 @@ use reqwest::blocking::{Client, ClientBuilder, Response};
 use reqwest::header::{HeaderMap, HeaderValue, USER_AGENT};
 use reqwest_cookie_store::CookieStoreMutex;
 use serde::Deserialize;
-use serde_json::{Map, Value};
+use serde_json::{Map, Value, json};
 
 use crate::apple::apple_id::StoredAppleSession;
 
@@ -29,6 +29,7 @@ enum CsrfScope {
     App,
     Device(bool),
     Certificate(bool),
+    Key,
     Merchant(bool),
     AppGroup,
     CloudContainer,
@@ -91,6 +92,14 @@ pub struct PortalCertificate {
     pub status: Option<String>,
     #[serde(rename = "certificateTypeDisplayId", default)]
     pub certificate_type_display_id: Option<String>,
+    #[serde(rename = "ownerType", default)]
+    pub owner_type: Option<String>,
+    #[serde(rename = "ownerName", default)]
+    pub owner_name: Option<String>,
+    #[serde(rename = "ownerId", default)]
+    pub owner_id: Option<String>,
+    #[serde(rename = "canDownload", default)]
+    pub can_download: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -155,6 +164,28 @@ pub struct PortalCloudContainer {
     pub id: String,
     pub name: String,
     pub identifier: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PortalAuthKey {
+    #[serde(rename = "keyId")]
+    pub id: String,
+    #[serde(rename = "keyName")]
+    pub name: String,
+    #[serde(rename = "canDownload", default)]
+    pub can_download: bool,
+    #[serde(rename = "canRevoke", default)]
+    pub can_revoke: bool,
+    #[serde(default)]
+    pub services: Vec<PortalAuthKeyService>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PortalAuthKeyService {
+    #[serde(rename = "serviceId")]
+    pub id: String,
+    #[serde(rename = "serviceName", default)]
+    pub name: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -625,20 +656,26 @@ impl PortalClient {
         &mut self,
         certificate_type: &str,
         csr_content: &str,
+        app_id: Option<&str>,
         mac: bool,
     ) -> Result<PortalCertificate> {
         self.ensure_csrf(CsrfScope::Certificate(mac))?;
+        let mut params = vec![
+            ("teamId", self.team_id.clone()),
+            ("type", certificate_type.to_owned()),
+            ("csrContent", csr_content.to_owned()),
+        ];
+        if let Some(app_id) = app_id {
+            params.push(("appIdId", app_id.to_owned()));
+            params.push(("specialIdentifierDisplayId", app_id.to_owned()));
+        }
         let (envelope, _) = self.request_json(
             Method::POST,
             &format!(
                 "account/{}/certificate/submitCertificateRequest.action",
                 platform_slug(mac)
             ),
-            &[
-                ("teamId", self.team_id.clone()),
-                ("type", certificate_type.to_owned()),
-                ("csrContent", csr_content.to_owned()),
-            ],
+            &params,
             self.csrf_headers(CsrfScope::Certificate(mac)),
         )?;
         json_field::<PortalCertificate>(&envelope.extra, "certRequest")
@@ -685,6 +722,94 @@ impl PortalClient {
             ],
             self.csrf_headers(CsrfScope::Certificate(mac)),
         )?;
+        Ok(())
+    }
+
+    pub fn list_auth_keys(&mut self) -> Result<Vec<PortalAuthKey>> {
+        self.paged_post_collection(
+            "account/auth/key/list",
+            "keys",
+            vec![
+                ("teamId", self.team_id.clone()),
+                ("sort", "name=asc".to_owned()),
+            ],
+            Some(CsrfScope::Key),
+        )
+    }
+
+    pub fn get_auth_key_info(&mut self, key_id: &str) -> Result<Option<PortalAuthKey>> {
+        let (envelope, headers) = self.request_json(
+            Method::POST,
+            "account/auth/key/get",
+            &[
+                ("teamId", self.team_id.clone()),
+                ("keyId", key_id.to_owned()),
+            ],
+            self.csrf_headers(CsrfScope::Key),
+        )?;
+        self.store_csrf_tokens(CsrfScope::Key, &headers);
+        let mut keys =
+            json_field::<Vec<PortalAuthKey>>(&envelope.extra, "keys").unwrap_or_default();
+        Ok(keys.pop())
+    }
+
+    pub fn download_auth_key(&mut self, key_id: &str) -> Result<String> {
+        self.ensure_csrf(CsrfScope::Key)?;
+        let bytes = self.request_bytes(
+            Method::GET,
+            "account/auth/key/download",
+            &[
+                ("teamId", self.team_id.clone()),
+                ("keyId", key_id.to_owned()),
+            ],
+            self.csrf_headers(CsrfScope::Key),
+        )?;
+        String::from_utf8(bytes)
+            .context("Apple Developer Portal returned a non-UTF-8 auth key payload")
+    }
+
+    pub fn create_auth_key(&mut self, name: &str) -> Result<PortalAuthKey> {
+        self.ensure_csrf(CsrfScope::Key)?;
+        let (envelope, headers) = self.request_json_value(
+            Method::POST,
+            "account/auth/key/v2/create",
+            &json!({
+                "teamId": self.team_id.clone(),
+                "name": name,
+                "scope": "team",
+                "serviceConfigurations": {
+                    "U27F4V844T": []
+                },
+                "serviceConfigurationsRequests": [
+                    {
+                        "isNew": true,
+                        "serviceId": "U27F4V844T",
+                        "identifiers": {},
+                        "environment": "all",
+                        "scope": "team"
+                    }
+                ]
+            }),
+            self.csrf_headers(CsrfScope::Key),
+        )?;
+        self.store_csrf_tokens(CsrfScope::Key, &headers);
+        let mut keys = json_field::<Vec<PortalAuthKey>>(&envelope.extra, "keys")?;
+        keys.pop()
+            .context("Apple Developer Portal did not return the created auth key")
+    }
+
+    pub fn revoke_auth_key(&mut self, key_id: &str) -> Result<()> {
+        self.ensure_csrf(CsrfScope::Key)?;
+        let (_, headers) = self.request_json(
+            Method::POST,
+            "account/auth/key/revoke",
+            &[
+                ("teamId", self.team_id.clone()),
+                ("keyId", key_id.to_owned()),
+            ],
+            self.csrf_headers(CsrfScope::Key),
+        )?;
+        self.store_csrf_tokens(CsrfScope::Key, &headers);
         Ok(())
     }
 
@@ -825,6 +950,9 @@ impl PortalClient {
                     mac,
                 )?;
             }
+            CsrfScope::Key => {
+                let _ = self.list_auth_keys()?;
+            }
             CsrfScope::Merchant(mac) => {
                 let _ = self.list_merchants(mac)?;
             }
@@ -909,33 +1037,25 @@ impl PortalClient {
         params: &[(&str, String)],
         headers: Option<HeaderMap>,
     ) -> Result<(PortalEnvelope, HeaderMap)> {
-        let response = self.send(method, path, params, headers)?;
-        let header_map = response.headers().clone();
-        let status = response.status();
-        let bytes = response
-            .bytes()
-            .context("failed to read Apple Developer Portal response body")?;
-        let envelope: PortalEnvelope = serde_json::from_slice(&bytes).with_context(|| {
-            format!("failed to parse Apple Developer Portal response as JSON (status {status})")
-        })?;
+        let response = self.send(method, path, params, headers, None)?;
+        parse_json_response(response)
+    }
 
-        if let Some(result_code) = envelope.result_code {
-            if result_code != 0 {
-                let message = envelope
-                    .user_string
-                    .clone()
-                    .or_else(|| envelope.result_string.clone())
-                    .unwrap_or_else(|| "Apple Developer Portal request failed".to_owned());
-                bail!("{message}");
-            }
-        } else if !status.is_success() {
-            bail!(
-                "Apple Developer Portal request failed with {status}: {}",
-                String::from_utf8_lossy(&bytes)
-            );
-        }
-
-        Ok((envelope, header_map))
+    fn request_json_value(
+        &self,
+        method: Method,
+        path: &str,
+        body: &Value,
+        headers: Option<HeaderMap>,
+    ) -> Result<(PortalEnvelope, HeaderMap)> {
+        let response = self.send(
+            method,
+            path,
+            &[],
+            headers,
+            Some(PortalRequestBody::Json(body)),
+        )?;
+        parse_json_response(response)
     }
 
     fn request_bytes(
@@ -945,7 +1065,7 @@ impl PortalClient {
         params: &[(&str, String)],
         headers: Option<HeaderMap>,
     ) -> Result<Vec<u8>> {
-        let response = self.send(method, path, params, headers)?;
+        let response = self.send(method, path, params, headers, None)?;
         let status = response.status();
         let bytes = response
             .bytes()
@@ -965,6 +1085,7 @@ impl PortalClient {
         path: &str,
         params: &[(&str, String)],
         headers: Option<HeaderMap>,
+        body: Option<PortalRequestBody<'_>>,
     ) -> Result<Response> {
         let url = if path.starts_with("https://") {
             path.to_owned()
@@ -980,9 +1101,18 @@ impl PortalClient {
         }
         request = request.header(USER_AGENT, format!("orbit/{}", env!("CARGO_PKG_VERSION")));
         if method == Method::POST {
-            request = request
-                .header("Content-Type", "application/x-www-form-urlencoded")
-                .body(form_body(params)?);
+            match body {
+                Some(PortalRequestBody::Json(value)) => {
+                    request = request
+                        .header("Content-Type", "application/json")
+                        .json(value);
+                }
+                None => {
+                    request = request
+                        .header("Content-Type", "application/x-www-form-urlencoded")
+                        .body(form_body(params)?);
+                }
+            }
         }
         request
             .send()
@@ -1000,6 +1130,39 @@ impl PortalClient {
             self.csrf_cache.insert(scope, CsrfTokens { values: tokens });
         }
     }
+}
+
+enum PortalRequestBody<'a> {
+    Json(&'a Value),
+}
+
+fn parse_json_response(response: Response) -> Result<(PortalEnvelope, HeaderMap)> {
+    let header_map = response.headers().clone();
+    let status = response.status();
+    let bytes = response
+        .bytes()
+        .context("failed to read Apple Developer Portal response body")?;
+    let envelope: PortalEnvelope = serde_json::from_slice(&bytes).with_context(|| {
+        format!("failed to parse Apple Developer Portal response as JSON (status {status})")
+    })?;
+
+    if let Some(result_code) = envelope.result_code {
+        if result_code != 0 {
+            let message = envelope
+                .user_string
+                .clone()
+                .or_else(|| envelope.result_string.clone())
+                .unwrap_or_else(|| "Apple Developer Portal request failed".to_owned());
+            bail!("{message}");
+        }
+    } else if !status.is_success() {
+        bail!(
+            "Apple Developer Portal request failed with {status}: {}",
+            String::from_utf8_lossy(&bytes)
+        );
+    }
+
+    Ok((envelope, header_map))
 }
 
 #[derive(Debug, Clone, Deserialize)]
