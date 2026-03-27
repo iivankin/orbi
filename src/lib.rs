@@ -1,5 +1,6 @@
 pub mod apple;
 pub mod build;
+pub mod clean;
 pub mod cli;
 pub mod context;
 pub mod manifest;
@@ -30,6 +31,10 @@ pub fn run() -> Result<()> {
             let project = app.load_project(cli.manifest.as_deref())?;
             build::submit_artifact(&project, args)
         }
+        Command::Clean(args) => {
+            let project = app.load_project(cli.manifest.as_deref())?;
+            clean::clean_project(&project, args)
+        }
         Command::Apple(apple) => match &apple.command {
             AppleCommand::Device { command } => match command {
                 AppleDeviceCommand::List(args) => apple_device::list_devices(&app, args),
@@ -41,6 +46,14 @@ pub fn run() -> Result<()> {
                 AppleSigningCommand::Sync(args) => {
                     let project = app.load_project(cli.manifest.as_deref())?;
                     apple_signing::sync_signing(&project, args)
+                }
+                AppleSigningCommand::Export(args) => {
+                    let project = app.load_project(cli.manifest.as_deref())?;
+                    apple_signing::export_signing_credentials(&project, args)
+                }
+                AppleSigningCommand::Import(args) => {
+                    let project = app.load_project(cli.manifest.as_deref())?;
+                    apple_signing::import_signing_credentials(&project, args)
                 }
             },
         },

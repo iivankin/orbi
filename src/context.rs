@@ -31,7 +31,6 @@ pub struct GlobalPaths {
     pub cache_dir: PathBuf,
     pub auth_state_path: PathBuf,
     pub device_cache_path: PathBuf,
-    pub signing_state_path: PathBuf,
     pub keychain_path: PathBuf,
 }
 
@@ -69,7 +68,6 @@ impl AppContext {
             global_paths: GlobalPaths {
                 auth_state_path: data_dir.join("auth.json"),
                 device_cache_path: data_dir.join("devices.json"),
-                signing_state_path: data_dir.join("signing.json"),
                 data_dir,
                 cache_dir,
                 keychain_path,

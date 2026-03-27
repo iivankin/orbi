@@ -9,11 +9,11 @@
 Known gaps:
 
 - [ ] Add an ASC API key provisioning/signing path for CI using App Store Connect API for supported resources (`bundleIds`, `bundleIdCapabilities`, `certificates`, `devices`, `profiles`, `merchantIds`), and fail clearly when identifier-linking flows still require Apple ID portal sessions (for example App Groups and iCloud containers).
-- [ ] Add a CLI command to export Orbit-managed signing credentials for CI use (`.p12`, password) from local Orbit state.
-- [ ] Add a CLI command to import signing credentials (`.p12`, password), into Orbit-managed signing state.
+- [x] Add a CLI command to export Orbit-managed signing credentials for CI use (`.p12`, password) from local Orbit state.
+- [x] Add a CLI command to import signing credentials (`.p12`, password), into Orbit-managed signing state.
 - [ ] Add `orbit clean` to remove either local Orbit caches/state or all Orbit-managed Apple Developer resources for the current project, so e2e tests can reset cleanly.
 - [ ] Add comprehensive end-to-end tests that exercise Orbit-managed Apple setup, clean/reset flows, signing reuse/import-export, and CI-oriented signed build/submit scenarios.
-- [ ] Scope signing state by Apple team instead of a single global user cache; keep certificates team-scoped and profiles team + bundle/profile scoped.
+- [x] Scope signing state by Apple team instead of a single global user cache; keep certificates team-scoped and profiles team + bundle/profile scoped.
 - [ ] Implement App Clip bundle ID creation/signing flow for `com.apple.developer.parent-application-identifiers`.
 - [ ] Implement `orbit run` for watchOS targets.
 - [ ] Implement `orbit run --debug` with debugger attach and breakpoint support.

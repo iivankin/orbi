@@ -20,7 +20,7 @@ pub const CLAP_STYLING: Styles = Styles::styled()
 #[command(arg_required_else_help = true)]
 #[command(styles = CLAP_STYLING)]
 #[command(
-    after_help = "Examples:\n  orbit run --simulator\n  orbit build --profile release\n  orbit submit --wait\n  orbit apple device list --refresh"
+    after_help = "Examples:\n  orbit run --simulator\n  orbit build --profile release\n  orbit submit --wait\n  orbit clean --all\n  orbit apple device list --refresh\n  orbit apple signing export --profile development\n  orbit apple signing import --profile development --p12 ./signing.p12 --password secret"
 )]
 pub struct Cli {
     #[arg(long, global = true)]
@@ -38,6 +38,7 @@ pub enum Command {
     Run(RunArgs),
     Build(BuildArgs),
     Submit(SubmitArgs),
+    Clean(CleanArgs),
     Apple(AppleArgs),
 }
 
@@ -93,6 +94,18 @@ pub struct SubmitArgs {
 
     #[arg(long)]
     pub wait: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct CleanArgs {
+    #[arg(long, conflicts_with_all = ["apple", "all"])]
+    pub local: bool,
+
+    #[arg(long, conflicts_with_all = ["local", "all"])]
+    pub apple: bool,
+
+    #[arg(long, conflicts_with_all = ["local", "apple"])]
+    pub all: bool,
 }
 
 #[derive(Debug, Args)]
@@ -170,6 +183,8 @@ pub enum DevicePlatform {
 #[derive(Debug, Subcommand)]
 pub enum AppleSigningCommand {
     Sync(SigningSyncArgs),
+    Export(SigningExportArgs),
+    Import(SigningImportArgs),
 }
 
 #[derive(Debug, Args)]
@@ -185,4 +200,51 @@ pub struct SigningSyncArgs {
 
     #[arg(long, conflicts_with = "simulator")]
     pub device: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct SigningExportArgs {
+    #[arg(long)]
+    pub target: Option<String>,
+
+    #[arg(long)]
+    pub profile: Option<String>,
+
+    #[arg(long, value_enum)]
+    pub platform: Option<TargetPlatform>,
+
+    #[arg(long)]
+    pub output_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+pub struct SigningImportArgs {
+    #[arg(long)]
+    pub target: Option<String>,
+
+    #[arg(long)]
+    pub profile: Option<String>,
+
+    #[arg(long, value_enum)]
+    pub platform: Option<TargetPlatform>,
+
+    #[arg(long)]
+    pub p12: PathBuf,
+
+    #[arg(long)]
+    pub password: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, ValueEnum)]
+pub enum TargetPlatform {
+    #[value(name = "ios")]
+    Ios,
+    #[value(name = "macos")]
+    Macos,
+    #[value(name = "tvos")]
+    Tvos,
+    #[value(name = "visionos")]
+    Visionos,
+    #[value(name = "watchos")]
+    Watchos,
 }

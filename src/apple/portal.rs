@@ -212,6 +212,10 @@ impl PortalClient {
         })
     }
 
+    pub fn team_id(&self) -> &str {
+        &self.team_id
+    }
+
     pub fn list_devices(
         &mut self,
         device_class: PortalDeviceClass,
@@ -381,6 +385,20 @@ impl PortalClient {
         json_field::<PortalAppId>(&envelope.extra, "appId")
     }
 
+    pub fn delete_app(&mut self, id: &str, mac: bool) -> Result<()> {
+        self.ensure_csrf(CsrfScope::App)?;
+        let _ = self.request_json(
+            Method::POST,
+            &format!(
+                "account/{}/identifiers/deleteAppId.action",
+                platform_slug(mac)
+            ),
+            &[("teamId", self.team_id.clone()), ("appIdId", id.to_owned())],
+            self.csrf_headers(CsrfScope::App),
+        )?;
+        Ok(())
+    }
+
     pub fn update_app_service(&mut self, app_id: &str, update: &PortalServiceUpdate) -> Result<()> {
         self.ensure_csrf(CsrfScope::App)?;
         let uri = if update.uses_push_uri {
@@ -429,6 +447,20 @@ impl PortalClient {
         json_field::<PortalAppGroup>(&envelope.extra, "applicationGroup")
     }
 
+    pub fn delete_app_group(&mut self, id: &str) -> Result<()> {
+        self.ensure_csrf(CsrfScope::AppGroup)?;
+        let _ = self.request_json(
+            Method::POST,
+            "account/ios/identifiers/deleteApplicationGroup.action",
+            &[
+                ("teamId", self.team_id.clone()),
+                ("applicationGroup", id.to_owned()),
+            ],
+            self.csrf_headers(CsrfScope::AppGroup),
+        )?;
+        Ok(())
+    }
+
     pub fn list_merchants(&mut self, mac: bool) -> Result<Vec<PortalMerchant>> {
         self.paged_post_collection(
             &format!("account/{}/identifiers/listOMCs.action", platform_slug(mac)),
@@ -459,6 +491,20 @@ impl PortalClient {
             self.csrf_headers(CsrfScope::Merchant(mac)),
         )?;
         json_field::<PortalMerchant>(&envelope.extra, "omcId")
+    }
+
+    pub fn delete_merchant(&mut self, id: &str, mac: bool) -> Result<()> {
+        self.ensure_csrf(CsrfScope::Merchant(mac))?;
+        let _ = self.request_json(
+            Method::POST,
+            &format!(
+                "account/{}/identifiers/deleteOMC.action",
+                platform_slug(mac)
+            ),
+            &[("teamId", self.team_id.clone()), ("omcId", id.to_owned())],
+            self.csrf_headers(CsrfScope::Merchant(mac)),
+        )?;
+        Ok(())
     }
 
     pub fn list_cloud_containers(&mut self) -> Result<Vec<PortalCloudContainer>> {
@@ -617,6 +663,29 @@ impl PortalClient {
             ],
             self.csrf_headers(CsrfScope::Certificate(mac)),
         )
+    }
+
+    pub fn revoke_certificate(
+        &mut self,
+        certificate_id: &str,
+        certificate_type: &str,
+        mac: bool,
+    ) -> Result<()> {
+        self.ensure_csrf(CsrfScope::Certificate(mac))?;
+        let _ = self.request_json(
+            Method::POST,
+            &format!(
+                "account/{}/certificate/revokeCertificate.action",
+                platform_slug(mac)
+            ),
+            &[
+                ("teamId", self.team_id.clone()),
+                ("certificateId", certificate_id.to_owned()),
+                ("type", certificate_type.to_owned()),
+            ],
+            self.csrf_headers(CsrfScope::Certificate(mac)),
+        )?;
+        Ok(())
     }
 
     pub fn list_profiles(
