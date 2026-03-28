@@ -1991,8 +1991,19 @@ fn string_array_value(key: &str, value: &Value) -> Result<Vec<String>> {
         .collect()
 }
 
-pub fn sign_bundle(bundle_path: &Path, material: &SigningMaterial) -> Result<()> {
-    let embedded_profile = bundle_path.join("embedded.mobileprovision");
+pub fn sign_bundle(
+    platform: ApplePlatform,
+    bundle_path: &Path,
+    material: &SigningMaterial,
+) -> Result<()> {
+    let embedded_profile = if platform == ApplePlatform::Macos {
+        bundle_path
+            .join("Contents")
+            .join("embedded.provisionprofile")
+    } else {
+        bundle_path.join("embedded.mobileprovision")
+    };
+    ensure_parent_dir(&embedded_profile)?;
     fs::copy(&material.provisioning_profile_path, &embedded_profile).with_context(|| {
         format!(
             "failed to embed provisioning profile into {}",

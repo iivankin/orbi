@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsStr;
 use std::fs;
+use std::os::unix::process::CommandExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -325,7 +326,13 @@ fn build_project(project: &ProjectContext, request: &BuildRequest) -> Result<Bui
             let built_target = built_targets
                 .get_mut(&target.name)
                 .with_context(|| format!("missing built target `{}`", target.name))?;
-            embed_dependencies(project, target, &built_targets_snapshot, built_target)?;
+            embed_dependencies(
+                project,
+                platform,
+                target,
+                &built_targets_snapshot,
+                built_target,
+            )?;
         }
 
         if signing_required && target.kind.is_bundle() {
@@ -339,7 +346,7 @@ fn build_project(project: &ProjectContext, request: &BuildRequest) -> Result<Bui
                 profile,
                 request.provisioning_udids.clone(),
             )?;
-            crate::apple::signing::sign_bundle(&built_target.bundle_path, &material)?;
+            crate::apple::signing::sign_bundle(platform, &built_target.bundle_path, &material)?;
         }
     }
 
@@ -388,11 +395,13 @@ fn compile_target(
     let intermediates_dir = target_dir.join("intermediates");
     let product = product_layout(&target_dir, &intermediates_dir, target, toolchain);
     ensure_dir(&intermediates_dir)?;
+    remove_existing_path(&product.product_path)?;
     if target.kind.is_bundle() {
         ensure_dir(&product.product_path)?;
     } else {
         ensure_parent_dir(&product.product_path)?;
     }
+    ensure_parent_dir(&product.binary_path)?;
 
     let package_outputs = if target.swift_packages.is_empty() {
         Vec::new()
@@ -528,7 +537,14 @@ fn compile_target(
                         target.name
                     )
                 },
-                || embed_external_payloads(&external_link_inputs, &product.product_path),
+                || {
+                    embed_external_payloads(
+                        &external_link_inputs,
+                        toolchain,
+                        target.kind,
+                        &product.product_path,
+                    )
+                },
             )?;
         }
     }
@@ -939,6 +955,54 @@ fn bundle_directory_name(target: &TargetManifest) -> String {
     }
 }
 
+fn macos_bundle_uses_contents(platform: ApplePlatform, target_kind: TargetKind) -> bool {
+    platform == ApplePlatform::Macos
+        && matches!(
+            target_kind,
+            TargetKind::App
+                | TargetKind::AppExtension
+                | TargetKind::WatchApp
+                | TargetKind::WatchExtension
+                | TargetKind::WidgetExtension
+        )
+}
+
+fn bundle_metadata_root(
+    toolchain: &Toolchain,
+    target_kind: TargetKind,
+    bundle_root: &Path,
+) -> PathBuf {
+    if macos_bundle_uses_contents(toolchain.platform, target_kind) {
+        bundle_root.join("Contents")
+    } else {
+        bundle_root.to_path_buf()
+    }
+}
+
+fn bundle_resources_root(
+    toolchain: &Toolchain,
+    target_kind: TargetKind,
+    bundle_root: &Path,
+) -> PathBuf {
+    if macos_bundle_uses_contents(toolchain.platform, target_kind) {
+        bundle_root.join("Contents").join("Resources")
+    } else {
+        bundle_root.to_path_buf()
+    }
+}
+
+fn bundle_frameworks_root(
+    toolchain: &Toolchain,
+    target_kind: TargetKind,
+    bundle_root: &Path,
+) -> PathBuf {
+    if macos_bundle_uses_contents(toolchain.platform, target_kind) {
+        bundle_root.join("Contents").join("Frameworks")
+    } else {
+        bundle_root.join("Frameworks")
+    }
+}
+
 fn product_layout(
     target_dir: &Path,
     intermediates_dir: &Path,
@@ -959,6 +1023,18 @@ fn product_layout(
         _ => None,
     };
     let binary_path = match target.kind {
+        TargetKind::App
+        | TargetKind::AppExtension
+        | TargetKind::WatchApp
+        | TargetKind::WatchExtension
+        | TargetKind::WidgetExtension
+            if macos_bundle_uses_contents(toolchain.platform, target.kind) =>
+        {
+            product_path
+                .join("Contents")
+                .join("MacOS")
+                .join(&target.name)
+        }
         TargetKind::App
         | TargetKind::AppExtension
         | TargetKind::WatchApp
@@ -1004,7 +1080,7 @@ fn write_info_plist(
             target
                 .display_name
                 .clone()
-                .unwrap_or_else(|| project.manifest.name.clone()),
+                .unwrap_or_else(|| target.name.clone()),
         ),
     );
     plist.insert(
@@ -1118,12 +1194,13 @@ fn write_info_plist(
 
     apply_info_plist_overrides(&mut plist, &target.info_plist)?;
 
-    let path = bundle_root.join("Info.plist");
+    let metadata_root = bundle_metadata_root(toolchain, target.kind, bundle_root);
+    let path = metadata_root.join("Info.plist");
     ensure_parent_dir(&path)?;
     Value::Dictionary(plist)
         .to_file_xml(&path)
         .with_context(|| format!("failed to write {}", path.display()))?;
-    write_bundle_pkg_info(target.kind, bundle_root)
+    write_bundle_pkg_info(toolchain, target.kind, bundle_root)
 }
 
 fn add_ios_app_plist_defaults(
@@ -1269,7 +1346,11 @@ fn ios_orientation_name(orientation: IosInterfaceOrientation) -> &'static str {
     }
 }
 
-fn write_bundle_pkg_info(target_kind: TargetKind, bundle_root: &Path) -> Result<()> {
+fn write_bundle_pkg_info(
+    toolchain: &Toolchain,
+    target_kind: TargetKind,
+    bundle_root: &Path,
+) -> Result<()> {
     let contents = match target_kind {
         TargetKind::App | TargetKind::WatchApp => Some("APPL????"),
         TargetKind::AppExtension | TargetKind::WatchExtension | TargetKind::WidgetExtension => {
@@ -1283,7 +1364,7 @@ fn write_bundle_pkg_info(target_kind: TargetKind, bundle_root: &Path) -> Result<
         return Ok(());
     };
 
-    let path = bundle_root.join("PkgInfo");
+    let path = bundle_metadata_root(toolchain, target_kind, bundle_root).join("PkgInfo");
     fs::write(&path, contents).with_context(|| format!("failed to write {}", path.display()))
 }
 
@@ -1373,6 +1454,8 @@ fn process_resources(
     target: &TargetManifest,
     bundle_root: &Path,
 ) -> Result<ResourceWorkSummary> {
+    let resources_root = bundle_resources_root(toolchain, target.kind, bundle_root);
+    ensure_dir(&resources_root)?;
     let mut asset_catalogs = Vec::new();
     let mut interface_jobs = Vec::new();
     let mut strings_jobs = Vec::new();
@@ -1408,20 +1491,20 @@ fn process_resources(
     };
 
     if !asset_catalogs.is_empty() {
-        compile_asset_catalogs(toolchain, &asset_catalogs, bundle_root)?;
+        compile_asset_catalogs(toolchain, target.kind, &asset_catalogs, bundle_root)?;
     }
     for (source, relative) in interface_jobs {
-        compile_interface_resource(toolchain, &source, &bundle_root.join(relative))?;
+        compile_interface_resource(toolchain, &source, &resources_root.join(relative))?;
     }
     for (source, relative) in strings_jobs {
-        compile_strings_resource(&source, &bundle_root.join(relative))?;
+        compile_strings_resource(&source, &resources_root.join(relative))?;
     }
     for (source, relative) in core_data_jobs {
-        compile_core_data_model(&source, &bundle_root.join(relative))?;
+        compile_core_data_model(&source, &resources_root.join(relative))?;
     }
 
     for (source, relative) in copy_jobs {
-        let destination = bundle_root.join(relative);
+        let destination = resources_root.join(relative);
         if source.is_dir() {
             copy_dir_recursive(&source, &destination)?;
         } else {
@@ -1579,13 +1662,15 @@ fn discover_resources(
 
 fn compile_asset_catalogs(
     toolchain: &Toolchain,
+    target_kind: TargetKind,
     asset_catalogs: &[PathBuf],
     bundle_root: &Path,
 ) -> Result<()> {
     let partial_plist = NamedTempFile::new()?;
+    let resources_root = bundle_resources_root(toolchain, target_kind, bundle_root);
     let mut command = toolchain.actool_command();
     command.arg("actool");
-    command.arg("--compile").arg(bundle_root);
+    command.arg("--compile").arg(&resources_root);
     command
         .arg("--output-partial-info-plist")
         .arg(partial_plist.path());
@@ -1608,7 +1693,10 @@ fn compile_asset_catalogs(
         command.arg(catalog);
     }
     command_output(&mut command)?;
-    merge_partial_info_plist(bundle_root, partial_plist.path())
+    merge_partial_info_plist(
+        bundle_metadata_root(toolchain, target_kind, bundle_root),
+        partial_plist.path(),
+    )
 }
 
 fn asset_catalog_contains_named_set(asset_catalogs: &[PathBuf], expected_name: &str) -> bool {
@@ -1617,12 +1705,16 @@ fn asset_catalog_contains_named_set(asset_catalogs: &[PathBuf], expected_name: &
         .any(|catalog| catalog.join(expected_name).exists())
 }
 
-fn merge_partial_info_plist(bundle_root: &Path, partial_plist_path: &Path) -> Result<()> {
+fn merge_partial_info_plist(
+    info_plist_root: impl AsRef<Path>,
+    partial_plist_path: &Path,
+) -> Result<()> {
+    let info_plist_root = info_plist_root.as_ref();
     if !partial_plist_path.exists() {
         return Ok(());
     }
 
-    let info_plist_path = bundle_root.join("Info.plist");
+    let info_plist_path = info_plist_root.join("Info.plist");
     if !info_plist_path.exists() {
         return Ok(());
     }
@@ -1700,6 +1792,7 @@ fn compiled_interface_relative(
 
 fn embed_dependencies(
     project: &ProjectContext,
+    platform: ApplePlatform,
     root_target: &TargetManifest,
     built_targets: &HashMap<String, BuiltTarget>,
     built_root_target: &mut BuiltTarget,
@@ -1710,7 +1803,7 @@ fn embed_dependencies(
             .get(dependency_name)
             .with_context(|| format!("missing built dependency `{dependency_name}`"))?;
         let Some(destination_root) =
-            embedded_dependency_root(project, root_target, dependency_target)?
+            embedded_dependency_root(project, platform, root_target, dependency_target)?
         else {
             continue;
         };
@@ -1731,19 +1824,20 @@ fn embed_dependencies(
 
 fn embedded_dependency_root(
     project: &ProjectContext,
+    platform: ApplePlatform,
     parent_target: &TargetManifest,
     child_target: &TargetManifest,
-) -> Result<Option<&'static str>> {
-    Ok(match (parent_target.kind, child_target.kind) {
+) -> Result<Option<PathBuf>> {
+    let relative = match (parent_target.kind, child_target.kind) {
         (
             TargetKind::App | TargetKind::WatchApp,
             TargetKind::AppExtension | TargetKind::WatchExtension | TargetKind::WidgetExtension,
-        ) => Some("PlugIns"),
-        (TargetKind::App, TargetKind::WatchApp) => Some("Watch"),
+        ) => Some(PathBuf::from("PlugIns")),
+        (TargetKind::App, TargetKind::WatchApp) => Some(PathBuf::from("Watch")),
         (TargetKind::App, TargetKind::App)
             if crate::apple::signing::target_is_app_clip(project, child_target)? =>
         {
-            Some("AppClips")
+            Some(PathBuf::from("AppClips"))
         }
         (
             TargetKind::App
@@ -1752,9 +1846,16 @@ fn embedded_dependency_root(
             | TargetKind::WatchExtension
             | TargetKind::WidgetExtension,
             TargetKind::Framework,
-        ) => Some("Frameworks"),
+        ) => Some(PathBuf::from("Frameworks")),
         _ => None,
-    })
+    };
+    Ok(relative.map(|path| {
+        if macos_bundle_uses_contents(platform, parent_target.kind) {
+            PathBuf::from("Contents").join(path)
+        } else {
+            path
+        }
+    }))
 }
 
 fn export_artifact(
@@ -1902,7 +2003,7 @@ fn copy_product(source: &Path, destination: &Path) -> Result<()> {
 fn run_on_macos(receipt: &BuildReceipt) -> Result<()> {
     let executable = macos_executable_path(receipt)?;
     println!(
-        "Launching {} on the local Mac. Orbit will stay attached until the process exits; press Ctrl-C to stop.",
+        "Launching {} on the local Mac. Orbit will hand control to the app until it exits; press Ctrl-C to stop.",
         receipt.bundle_id
     );
 
@@ -1910,7 +2011,9 @@ fn run_on_macos(receipt: &BuildReceipt) -> Result<()> {
     if let Some(bundle_root) = receipt.bundle_path.parent() {
         command.current_dir(bundle_root);
     }
-    run_command(&mut command)
+    let debug = crate::util::debug_command(&command);
+    let error = command.exec();
+    bail!("failed to execute `{debug}`: {error}")
 }
 
 fn debug_on_macos(receipt: &BuildReceipt) -> Result<()> {
@@ -1937,11 +2040,6 @@ fn macos_executable_path(receipt: &BuildReceipt) -> Result<PathBuf> {
         .join(&receipt.target);
     if standard_bundle_binary.exists() {
         return Ok(standard_bundle_binary);
-    }
-
-    let legacy_bundle_binary = receipt.bundle_path.join(&receipt.target);
-    if legacy_bundle_binary.exists() {
-        return Ok(legacy_bundle_binary);
     }
 
     if receipt.bundle_path.is_file() {
@@ -2971,12 +3069,17 @@ fn apply_external_link_inputs(command: &mut Command, inputs: &ExternalLinkInputs
     }
 }
 
-fn embed_external_payloads(inputs: &ExternalLinkInputs, bundle_root: &Path) -> Result<()> {
+fn embed_external_payloads(
+    inputs: &ExternalLinkInputs,
+    toolchain: &Toolchain,
+    target_kind: TargetKind,
+    bundle_root: &Path,
+) -> Result<()> {
     if inputs.embedded_payloads.is_empty() {
         return Ok(());
     }
 
-    let frameworks_root = bundle_root.join("Frameworks");
+    let frameworks_root = bundle_frameworks_root(toolchain, target_kind, bundle_root);
     ensure_dir(&frameworks_root)?;
     for payload in &inputs.embedded_payloads {
         let file_name = payload
@@ -3879,14 +3982,15 @@ mod tests {
         SwiftPackageTargetDependency, TargetKind, Toolchain, XcframeworkLibrary,
         device_is_locked_from_details, device_support_label_from_device, embedded_dependency_root,
         error_mentions_locked_device, extension_plist, find_running_process_for_installation,
-        json_to_plist, lldb_expect_attach_script, merge_extension_attributes,
-        merge_partial_info_plist, ordered_package_targets, relocate_bundle_debug_artifacts,
-        select_xcframework_library, write_info_plist,
+        json_to_plist, lldb_expect_attach_script, macos_executable_path,
+        merge_extension_attributes, merge_partial_info_plist, ordered_package_targets,
+        relocate_bundle_debug_artifacts, select_xcframework_library, write_info_plist,
     };
+    use crate::build::receipt::BuildReceipt;
     use crate::context::{AppContext, GlobalPaths, ProjectContext, ProjectPaths};
     use crate::manifest::{
-        IosDeviceFamily, IosInterfaceOrientation, IosSupportedOrientationsManifest,
-        IosTargetManifest, Manifest,
+        DistributionKind, IosDeviceFamily, IosInterfaceOrientation,
+        IosSupportedOrientationsManifest, IosTargetManifest, Manifest,
     };
 
     fn fixture(path: &str) -> PathBuf {
@@ -4196,6 +4300,68 @@ mod tests {
     }
 
     #[test]
+    fn defaults_bundle_display_name_to_target_name() {
+        let (temp, project) = project_for_fixture("examples/ios-simulator-app/orbit.json");
+        let target = project
+            .manifest
+            .resolve_target(Some("ExampleMacApp"))
+            .unwrap()
+            .clone();
+        let bundle_root = temp.path().join("ExampleMacApp.app");
+        std::fs::create_dir_all(&bundle_root).unwrap();
+        let toolchain = Toolchain {
+            platform: ApplePlatform::Macos,
+            destination: DestinationKind::Device,
+            sdk_name: "macosx".to_owned(),
+            sdk_path: PathBuf::from("/tmp/macosx.sdk"),
+            deployment_target: "14.0".to_owned(),
+            architecture: "arm64".to_owned(),
+            target_triple: "arm64-apple-macosx14.0".to_owned(),
+        };
+
+        write_info_plist(&project, &toolchain, &target, &bundle_root, "development").unwrap();
+
+        let plist = Value::from_file(bundle_root.join("Contents").join("Info.plist")).unwrap();
+        let dict = plist.as_dictionary().unwrap();
+        assert_eq!(
+            dict.get("CFBundleName").and_then(Value::as_string),
+            Some("ExampleMacApp")
+        );
+        assert_eq!(
+            dict.get("CFBundleDisplayName").and_then(Value::as_string),
+            Some("ExampleMacApp")
+        );
+    }
+
+    #[test]
+    fn writes_macos_app_metadata_under_contents() {
+        let (temp, project) = project_for_fixture("examples/ios-simulator-app/orbit.json");
+        let target = project
+            .manifest
+            .resolve_target(Some("ExampleMacApp"))
+            .unwrap()
+            .clone();
+        let bundle_root = temp.path().join("ExampleMacApp.app");
+        std::fs::create_dir_all(&bundle_root).unwrap();
+        let toolchain = Toolchain {
+            platform: ApplePlatform::Macos,
+            destination: DestinationKind::Device,
+            sdk_name: "macosx".to_owned(),
+            sdk_path: PathBuf::from("/tmp/macosx.sdk"),
+            deployment_target: "14.0".to_owned(),
+            architecture: "arm64".to_owned(),
+            target_triple: "arm64-apple-macosx14.0".to_owned(),
+        };
+
+        write_info_plist(&project, &toolchain, &target, &bundle_root, "development").unwrap();
+
+        assert!(bundle_root.join("Contents").join("Info.plist").exists());
+        assert!(bundle_root.join("Contents").join("PkgInfo").exists());
+        assert!(!bundle_root.join("Info.plist").exists());
+        assert!(!bundle_root.join("PkgInfo").exists());
+    }
+
+    #[test]
     fn relocates_bundle_dsym_out_of_app_bundle() {
         let temp = tempfile::tempdir().unwrap();
         let target_dir = temp.path().join("ExampleIOSApp");
@@ -4210,6 +4376,31 @@ mod tests {
 
         assert!(!bundle_dsym.exists());
         assert!(target_dir.join("ExampleIOSApp.dSYM").exists());
+    }
+
+    #[test]
+    fn finds_macos_executable_in_standard_bundle_layout_only() {
+        let temp = tempfile::tempdir().unwrap();
+        let bundle_root = temp.path().join("ExampleMacApp.app");
+        let standard_binary = bundle_root
+            .join("Contents")
+            .join("MacOS")
+            .join("ExampleMacApp");
+        std::fs::create_dir_all(standard_binary.parent().unwrap()).unwrap();
+        std::fs::write(&standard_binary, b"binary").unwrap();
+
+        let receipt = BuildReceipt::new(
+            "ExampleMacApp",
+            ApplePlatform::Macos,
+            "development",
+            DistributionKind::Development,
+            "local",
+            "dev.orbit.examples.examplemacapp",
+            bundle_root.clone(),
+            bundle_root.clone(),
+        );
+
+        assert_eq!(macos_executable_path(&receipt).unwrap(), standard_binary);
     }
 
     #[test]
@@ -4305,15 +4496,17 @@ mod tests {
             .resolve_target(Some("ExampleWatchExtension"))
             .unwrap();
         assert_eq!(
-            embedded_dependency_root(&project, app, watch_app).unwrap(),
-            Some("Watch")
+            embedded_dependency_root(&project, ApplePlatform::Ios, app, watch_app).unwrap(),
+            Some(PathBuf::from("Watch"))
         );
         assert_eq!(
-            embedded_dependency_root(&project, watch_app, watch_extension).unwrap(),
-            Some("PlugIns")
+            embedded_dependency_root(&project, ApplePlatform::Watchos, watch_app, watch_extension)
+                .unwrap(),
+            Some(PathBuf::from("PlugIns"))
         );
         assert_eq!(
-            embedded_dependency_root(&project, watch_app, watch_app).unwrap(),
+            embedded_dependency_root(&project, ApplePlatform::Watchos, watch_app, watch_app)
+                .unwrap(),
             None
         );
         let framework = crate::manifest::TargetManifest {
@@ -4338,8 +4531,9 @@ mod tests {
             extension: None,
         };
         assert_eq!(
-            embedded_dependency_root(&project, watch_app, &framework).unwrap(),
-            Some("Frameworks")
+            embedded_dependency_root(&project, ApplePlatform::Watchos, watch_app, &framework)
+                .unwrap(),
+            Some(PathBuf::from("Frameworks"))
         );
     }
 
@@ -4353,8 +4547,8 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            embedded_dependency_root(&project, app, clip).unwrap(),
-            Some("AppClips")
+            embedded_dependency_root(&project, ApplePlatform::Ios, app, clip).unwrap(),
+            Some(PathBuf::from("AppClips"))
         );
     }
 

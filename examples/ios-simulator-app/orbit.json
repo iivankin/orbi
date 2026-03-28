@@ -25,6 +25,15 @@
           "distribution": "app-store"
         }
       }
+    },
+    "macos": {
+      "deployment_target": "14.0",
+      "profiles": {
+        "development": {
+          "configuration": "debug",
+          "distribution": "development"
+        }
+      }
     }
   },
   "targets": [
@@ -32,9 +41,36 @@
       "name": "ExampleIOSApp",
       "kind": "app",
       "bundle_id": "dev.orbit.examples.exampleiosapp",
-      "platforms": [],
+      "platforms": [
+        "ios"
+      ],
       "sources": [
-        "Sources/ExampleIOSApp"
+        "Sources/ExampleIOSApp",
+        "Sources/Shared"
+      ],
+      "resources": [
+        "Resources"
+      ],
+      "dependencies": [],
+      "swift_packages": [
+        {
+          "product": "OrbitGreeting",
+          "path": "Packages/OrbitGreeting"
+        }
+      ],
+      "entitlements": null,
+      "extension": null
+    },
+    {
+      "name": "ExampleMacApp",
+      "kind": "app",
+      "bundle_id": "dev.orbit.examples.examplemacapp",
+      "platforms": [
+        "macos"
+      ],
+      "sources": [
+        "Sources/ExampleMacApp",
+        "Sources/Shared"
       ],
       "resources": [
         "Resources"

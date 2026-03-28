@@ -1,7 +1,7 @@
 import SwiftUI
 
 @main
-struct ExampleIOSApp: App {
+struct ExampleMacApp: App {
     var body: some Scene {
         WindowGroup { ExampleLandingView() }
     }

@@ -572,14 +572,21 @@ mod tests {
     #[test]
     fn loads_example_simulator_manifest() {
         let manifest = Manifest::load(&fixture("examples/ios-simulator-app/orbit.json")).unwrap();
-        let profile = manifest
+        let ios_profile = manifest
             .profile_for(super::ApplePlatform::Ios, "development")
             .unwrap();
         assert!(matches!(
-            profile.distribution,
+            ios_profile.distribution,
             DistributionKind::Development
         ));
-        assert_eq!(manifest.targets.len(), 1);
+        let macos_profile = manifest
+            .profile_for(super::ApplePlatform::Macos, "development")
+            .unwrap();
+        assert!(matches!(
+            macos_profile.distribution,
+            DistributionKind::Development
+        ));
+        assert_eq!(manifest.targets.len(), 2);
     }
 
     #[test]
