@@ -31,7 +31,7 @@
     {
       "name": "ExampleIOSApp",
       "kind": "app",
-      "bundle_id": "dev.orbit.examples.iossim",
+      "bundle_id": "dev.orbit.examples.exampleiosapp",
       "platforms": [],
       "sources": [
         "Sources/ExampleIOSApp"

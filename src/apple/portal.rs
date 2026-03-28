@@ -86,7 +86,7 @@ pub struct PortalCertificate {
     pub id: String,
     #[serde(default)]
     pub name: Option<String>,
-    #[serde(rename = "serialNumber", default)]
+    #[serde(rename = "serialNumber", alias = "serialNum", default)]
     pub serial_number: Option<String>,
     #[serde(rename = "statusString", default)]
     pub status: Option<String>,
@@ -1202,4 +1202,27 @@ fn form_body(params: &[(&str, String)]) -> Result<String> {
     )
     .context("failed to encode Apple Developer Portal form parameters")?;
     Ok(url.query().unwrap_or_default().to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PortalCertificate;
+
+    #[test]
+    fn portal_certificate_parses_serial_num_alias() {
+        let certificate: PortalCertificate = serde_json::from_str(
+            r#"{
+                "certificateId": "4HKKBFKCD6",
+                "serialNum": "51592AA4C443C1F73C355CBA08736AF3",
+                "statusString": "Issued"
+            }"#,
+        )
+        .expect("certificate should deserialize");
+        assert_eq!(certificate.id, "4HKKBFKCD6");
+        assert_eq!(
+            certificate.serial_number.as_deref(),
+            Some("51592AA4C443C1F73C355CBA08736AF3")
+        );
+        assert_eq!(certificate.status.as_deref(), Some("Issued"));
+    }
 }

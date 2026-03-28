@@ -1,8 +1,11 @@
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsStr;
 use std::fs;
+use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use plist::{Dictionary, Value};
@@ -14,12 +17,14 @@ use crate::build::toolchain::{DestinationKind, Toolchain};
 use crate::cli::{BuildArgs, RunArgs, SubmitArgs};
 use crate::context::ProjectContext;
 use crate::manifest::{
-    ApplePlatform, DistributionKind, ExtensionManifest, ProfileManifest, SwiftPackageDependency,
-    TargetKind, TargetManifest, XcframeworkDependency,
+    ApplePlatform, DistributionKind, ExtensionManifest, IosDeviceFamily, IosInterfaceOrientation,
+    IosTargetManifest, ProfileManifest, SwiftPackageDependency, TargetKind, TargetManifest,
+    XcframeworkDependency,
 };
 use crate::util::{
-    CliSpinner, collect_files_with_extensions, command_output, copy_dir_recursive, copy_file,
-    ensure_dir, ensure_parent_dir, prompt_select, resolve_path, run_command,
+    CliSpinner, collect_files_with_extensions, command_output, command_output_allow_failure,
+    copy_dir_recursive, copy_file, ensure_dir, ensure_parent_dir, prompt_select, resolve_path,
+    run_command, run_command_capture,
 };
 
 #[derive(Debug, Clone)]
@@ -63,6 +68,67 @@ pub struct BuildOutcome {
     pub receipt_path: PathBuf,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct ResourceWorkSummary {
+    asset_catalogs: usize,
+    interface_resources: usize,
+    strings_files: usize,
+    core_data_models: usize,
+    copied_resources: usize,
+}
+
+impl ResourceWorkSummary {
+    fn describe(&self) -> String {
+        let mut parts = Vec::new();
+        if self.asset_catalogs > 0 {
+            parts.push(format!("{} asset catalog(s)", self.asset_catalogs));
+        }
+        if self.interface_resources > 0 {
+            parts.push(format!("{} interface file(s)", self.interface_resources));
+        }
+        if self.strings_files > 0 {
+            parts.push(format!("{} strings file(s)", self.strings_files));
+        }
+        if self.core_data_models > 0 {
+            parts.push(format!("{} Core Data model(s)", self.core_data_models));
+        }
+        if self.copied_resources > 0 {
+            parts.push(format!("{} copied resource(s)", self.copied_resources));
+        }
+        if parts.is_empty() {
+            return "no resource work".to_owned();
+        }
+        parts.join(", ")
+    }
+}
+
+fn build_progress_step<T, F, G>(
+    message: impl Into<String>,
+    success_message: G,
+    action: F,
+) -> Result<T>
+where
+    F: FnOnce() -> Result<T>,
+    G: FnOnce(&T) -> String,
+{
+    let spinner = CliSpinner::new(message.into());
+    match action() {
+        Ok(value) => {
+            spinner.finish_success(success_message(&value));
+            Ok(value)
+        }
+        Err(error) => {
+            spinner.finish_clear();
+            Err(error)
+        }
+    }
+}
+
+fn build_requires_signing(profile: &ProfileManifest, destination: DestinationKind) -> bool {
+    destination == DestinationKind::Device
+        || !matches!(profile.distribution, DistributionKind::Development)
+}
+
 pub fn build_artifact(project: &ProjectContext, args: &BuildArgs) -> Result<()> {
     let target = resolve_requested_target(project, args.target.as_deref())?;
     let platform = project.manifest.resolve_platform_for_target(target, None)?;
@@ -82,6 +148,9 @@ pub fn build_artifact(project: &ProjectContext, args: &BuildArgs) -> Result<()> 
         output: args.output.clone(),
         provisioning_udids: None,
     };
+    if build_requires_signing(profile, request.destination) {
+        crate::apple::auth::ensure_project_authenticated(project)?;
+    }
 
     let spinner = CliSpinner::new(format!(
         "Building {} for {} ({})",
@@ -106,8 +175,6 @@ pub fn build_artifact(project: &ProjectContext, args: &BuildArgs) -> Result<()> 
 }
 
 pub fn run_on_destination(project: &ProjectContext, args: &RunArgs) -> Result<()> {
-    crate::apple::auth::best_effort_app_store_authenticate(project)?;
-
     let target = resolve_requested_target(project, args.target.as_deref())?;
     let platform = project.manifest.resolve_platform_for_target(target, None)?;
     validate_run_platform(platform)?;
@@ -144,6 +211,9 @@ pub fn run_on_destination(project: &ProjectContext, args: &RunArgs) -> Result<()
             .as_ref()
             .map(|device| vec![device.hardware_properties.udid.clone()]),
     };
+    if build_requires_signing(profile, request.destination) {
+        crate::apple::auth::ensure_project_authenticated(project)?;
+    }
 
     let spinner = CliSpinner::new(format!(
         "Building {} for {} ({})",
@@ -178,6 +248,7 @@ pub fn run_on_destination(project: &ProjectContext, args: &RunArgs) -> Result<()
             &outcome.receipt,
         ),
         (_, "device", true) => debug_on_device(
+            project,
             selected_device
                 .as_ref()
                 .context("device run requested without a selected physical device")?,
@@ -235,11 +306,7 @@ fn build_project(project: &ProjectContext, request: &BuildRequest) -> Result<Bui
 
     let ordered_targets = project.manifest.topological_targets(&root_target.name)?;
     let mut built_targets = HashMap::new();
-    let signing_required = request.destination == DestinationKind::Device
-        || !matches!(profile.distribution, DistributionKind::Development);
-    if signing_required {
-        crate::apple::auth::best_effort_app_store_authenticate(project)?;
-    }
+    let signing_required = build_requires_signing(profile, request.destination);
     for target in &ordered_targets {
         let built = compile_target(
             project,
@@ -327,35 +394,89 @@ fn compile_target(
         ensure_parent_dir(&product.product_path)?;
     }
 
-    let package_outputs =
-        compile_swift_packages(project, toolchain, profile, &intermediates_dir, target)?;
+    let package_outputs = if target.swift_packages.is_empty() {
+        Vec::new()
+    } else {
+        build_progress_step(
+            format!("Compiling Swift packages for target `{}`", target.name),
+            |outputs: &Vec<PackageBuildOutput>| {
+                format!(
+                    "Compiled {} Swift package product(s) for target `{}`.",
+                    outputs.len(),
+                    target.name
+                )
+            },
+            || compile_swift_packages(project, toolchain, profile, &intermediates_dir, target),
+        )?
+    };
     let external_link_inputs =
         resolve_external_link_inputs(project, toolchain, &intermediates_dir, target)?;
-    let c_objects =
-        compile_c_family_sources(project, toolchain, profile, &intermediates_dir, target)?;
+    let c_objects = build_progress_step(
+        format!("Compiling C-family sources for target `{}`", target.name),
+        |objects: &Vec<PathBuf>| {
+            if objects.is_empty() {
+                format!(
+                    "No C-family sources were compiled for target `{}`.",
+                    target.name
+                )
+            } else {
+                format!(
+                    "Compiled {} C-family object file(s) for target `{}`.",
+                    objects.len(),
+                    target.name
+                )
+            }
+        },
+        || compile_c_family_sources(project, toolchain, profile, &intermediates_dir, target),
+    )?;
     let swift_sources = resolve_target_sources(project, target, &["swift"])?;
 
     if !swift_sources.is_empty() {
-        compile_swift_target(
-            toolchain,
-            profile,
-            target.kind,
-            &swift_sources,
-            &package_outputs,
-            &external_link_inputs,
-            &c_objects,
-            &target.name,
-            &product.binary_path,
-            product.module_output_path.as_deref(),
+        build_progress_step(
+            format!("Compiling Swift target `{}`", target.name),
+            |_| {
+                format!(
+                    "Compiled {} Swift source file(s) for target `{}`.",
+                    swift_sources.len(),
+                    target.name
+                )
+            },
+            || {
+                compile_swift_target(
+                    toolchain,
+                    profile,
+                    target.kind,
+                    &intermediates_dir,
+                    &swift_sources,
+                    &package_outputs,
+                    &external_link_inputs,
+                    &c_objects,
+                    &target.name,
+                    &product.binary_path,
+                    product.module_output_path.as_deref(),
+                )
+            },
         )?;
     } else if !c_objects.is_empty() {
-        link_native_target(
-            toolchain,
-            profile,
-            target.kind,
-            &external_link_inputs,
-            &c_objects,
-            &product.binary_path,
+        build_progress_step(
+            format!("Linking native target `{}`", target.name),
+            |_| {
+                format!(
+                    "Linked {} object file(s) into target `{}`.",
+                    c_objects.len(),
+                    target.name
+                )
+            },
+            || {
+                link_native_target(
+                    toolchain,
+                    profile,
+                    target.kind,
+                    &external_link_inputs,
+                    &c_objects,
+                    &product.binary_path,
+                )
+            },
         )?;
     } else {
         bail!(
@@ -364,18 +485,52 @@ fn compile_target(
         );
     }
 
+    if target.kind.is_bundle() {
+        relocate_bundle_debug_artifacts(&target_dir, &product.product_path, &product.binary_path)?;
+    }
+
     if needs_info_plist(target.kind) {
-        write_info_plist(
-            project,
-            toolchain,
-            target,
-            &product.product_path,
-            profile_name,
+        build_progress_step(
+            format!("Writing Info.plist for target `{}`", target.name),
+            |_| format!("Wrote Info.plist for target `{}`.", target.name),
+            || {
+                write_info_plist(
+                    project,
+                    toolchain,
+                    target,
+                    &product.product_path,
+                    profile_name,
+                )
+            },
         )?;
     }
     if target.kind.is_bundle() {
-        process_resources(project, toolchain, target, &product.product_path)?;
-        embed_external_payloads(&external_link_inputs, &product.product_path)?;
+        if !target.resources.is_empty() {
+            build_progress_step(
+                format!("Processing resources for target `{}`", target.name),
+                |summary: &ResourceWorkSummary| {
+                    format!(
+                        "Processed resources for target `{}`: {}.",
+                        target.name,
+                        summary.describe()
+                    )
+                },
+                || process_resources(project, toolchain, target, &product.product_path),
+            )?;
+        }
+        if !external_link_inputs.embedded_payloads.is_empty() {
+            build_progress_step(
+                format!("Embedding external payloads for target `{}`", target.name),
+                |_| {
+                    format!(
+                        "Embedded {} external payload(s) for target `{}`.",
+                        external_link_inputs.embedded_payloads.len(),
+                        target.name
+                    )
+                },
+                || embed_external_payloads(&external_link_inputs, &product.product_path),
+            )?;
+        }
     }
 
     Ok(BuiltTarget {
@@ -383,6 +538,32 @@ fn compile_target(
         target_kind: target.kind,
         bundle_path: product.product_path,
     })
+}
+
+fn relocate_bundle_debug_artifacts(
+    target_dir: &Path,
+    bundle_root: &Path,
+    binary_path: &Path,
+) -> Result<()> {
+    let sidecar_dsym = binary_path.with_extension("dSYM");
+    if !sidecar_dsym.exists() || !sidecar_dsym.starts_with(bundle_root) {
+        return Ok(());
+    }
+
+    let destination = target_dir.join(
+        sidecar_dsym
+            .file_name()
+            .context("bundle debug artifact is missing a file name")?,
+    );
+    remove_existing_path(&destination)?;
+    fs::rename(&sidecar_dsym, &destination).with_context(|| {
+        format!(
+            "failed to move debug symbols from {} to {}",
+            sidecar_dsym.display(),
+            destination.display()
+        )
+    })?;
+    Ok(())
 }
 
 fn resolve_requested_target<'a>(
@@ -628,6 +809,7 @@ fn compile_swift_target(
     toolchain: &Toolchain,
     profile: &ProfileManifest,
     target_kind: TargetKind,
+    intermediates_dir: &Path,
     swift_sources: &[PathBuf],
     package_outputs: &[PackageBuildOutput],
     external_link_inputs: &ExternalLinkInputs,
@@ -636,6 +818,21 @@ fn compile_swift_target(
     product_path: &Path,
     module_output_path: Option<&Path>,
 ) -> Result<()> {
+    if use_split_swift_device_app_build(toolchain, target_kind) {
+        return compile_split_swift_device_app_target(
+            toolchain,
+            profile,
+            target_kind,
+            intermediates_dir,
+            swift_sources,
+            package_outputs,
+            external_link_inputs,
+            object_files,
+            module_name,
+            product_path,
+        );
+    }
+
     let mut command = toolchain.swiftc();
     command.arg("-parse-as-library");
     command.arg("-target").arg(&toolchain.target_triple);
@@ -655,6 +852,7 @@ fn compile_swift_target(
         }
         _ => {}
     }
+    apply_swift_target_linker_defaults(&mut command, target_kind);
     if matches!(
         target_kind,
         TargetKind::StaticLibrary | TargetKind::DynamicLibrary | TargetKind::Framework
@@ -688,6 +886,178 @@ fn compile_swift_target(
         command.arg(source);
     }
     run_command(&mut command)
+}
+
+fn use_split_swift_device_app_build(toolchain: &Toolchain, target_kind: TargetKind) -> bool {
+    toolchain.platform == ApplePlatform::Ios
+        && toolchain.destination == DestinationKind::Device
+        && target_kind == TargetKind::App
+}
+
+fn compile_split_swift_device_app_target(
+    toolchain: &Toolchain,
+    profile: &ProfileManifest,
+    target_kind: TargetKind,
+    intermediates_dir: &Path,
+    swift_sources: &[PathBuf],
+    package_outputs: &[PackageBuildOutput],
+    external_link_inputs: &ExternalLinkInputs,
+    c_object_files: &[PathBuf],
+    module_name: &str,
+    product_path: &Path,
+) -> Result<()> {
+    let compile_plan =
+        prepare_swift_device_app_compile_plan(intermediates_dir, swift_sources, module_name)?;
+    let (swift_stdlib_path, host_swift_stdlib_path) = swift_stdlib_search_paths(toolchain)?;
+
+    let mut compile_command = toolchain.swiftc();
+    compile_command.current_dir(intermediates_dir);
+    compile_command.arg("-module-name").arg(module_name);
+    compile_command.arg("-sdk").arg(&toolchain.sdk_path);
+    compile_command.arg("-target").arg(&toolchain.target_triple);
+    compile_command.arg("-c");
+    compile_command.arg("-whole-module-optimization");
+    compile_command.arg("-emit-module");
+    compile_command
+        .arg("-emit-module-path")
+        .arg(&compile_plan.module_path);
+    compile_command
+        .arg("-working-directory")
+        .arg(intermediates_dir);
+    if matches!(profile.configuration.as_str(), "debug") {
+        compile_command.args(["-Onone", "-g"]);
+    } else {
+        compile_command.arg("-O");
+    }
+    for package in package_outputs {
+        compile_command.arg("-I").arg(&package.module_dir);
+    }
+    for path in &external_link_inputs.module_search_paths {
+        compile_command.arg("-I").arg(path);
+    }
+    for path in &external_link_inputs.framework_search_paths {
+        compile_command.arg("-F").arg(path);
+    }
+    for source in &compile_plan.source_files {
+        compile_command.arg(source);
+    }
+    run_command_capture(&mut compile_command)?;
+
+    let mut link_command = toolchain.clang(false);
+    link_command.arg("-target").arg(&toolchain.target_triple);
+    link_command.arg("-isysroot").arg(&toolchain.sdk_path);
+    link_command.arg("-o").arg(product_path);
+    if matches!(profile.configuration.as_str(), "debug") {
+        link_command.args(["-O0", "-g"]);
+    } else {
+        link_command.arg("-O2");
+    }
+    for package in package_outputs {
+        link_command.arg("-L").arg(&package.library_dir);
+        for library in &package.link_libraries {
+            link_command.arg("-l").arg(library);
+        }
+    }
+    apply_external_link_inputs(&mut link_command, external_link_inputs);
+    link_command.arg("-L").arg(swift_stdlib_path);
+    link_command.arg("-L").arg(host_swift_stdlib_path);
+    apply_clang_swift_target_linker_defaults(&mut link_command, target_kind);
+    link_command.args(["-Xlinker", "-add_ast_path", "-Xlinker"]);
+    link_command.arg(&compile_plan.module_path);
+    for object_file in c_object_files {
+        link_command.arg(object_file);
+    }
+    link_command.arg(&compile_plan.object_path);
+    run_command(&mut link_command)
+}
+
+#[derive(Debug, Clone)]
+struct SwiftDeviceAppCompilePlan {
+    source_files: Vec<PathBuf>,
+    object_path: PathBuf,
+    module_path: PathBuf,
+}
+
+fn prepare_swift_device_app_compile_plan(
+    intermediates_dir: &Path,
+    swift_sources: &[PathBuf],
+    module_name: &str,
+) -> Result<SwiftDeviceAppCompilePlan> {
+    let support_source_path = intermediates_dir.join("__orbit_swift_support__.swift");
+    // Force the Swift driver down the multi-file whole-module path. The one-shot
+    // `swiftc` link path produces a different iPhoneOS SwiftUI entrypoint shape,
+    // and that binary exits immediately on physical devices.
+    fs::write(
+        &support_source_path,
+        "// Orbit support file for iPhoneOS app compilation.\n",
+    )
+    .with_context(|| format!("failed to write {}", support_source_path.display()))?;
+
+    let mut source_files = swift_sources.to_vec();
+    source_files.push(support_source_path);
+    Ok(SwiftDeviceAppCompilePlan {
+        source_files,
+        object_path: intermediates_dir.join(format!("{module_name}.o")),
+        module_path: intermediates_dir.join(format!("{module_name}.swiftmodule")),
+    })
+}
+
+fn swift_stdlib_search_paths(toolchain: &Toolchain) -> Result<(PathBuf, PathBuf)> {
+    let developer_dir =
+        PathBuf::from(command_output(Command::new("xcode-select").arg("-p"))?.trim());
+    Ok((
+        developer_dir
+            .join("Toolchains")
+            .join("XcodeDefault.xctoolchain")
+            .join("usr")
+            .join("lib")
+            .join("swift")
+            .join(&toolchain.sdk_name),
+        PathBuf::from("/usr/lib/swift"),
+    ))
+}
+
+fn apply_swift_target_linker_defaults(command: &mut Command, target_kind: TargetKind) {
+    if !swift_target_needs_executable_runtime_linker_args(target_kind) {
+        return;
+    }
+
+    // Match Xcode's iPhoneOS app/executable link behavior closely enough that
+    // LaunchServices sees the same Objective-C runtime dependency and
+    // executable framework rpath in the final binary.
+    command.arg("-link-objc-runtime");
+    command.args([
+        "-Xlinker",
+        "-rpath",
+        "-Xlinker",
+        "@executable_path/Frameworks",
+    ]);
+}
+
+fn apply_clang_swift_target_linker_defaults(command: &mut Command, target_kind: TargetKind) {
+    if !swift_target_needs_executable_runtime_linker_args(target_kind) {
+        return;
+    }
+
+    command.arg("-fobjc-link-runtime");
+    command.args([
+        "-Xlinker",
+        "-rpath",
+        "-Xlinker",
+        "@executable_path/Frameworks",
+    ]);
+}
+
+fn swift_target_needs_executable_runtime_linker_args(target_kind: TargetKind) -> bool {
+    matches!(
+        target_kind,
+        TargetKind::App
+            | TargetKind::WatchApp
+            | TargetKind::AppExtension
+            | TargetKind::WatchExtension
+            | TargetKind::WidgetExtension
+            | TargetKind::Executable
+    )
 }
 
 fn link_native_target(
@@ -801,7 +1171,7 @@ fn write_info_plist(
     toolchain: &Toolchain,
     target: &TargetManifest,
     bundle_root: &Path,
-    profile_name: &str,
+    _profile_name: &str,
 ) -> Result<()> {
     let mut plist = Dictionary::new();
     plist.insert(
@@ -818,7 +1188,12 @@ fn write_info_plist(
     );
     plist.insert(
         "CFBundleDisplayName".to_owned(),
-        Value::String(project.manifest.name.clone()),
+        Value::String(
+            target
+                .display_name
+                .clone()
+                .unwrap_or_else(|| project.manifest.name.clone()),
+        ),
     );
     plist.insert(
         "CFBundleShortVersionString".to_owned(),
@@ -826,11 +1201,20 @@ fn write_info_plist(
     );
     plist.insert(
         "CFBundleVersion".to_owned(),
-        Value::String(project.manifest.version.clone()),
+        Value::String(
+            target
+                .build_number
+                .clone()
+                .unwrap_or_else(|| project.manifest.version.clone()),
+        ),
     );
     plist.insert(
         "CFBundleInfoDictionaryVersion".to_owned(),
         Value::String("6.0".to_owned()),
+    );
+    plist.insert(
+        "CFBundleDevelopmentRegion".to_owned(),
+        Value::String("en".to_owned()),
     );
     plist.insert(
         "CFBundleSupportedPlatforms".to_owned(),
@@ -847,6 +1231,12 @@ fn write_info_plist(
             );
             if matches!(toolchain.platform, ApplePlatform::Ios) {
                 plist.insert("LSRequiresIPhoneOS".to_owned(), Value::Boolean(true));
+                add_ios_app_plist_defaults(
+                    &mut plist,
+                    target,
+                    toolchain.info_plist_supported_platform() == "iPhoneOS",
+                    target_uses_swiftui_app_lifecycle(project, target)?,
+                )?;
             }
             plist.insert(
                 "MinimumOSVersion".to_owned(),
@@ -915,16 +1305,228 @@ fn write_info_plist(
         }
     }
 
-    plist.insert(
-        "OrbitProfile".to_owned(),
-        Value::String(profile_name.to_owned()),
-    );
+    apply_info_plist_overrides(&mut plist, &target.info_plist)?;
 
     let path = bundle_root.join("Info.plist");
     ensure_parent_dir(&path)?;
     Value::Dictionary(plist)
         .to_file_xml(&path)
-        .with_context(|| format!("failed to write {}", path.display()))
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    write_bundle_pkg_info(target.kind, bundle_root)
+}
+
+fn add_ios_app_plist_defaults(
+    plist: &mut Dictionary,
+    target: &TargetManifest,
+    is_device_build: bool,
+    uses_swiftui_app_lifecycle: bool,
+) -> Result<()> {
+    let families = resolved_ios_device_families(target.ios.as_ref());
+    plist.insert(
+        "UIDeviceFamily".to_owned(),
+        Value::Array(
+            families
+                .iter()
+                .map(|family| Value::Integer(ios_device_family_code(*family).into()))
+                .collect(),
+        ),
+    );
+    if uses_swiftui_app_lifecycle {
+        plist.insert(
+            "UIApplicationSceneManifest".to_owned(),
+            Value::Dictionary(Dictionary::from_iter([
+                (
+                    "UIApplicationSupportsMultipleScenes".to_owned(),
+                    Value::Boolean(true),
+                ),
+                (
+                    "UISceneConfigurations".to_owned(),
+                    Value::Dictionary(Dictionary::new()),
+                ),
+            ])),
+        );
+    } else {
+        plist.insert(
+            "UIApplicationSceneManifest".to_owned(),
+            Value::Dictionary(Dictionary::from_iter([
+                (
+                    "UIApplicationSupportsMultipleScenes".to_owned(),
+                    Value::Boolean(false),
+                ),
+                (
+                    "UISceneConfigurations".to_owned(),
+                    Value::Dictionary(Dictionary::from_iter([(
+                        "UIWindowSceneSessionRoleApplication".to_owned(),
+                        Value::Array(vec![Value::Dictionary(Dictionary::from_iter([(
+                            "UISceneConfigurationName".to_owned(),
+                            Value::String("Default Configuration".to_owned()),
+                        )]))]),
+                    )])),
+                ),
+            ])),
+        );
+    }
+    let required_capabilities = target
+        .ios
+        .as_ref()
+        .and_then(|ios| ios.required_device_capabilities.as_ref());
+    if is_device_build || required_capabilities.is_some() {
+        plist.insert(
+            "UIRequiredDeviceCapabilities".to_owned(),
+            Value::Array(
+                required_capabilities
+                    .map(|capabilities| {
+                        capabilities
+                            .iter()
+                            .cloned()
+                            .map(Value::String)
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_else(|| vec![Value::String("arm64".to_owned())]),
+            ),
+        );
+    }
+    plist.insert(
+        "UIApplicationSupportsIndirectInputEvents".to_owned(),
+        Value::Boolean(true),
+    );
+    plist.insert(
+        "UILaunchScreen".to_owned(),
+        Value::Dictionary(Dictionary::from_iter([(
+            "UILaunchScreen".to_owned(),
+            Value::Dictionary(launch_screen_dictionary(target.ios.as_ref())?),
+        )])),
+    );
+    plist.insert(
+        "UIStatusBarStyle".to_owned(),
+        Value::String("UIStatusBarStyleDefault".to_owned()),
+    );
+    if families.contains(&IosDeviceFamily::Iphone) {
+        plist.insert(
+            "UISupportedInterfaceOrientations~iphone".to_owned(),
+            Value::Array(resolved_ios_orientations(
+                target.ios.as_ref().and_then(|ios| {
+                    ios.supported_orientations
+                        .as_ref()
+                        .and_then(|orientations| orientations.iphone.as_ref())
+                }),
+                &[
+                    IosInterfaceOrientation::Portrait,
+                    IosInterfaceOrientation::LandscapeLeft,
+                    IosInterfaceOrientation::LandscapeRight,
+                ],
+            )),
+        );
+    }
+    if families.contains(&IosDeviceFamily::Ipad) {
+        plist.insert(
+            "UISupportedInterfaceOrientations~ipad".to_owned(),
+            Value::Array(resolved_ios_orientations(
+                target.ios.as_ref().and_then(|ios| {
+                    ios.supported_orientations
+                        .as_ref()
+                        .and_then(|orientations| orientations.ipad.as_ref())
+                }),
+                &[
+                    IosInterfaceOrientation::Portrait,
+                    IosInterfaceOrientation::PortraitUpsideDown,
+                    IosInterfaceOrientation::LandscapeLeft,
+                    IosInterfaceOrientation::LandscapeRight,
+                ],
+            )),
+        );
+    }
+    Ok(())
+}
+
+fn apply_info_plist_overrides(
+    plist: &mut Dictionary,
+    overrides: &BTreeMap<String, serde_json::Value>,
+) -> Result<()> {
+    for (key, value) in overrides {
+        plist.insert(key.clone(), json_to_plist(value)?);
+    }
+    Ok(())
+}
+
+fn resolved_ios_device_families(config: Option<&IosTargetManifest>) -> Vec<IosDeviceFamily> {
+    config
+        .and_then(|ios| ios.device_families.clone())
+        .unwrap_or_else(|| vec![IosDeviceFamily::Iphone, IosDeviceFamily::Ipad])
+}
+
+fn ios_device_family_code(family: IosDeviceFamily) -> i64 {
+    match family {
+        IosDeviceFamily::Iphone => 1,
+        IosDeviceFamily::Ipad => 2,
+    }
+}
+
+fn launch_screen_dictionary(config: Option<&IosTargetManifest>) -> Result<Dictionary> {
+    let mut dictionary = Dictionary::new();
+    let Some(launch_screen) = config.and_then(|ios| ios.launch_screen.as_ref()) else {
+        return Ok(dictionary);
+    };
+    for (key, value) in launch_screen {
+        dictionary.insert(key.clone(), json_to_plist(value)?);
+    }
+    Ok(dictionary)
+}
+
+fn resolved_ios_orientations(
+    configured: Option<&Vec<IosInterfaceOrientation>>,
+    defaults: &[IosInterfaceOrientation],
+) -> Vec<Value> {
+    configured
+        .map(|orientations| orientations.as_slice())
+        .unwrap_or(defaults)
+        .iter()
+        .map(|orientation| Value::String(ios_orientation_name(*orientation).to_owned()))
+        .collect()
+}
+
+fn ios_orientation_name(orientation: IosInterfaceOrientation) -> &'static str {
+    match orientation {
+        IosInterfaceOrientation::Portrait => "UIInterfaceOrientationPortrait",
+        IosInterfaceOrientation::PortraitUpsideDown => "UIInterfaceOrientationPortraitUpsideDown",
+        IosInterfaceOrientation::LandscapeLeft => "UIInterfaceOrientationLandscapeLeft",
+        IosInterfaceOrientation::LandscapeRight => "UIInterfaceOrientationLandscapeRight",
+    }
+}
+
+fn write_bundle_pkg_info(target_kind: TargetKind, bundle_root: &Path) -> Result<()> {
+    let contents = match target_kind {
+        TargetKind::App | TargetKind::WatchApp => Some("APPL????"),
+        TargetKind::AppExtension | TargetKind::WatchExtension | TargetKind::WidgetExtension => {
+            Some("XPC!????")
+        }
+        TargetKind::Framework => Some("FMWK????"),
+        TargetKind::StaticLibrary | TargetKind::DynamicLibrary | TargetKind::Executable => None,
+    };
+
+    let Some(contents) = contents else {
+        return Ok(());
+    };
+
+    let path = bundle_root.join("PkgInfo");
+    fs::write(&path, contents).with_context(|| format!("failed to write {}", path.display()))
+}
+
+fn target_uses_swiftui_app_lifecycle(
+    project: &ProjectContext,
+    target: &TargetManifest,
+) -> Result<bool> {
+    for source in resolve_target_sources(project, target, &["swift"])? {
+        let contents = fs::read_to_string(&source)
+            .with_context(|| format!("failed to read Swift source {}", source.display()))?;
+        if contents.contains("import SwiftUI")
+            && contents.contains("@main")
+            && contents.contains(": App")
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn extension_plist(config: &ExtensionManifest) -> Result<Dictionary> {
@@ -1012,7 +1614,7 @@ fn process_resources(
     toolchain: &Toolchain,
     target: &TargetManifest,
     bundle_root: &Path,
-) -> Result<()> {
+) -> Result<ResourceWorkSummary> {
     let mut asset_catalogs = Vec::new();
     let mut interface_jobs = Vec::new();
     let mut strings_jobs = Vec::new();
@@ -1039,6 +1641,14 @@ fn process_resources(
         )?;
     }
 
+    let summary = ResourceWorkSummary {
+        asset_catalogs: asset_catalogs.len(),
+        interface_resources: interface_jobs.len(),
+        strings_files: strings_jobs.len(),
+        core_data_models: core_data_jobs.len(),
+        copied_resources: copy_jobs.len(),
+    };
+
     if !asset_catalogs.is_empty() {
         compile_asset_catalogs(toolchain, &asset_catalogs, bundle_root)?;
     }
@@ -1061,7 +1671,7 @@ fn process_resources(
         }
     }
 
-    Ok(())
+    Ok(summary)
 }
 
 fn discover_resources(
@@ -1214,9 +1824,13 @@ fn compile_asset_catalogs(
     asset_catalogs: &[PathBuf],
     bundle_root: &Path,
 ) -> Result<()> {
+    let partial_plist = NamedTempFile::new()?;
     let mut command = toolchain.actool_command();
     command.arg("actool");
     command.arg("--compile").arg(bundle_root);
+    command
+        .arg("--output-partial-info-plist")
+        .arg(partial_plist.path());
     command
         .arg("--platform")
         .arg(toolchain.actool_platform_name());
@@ -1226,10 +1840,51 @@ fn compile_asset_catalogs(
     for device in toolchain.actool_target_device() {
         command.arg("--target-device").arg(device);
     }
+    if asset_catalog_contains_named_set(asset_catalogs, "AccentColor.colorset") {
+        command.arg("--accent-color").arg("AccentColor");
+    }
+    if asset_catalog_contains_named_set(asset_catalogs, "AppIcon.appiconset") {
+        command.arg("--app-icon").arg("AppIcon");
+    }
     for catalog in asset_catalogs {
         command.arg(catalog);
     }
-    command_output(&mut command).map(|_| ())
+    command_output(&mut command)?;
+    merge_partial_info_plist(bundle_root, partial_plist.path())
+}
+
+fn asset_catalog_contains_named_set(asset_catalogs: &[PathBuf], expected_name: &str) -> bool {
+    asset_catalogs
+        .iter()
+        .any(|catalog| catalog.join(expected_name).exists())
+}
+
+fn merge_partial_info_plist(bundle_root: &Path, partial_plist_path: &Path) -> Result<()> {
+    if !partial_plist_path.exists() {
+        return Ok(());
+    }
+
+    let info_plist_path = bundle_root.join("Info.plist");
+    if !info_plist_path.exists() {
+        return Ok(());
+    }
+
+    let mut info_plist = Value::from_file(&info_plist_path)
+        .with_context(|| format!("failed to read {}", info_plist_path.display()))?;
+    let partial = Value::from_file(partial_plist_path)
+        .with_context(|| format!("failed to read {}", partial_plist_path.display()))?;
+    let info_dict = info_plist
+        .as_dictionary_mut()
+        .context("Info.plist must be a dictionary")?;
+    let partial_dict = partial
+        .as_dictionary()
+        .context("actool partial Info.plist must be a dictionary")?;
+    for (key, value) in partial_dict {
+        info_dict.insert(key.clone(), value.clone());
+    }
+    info_plist
+        .to_file_xml(&info_plist_path)
+        .with_context(|| format!("failed to write {}", info_plist_path.display()))
 }
 
 fn compile_interface_resource(
@@ -1571,7 +2226,7 @@ fn debug_on_simulator(project: &ProjectContext, receipt: &BuildReceipt) -> Resul
     let process_name = simulator_process_name(receipt);
 
     println!(
-        "Launching {} on {} in debug mode. Orbit will open LLDB after the app is suspended at launch.",
+        "Launching {} on {} in debug mode. Orbit will open LLDB, attach, and continue the app.",
         receipt.bundle_id, device.name
     );
 
@@ -1591,6 +2246,7 @@ fn debug_on_simulator(project: &ProjectContext, receipt: &BuildReceipt) -> Resul
     command
         .arg("-o")
         .arg(format!("process attach -i -w -n {process_name}"));
+    command.arg("-o").arg("process continue");
     if let Some(bundle_root) = receipt.bundle_path.parent() {
         command.current_dir(bundle_root);
     }
@@ -1598,8 +2254,134 @@ fn debug_on_simulator(project: &ProjectContext, receipt: &BuildReceipt) -> Resul
 }
 
 fn run_on_device(device: &PhysicalDevice, receipt: &BuildReceipt) -> Result<()> {
-    install_on_device(device, receipt)?;
+    let installed = install_on_device(device, receipt)?;
+    if receipt.platform == ApplePlatform::Ios {
+        launch_ios_app_by_bundle_id(device, &receipt.bundle_id)?;
+    } else {
+        let remote_bundle_path = remote_app_bundle_path(&installed.installation_url)?;
+        launch_device_app(device, &remote_bundle_path, false)?;
+    }
+    Ok(())
+}
 
+fn debug_on_device(
+    project: &ProjectContext,
+    device: &PhysicalDevice,
+    receipt: &BuildReceipt,
+) -> Result<()> {
+    if receipt.platform == ApplePlatform::Ios {
+        return debug_on_ios_device(project, device, receipt);
+    }
+
+    let installed = install_on_device(device, receipt)?;
+
+    let executable = bundle_debug_executable_path(receipt)?;
+    ensure_device_is_unlocked_for_debugging(device, receipt.platform)?;
+    let symbol_root = ensure_device_symbols_available(project, device, receipt.platform)?;
+    ensure_device_is_unlocked_for_debugging(device, receipt.platform)?;
+
+    println!(
+        "Launching {} on {} in debug mode. Orbit will open LLDB, attach, and continue the app. Use `quit` to end the session; Ctrl-C interrupts the target.",
+        receipt.bundle_id, device.device_properties.name
+    );
+
+    let remote_bundle_path = remote_app_bundle_path(&installed.installation_url)?;
+    let launch = launch_device_app(device, &remote_bundle_path, true)?;
+
+    let mut command = Command::new("lldb");
+    command.arg("--file").arg(&executable);
+    if let Some(symbol_root) = &symbol_root {
+        let symbol_root = symbol_root
+            .to_str()
+            .context("device symbol cache path contains invalid UTF-8")?;
+        let symbol_root = lldb_quote_arg(symbol_root);
+        command.arg("-o").arg(format!(
+            "settings append target.exec-search-paths {symbol_root}"
+        ));
+        command.arg("-o").arg(format!(
+            "settings append target.debug-file-search-paths {symbol_root}"
+        ));
+    }
+    command
+        .arg("-o")
+        .arg(format!("device select {}", device.identifier));
+    command.arg("-o").arg(format!(
+        "device process attach -c -p {}",
+        launch.process_identifier
+    ));
+    if let Some(bundle_root) = receipt.bundle_path.parent() {
+        command.current_dir(bundle_root);
+    }
+    run_command(&mut command)
+}
+
+fn debug_on_ios_device(
+    project: &ProjectContext,
+    device: &PhysicalDevice,
+    receipt: &BuildReceipt,
+) -> Result<()> {
+    let installed = install_on_device(device, receipt)?;
+
+    let executable = bundle_debug_executable_path(receipt)?;
+    ensure_device_is_unlocked_for_debugging(device, receipt.platform)?;
+    let symbol_root = ensure_device_symbols_available(project, device, receipt.platform)?;
+    ensure_device_is_unlocked_for_debugging(device, receipt.platform)?;
+
+    println!(
+        "Launching {} on {} in debug mode. Orbit will open LLDB and attach to the launched app. Use `quit` to end the session; Ctrl-C interrupts the target.",
+        receipt.bundle_id, device.device_properties.name
+    );
+
+    let mut launch = spawn_ios_debug_launch_session(device, &receipt.bundle_id)?;
+    let process = wait_for_device_process_for_installation(
+        device,
+        &installed.installation_url,
+        Duration::from_secs(15),
+        Some(&mut launch),
+    )?;
+
+    let result = run_lldb_device_attach_session(
+        device,
+        &executable,
+        process.process_identifier,
+        symbol_root.as_deref(),
+    );
+
+    let _ = launch.kill();
+    let _ = launch.wait();
+
+    result
+}
+
+fn launch_ios_app_by_bundle_id(
+    device: &PhysicalDevice,
+    bundle_id: &str,
+) -> Result<DeviceLaunchedProcess> {
+    let output_path = NamedTempFile::new()?;
+    let mut launch = Command::new("xcrun");
+    launch.args([
+        "devicectl",
+        "device",
+        "process",
+        "launch",
+        "--device",
+        &device.hardware_properties.udid,
+        "--json-output",
+        output_path
+            .path()
+            .to_str()
+            .context("temporary path contains invalid UTF-8")?,
+        bundle_id,
+    ]);
+    run_command(&mut launch)?;
+    let contents = fs::read_to_string(output_path.path())
+        .with_context(|| format!("failed to read {}", output_path.path().display()))?;
+    let launched: DeviceLaunchResponse = serde_json::from_str(&contents)
+        .context("failed to parse `devicectl device process launch` output")?;
+    Ok(launched.result.process)
+}
+
+fn spawn_ios_debug_launch_session(device: &PhysicalDevice, bundle_id: &str) -> Result<Child> {
     let mut launch = Command::new("xcrun");
     launch.args([
         "devicectl",
@@ -1607,52 +2389,21 @@ fn run_on_device(device: &PhysicalDevice, receipt: &BuildReceipt) -> Result<()> 
         "process",
         "launch",
         "--console",
-        "--terminate-existing",
-        "--device",
-        &device.identifier,
-        &receipt.bundle_id,
-    ]);
-    run_command(&mut launch)
-}
-
-fn debug_on_device(device: &PhysicalDevice, receipt: &BuildReceipt) -> Result<()> {
-    ensure_device_symbols_available(receipt.platform)?;
-    install_on_device(device, receipt)?;
-
-    let executable = bundle_debug_executable_path(receipt)?;
-    let process_name = simulator_process_name(receipt);
-
-    println!(
-        "Launching {} on {} in debug mode. Orbit will open LLDB after the app is suspended at launch.",
-        receipt.bundle_id, device.device_properties.name
-    );
-
-    let mut launch = Command::new("xcrun");
-    launch.args([
-        "devicectl",
-        "device",
-        "process",
-        "launch",
         "--start-stopped",
         "--terminate-existing",
         "--device",
-        &device.identifier,
-        &receipt.bundle_id,
+        &device.hardware_properties.udid,
+        bundle_id,
     ]);
-    run_command(&mut launch)?;
-
-    let mut command = Command::new("lldb");
-    command.arg("--file").arg(&executable);
-    command
-        .arg("-o")
-        .arg(format!("device select {}", device.identifier));
-    command
-        .arg("-o")
-        .arg(format!("device process attach -i -w -n {process_name}"));
-    if let Some(bundle_root) = receipt.bundle_path.parent() {
-        command.current_dir(bundle_root);
-    }
-    run_command(&mut command)
+    launch.stdin(Stdio::inherit());
+    launch.stdout(Stdio::inherit());
+    launch.stderr(Stdio::inherit());
+    launch.spawn().with_context(|| {
+        format!(
+            "failed to execute `{}`",
+            crate::util::debug_command(&launch)
+        )
+    })
 }
 
 fn prepare_simulator_installation(
@@ -1695,7 +2446,11 @@ fn prepare_simulator_installation(
     Ok(device)
 }
 
-fn install_on_device(device: &PhysicalDevice, receipt: &BuildReceipt) -> Result<()> {
+fn install_on_device(
+    device: &PhysicalDevice,
+    receipt: &BuildReceipt,
+) -> Result<InstalledApplication> {
+    let output_path = NamedTempFile::new()?;
     let mut install = Command::new("xcrun");
     install.args([
         "devicectl",
@@ -1703,13 +2458,247 @@ fn install_on_device(device: &PhysicalDevice, receipt: &BuildReceipt) -> Result<
         "install",
         "app",
         "--device",
-        &device.identifier,
+        &device.hardware_properties.udid,
+        "--json-output",
+        output_path
+            .path()
+            .to_str()
+            .context("temporary path contains invalid UTF-8")?,
         receipt
             .bundle_path
             .to_str()
             .context("bundle path contains invalid UTF-8")?,
     ]);
-    run_command(&mut install)
+    run_command(&mut install)?;
+    let contents = fs::read_to_string(output_path.path())
+        .with_context(|| format!("failed to read {}", output_path.path().display()))?;
+    let installed: DeviceInstallResponse = serde_json::from_str(&contents)
+        .context("failed to parse `devicectl device install app` output")?;
+    installed
+        .result
+        .installed_applications
+        .into_iter()
+        .next()
+        .context("`devicectl device install app` did not report an installed application")
+}
+
+fn remote_app_bundle_path(installation_url: &str) -> Result<String> {
+    let path = installation_url
+        .strip_prefix("file://")
+        .unwrap_or(installation_url)
+        .trim_end_matches('/');
+    if path.is_empty() {
+        bail!(
+            "installed application URL `{installation_url}` did not include a remote bundle path"
+        );
+    }
+    Ok(path.to_owned())
+}
+
+fn launch_device_app(
+    device: &PhysicalDevice,
+    remote_bundle_path: &str,
+    start_stopped: bool,
+) -> Result<DeviceLaunchedProcess> {
+    let output_path = NamedTempFile::new()?;
+    let mut launch = Command::new("xcrun");
+    launch.args(["devicectl", "device", "process", "launch"]);
+    if start_stopped {
+        launch.arg("--start-stopped");
+    }
+    launch.args([
+        "--terminate-existing",
+        "--device",
+        &device.hardware_properties.udid,
+        "--json-output",
+        output_path
+            .path()
+            .to_str()
+            .context("temporary path contains invalid UTF-8")?,
+        remote_bundle_path,
+    ]);
+    run_command(&mut launch)?;
+    let contents = fs::read_to_string(output_path.path())
+        .with_context(|| format!("failed to read {}", output_path.path().display()))?;
+    let launched: DeviceLaunchResponse = serde_json::from_str(&contents)
+        .context("failed to parse `devicectl device process launch` output")?;
+    Ok(launched.result.process)
+}
+
+fn list_device_processes(device: &PhysicalDevice) -> Result<Vec<DeviceRunningProcess>> {
+    let output_path = NamedTempFile::new()?;
+    let mut command = Command::new("xcrun");
+    command.args([
+        "devicectl",
+        "device",
+        "info",
+        "processes",
+        "--device",
+        &device.hardware_properties.udid,
+        "--json-output",
+        output_path
+            .path()
+            .to_str()
+            .context("temporary path contains invalid UTF-8")?,
+    ]);
+    run_command(&mut command)?;
+    let contents = fs::read_to_string(output_path.path())
+        .with_context(|| format!("failed to read {}", output_path.path().display()))?;
+    let processes: DeviceProcessesResponse = serde_json::from_str(&contents)
+        .context("failed to parse `devicectl device info processes` output")?;
+    Ok(processes.result.running_processes)
+}
+
+fn wait_for_device_process_for_installation(
+    device: &PhysicalDevice,
+    installation_url: &str,
+    timeout: Duration,
+    mut launch_child: Option<&mut Child>,
+) -> Result<DeviceRunningProcess> {
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        if let Some(process) =
+            find_running_process_for_installation(&list_device_processes(device)?, installation_url)
+        {
+            return Ok(process.clone());
+        }
+
+        if let Some(child) = launch_child.as_deref_mut() {
+            if let Some(status) = child.try_wait()? {
+                if !status.success() {
+                    if let Some(signal) = status.signal() {
+                        bail!(
+                            "`devicectl device process launch --console --start-stopped` exited from signal {signal} before Orbit could attach LLDB"
+                        );
+                    }
+                    bail!(
+                        "`devicectl device process launch --console --start-stopped` exited with {status} before Orbit could attach LLDB"
+                    );
+                }
+            }
+        }
+
+        thread::sleep(Duration::from_millis(250));
+    }
+
+    bail!(
+        "failed to identify the launched `{}` process on device {} ({})",
+        bundle_name_from_installation_url(installation_url),
+        device.device_properties.name,
+        device.hardware_properties.udid
+    )
+}
+
+fn find_running_process_for_installation<'a>(
+    processes: &'a [DeviceRunningProcess],
+    installation_url: &str,
+) -> Option<&'a DeviceRunningProcess> {
+    processes.iter().find(|process| {
+        process
+            .executable
+            .as_deref()
+            .is_some_and(|executable| executable.starts_with(installation_url))
+    })
+}
+
+fn bundle_name_from_installation_url(installation_url: &str) -> String {
+    installation_url
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or(installation_url)
+        .trim_end_matches(".app")
+        .to_owned()
+}
+
+fn run_lldb_device_attach_session(
+    device: &PhysicalDevice,
+    executable: &Path,
+    process_identifier: u64,
+    symbol_root: Option<&Path>,
+) -> Result<()> {
+    let script = NamedTempFile::new()?;
+    fs::write(
+        script.path(),
+        lldb_expect_attach_script(symbol_root)?.as_bytes(),
+    )
+    .with_context(|| format!("failed to write {}", script.path().display()))?;
+
+    let mut command = Command::new("expect");
+    command.arg("-f").arg(script.path());
+    command.arg(&device.hardware_properties.udid);
+    command.arg(process_identifier.to_string());
+    command.arg(executable);
+    run_command(&mut command)
+}
+
+fn lldb_expect_attach_script(symbol_root: Option<&Path>) -> Result<String> {
+    let expect_symbol_root = symbol_root
+        .map(|path| {
+            path.to_str()
+                .context("device symbol cache path contains invalid UTF-8")
+                .map(tcl_quote_arg)
+        })
+        .transpose()?
+        .unwrap_or_default();
+    let symbol_setup = if expect_symbol_root.is_empty() {
+        String::new()
+    } else {
+        format!(
+            r#"send -- "settings append target.exec-search-paths \"{symbol_root}\"\r"
+wait_for_prompt
+send -- "settings append target.debug-file-search-paths \"{symbol_root}\"\r"
+wait_for_prompt
+"#,
+            symbol_root = expect_symbol_root
+        )
+    };
+    Ok(format!(
+        r#"set timeout 60
+
+proc wait_for_prompt {{}} {{
+    expect {{
+        -re {{\(lldb\)}} {{ return }}
+        timeout {{ send_user "timed out waiting for LLDB prompt\n"; exit 1 }}
+        eof {{ send_user "LLDB exited before it became interactive\n"; exit 1 }}
+    }}
+}}
+
+proc wait_for_log {{pattern message}} {{
+    expect {{
+        -re $pattern {{ return }}
+        timeout {{ send_user "$message\n"; exit 1 }}
+        eof {{ send_user "LLDB exited unexpectedly\n"; exit 1 }}
+    }}
+}}
+
+set udid [lindex $argv 0]
+set pid [lindex $argv 1]
+set exe [lindex $argv 2]
+
+spawn lldb $exe
+wait_for_prompt
+{symbol_setup}send -- "device select $udid\r"
+wait_for_prompt
+send -- "device process attach --pid $pid\r"
+wait_for_log [format {{Process %s stopped}} $pid] [format {{timed out waiting for LLDB to attach to pid %s}} $pid]
+wait_for_prompt
+send -- "process continue\r"
+wait_for_log [format {{Process %s resuming}} $pid] [format {{timed out waiting for LLDB to resume pid %s}} $pid]
+wait_for_prompt
+interact
+"#,
+        symbol_setup = symbol_setup
+    ))
+}
+
+fn tcl_quote_arg(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('$', "\\$")
+        .replace('[', "\\[")
+        .replace(']', "\\]")
 }
 
 fn bundle_debug_executable_path(receipt: &BuildReceipt) -> Result<PathBuf> {
@@ -2032,12 +3021,18 @@ fn compile_swift_packages(
     let mut outputs = Vec::new();
 
     for dependency in &target.swift_packages {
-        outputs.push(compile_swift_package(
-            project,
-            toolchain,
-            profile,
-            intermediates_dir,
-            dependency,
+        outputs.push(build_progress_step(
+            format!(
+                "Compiling Swift package product `{}` for target `{}`",
+                dependency.product, target.name
+            ),
+            |_| {
+                format!(
+                    "Compiled Swift package product `{}` for target `{}`.",
+                    dependency.product, target.name
+                )
+            },
+            || compile_swift_package(project, toolchain, profile, intermediates_dir, dependency),
         )?);
     }
 
@@ -2345,7 +3340,19 @@ fn compile_swift_package(
         for source in swift_sources {
             command.arg(source);
         }
-        run_command(&mut command)?;
+        build_progress_step(
+            format!(
+                "Compiling Swift package target `{}` from `{}`",
+                target_name, dependency.product
+            ),
+            |_| {
+                format!(
+                    "Compiled Swift package target `{}` from `{}`.",
+                    target_name, dependency.product
+                )
+            },
+            || run_command(&mut command),
+        )?;
         built_libraries.push(library_name);
     }
 
@@ -2517,36 +3524,76 @@ struct PhysicalDevice {
 #[derive(Debug, Clone, Deserialize)]
 struct PhysicalDeviceProperties {
     name: String,
+    #[serde(rename = "osBuildUpdate")]
+    os_build_update: Option<String>,
+    #[serde(rename = "osVersionNumber")]
+    os_version_number: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 struct PhysicalHardwareProperties {
+    #[serde(rename = "cpuType")]
+    cpu_type: PhysicalCpuType,
     platform: String,
+    #[serde(rename = "productType")]
+    product_type: Option<String>,
     udid: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-struct PreferredDdiList {
-    result: PreferredDdiResult,
+struct PhysicalCpuType {
+    name: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-struct PreferredDdiResult {
-    platforms: BTreeMap<String, Vec<PreferredDdiEntry>>,
+struct DeviceInstallResponse {
+    result: DeviceInstallResult,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-struct PreferredDdiEntry {
-    #[serde(rename = "ddiMetadata")]
-    ddi_metadata: PreferredDdiMetadata,
+struct DeviceInstallResult {
+    #[serde(rename = "installedApplications")]
+    installed_applications: Vec<InstalledApplication>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-struct PreferredDdiMetadata {
-    #[serde(rename = "contentIsCompatible", default)]
-    content_is_compatible: Option<bool>,
-    #[serde(rename = "isUsable", default)]
-    is_usable: bool,
+struct InstalledApplication {
+    #[serde(rename = "installationURL")]
+    installation_url: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct DeviceLaunchResponse {
+    result: DeviceLaunchResult,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct DeviceLaunchResult {
+    process: DeviceLaunchedProcess,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct DeviceLaunchedProcess {
+    #[serde(rename = "processIdentifier")]
+    process_identifier: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct DeviceProcessesResponse {
+    result: DeviceProcessesResult,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct DeviceProcessesResult {
+    #[serde(rename = "runningProcesses", default)]
+    running_processes: Vec<DeviceRunningProcess>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct DeviceRunningProcess {
+    executable: Option<String>,
+    #[serde(rename = "processIdentifier")]
+    process_identifier: u64,
 }
 
 fn select_physical_device(
@@ -2554,28 +3601,7 @@ fn select_physical_device(
     requested_identifier: Option<&str>,
     platform: ApplePlatform,
 ) -> Result<PhysicalDevice> {
-    let output_path = NamedTempFile::new()?;
-    let mut list = Command::new("xcrun");
-    list.args([
-        "devicectl",
-        "list",
-        "devices",
-        "--json-output",
-        output_path
-            .path()
-            .to_str()
-            .context("temporary path contains invalid UTF-8")?,
-    ]);
-    run_command(&mut list)?;
-    let contents = fs::read_to_string(output_path.path())
-        .with_context(|| format!("failed to read {}", output_path.path().display()))?;
-    let devices: DeviceCtlList = serde_json::from_str(&contents)?;
-    let mut physical = devices
-        .result
-        .devices
-        .into_iter()
-        .filter(|device| physical_device_matches_platform(device, platform))
-        .collect::<Vec<_>>();
+    let mut physical = list_devicectl_devices(platform)?;
 
     if let Some(identifier) = requested_identifier {
         return physical
@@ -2609,64 +3635,438 @@ fn select_physical_device(
     Ok(physical.remove(index))
 }
 
-fn ensure_device_symbols_available(platform: ApplePlatform) -> Result<()> {
-    if preferred_ddi_is_usable(platform)? {
-        return Ok(());
-    }
-
-    let spinner = CliSpinner::new(format!("Preparing device symbols for {platform}"));
-    let result = (|| -> Result<()> {
-        let mut update = Command::new("xcrun");
-        update.args(["devicectl", "manage", "ddis", "update"]);
-        run_command(&mut update)?;
-        if !preferred_ddi_is_usable(platform)? {
-            bail!(
-                "the preferred Developer Disk Image for {platform} is still unusable after `devicectl manage ddis update`"
-            );
-        }
-        Ok(())
-    })();
-    match result {
-        Ok(()) => {
-            spinner.finish_success(format!("Prepared device symbols for {platform}."));
-            Ok(())
-        }
-        Err(error) => {
-            spinner.finish_clear();
-            Err(error)
-        }
-    }
-}
-
-fn preferred_ddi_is_usable(platform: ApplePlatform) -> Result<bool> {
+fn list_devicectl_devices(platform: ApplePlatform) -> Result<Vec<PhysicalDevice>> {
     let output_path = NamedTempFile::new()?;
-    let mut command = Command::new("xcrun");
-    command.args([
+    let mut list = Command::new("xcrun");
+    list.args([
         "devicectl",
         "list",
-        "preferredDDI",
-        "--platform",
-        devicectl_platform_name(platform),
+        "devices",
         "--json-output",
         output_path
             .path()
             .to_str()
             .context("temporary path contains invalid UTF-8")?,
     ]);
-    run_command(&mut command)?;
+    run_command(&mut list)?;
     let contents = fs::read_to_string(output_path.path())
         .with_context(|| format!("failed to read {}", output_path.path().display()))?;
-    let preferred: PreferredDdiList = serde_json::from_str(&contents)
-        .context("failed to parse `devicectl list preferredDDI` output")?;
-    Ok(preferred
+    let devices: DeviceCtlList = serde_json::from_str(&contents)?;
+    Ok(devices
         .result
-        .platforms
-        .get(devicectl_platform_name(platform))
+        .devices
+        .into_iter()
+        .filter(|device| physical_device_matches_platform(device, platform))
+        .collect::<Vec<_>>())
+}
+
+fn ensure_device_symbols_available(
+    project: &ProjectContext,
+    device: &PhysicalDevice,
+    platform: ApplePlatform,
+) -> Result<Option<PathBuf>> {
+    let symbol_root = resolve_device_symbol_root(project, device, platform);
+    if device_symbol_root_ready(&symbol_root) {
+        return Ok(Some(symbol_root));
+    }
+
+    ensure_device_is_unlocked_for_symbol_download(device, platform)?;
+
+    let spinner = CliSpinner::new(format!("Caching device symbols for {platform}"));
+    match prepare_device_support_symbols(device, platform) {
+        Ok(()) => {
+            let symbol_root = resolve_device_symbol_root(project, device, platform);
+            if device_symbol_root_ready(&symbol_root) {
+                spinner.finish_success(format!("Prepared device symbols for {platform}."));
+                Ok(Some(symbol_root))
+            } else {
+                spinner.finish_warning(format!(
+                    "Orbit prepared device support for {platform}, but no usable symbol root was found. LLDB will fall back to reading symbols from the device."
+                ));
+                Ok(None)
+            }
+        }
+        Err(error) => {
+            if error_mentions_locked_device(&error.to_string()) {
+                spinner.finish_clear();
+                return Err(error);
+            }
+            spinner.finish_warning(format!(
+                "Orbit could not cache device symbols for {platform}: {error}. LLDB will fall back to reading symbols from the device."
+            ));
+            Ok(None)
+        }
+    }
+}
+
+fn prepare_device_support_symbols(device: &PhysicalDevice, platform: ApplePlatform) -> Result<()> {
+    let os_version = device
+        .device_properties
+        .os_version_number
+        .as_deref()
+        .context("device is missing an OS version in `devicectl list devices` output")?;
+    let model_code = device
+        .hardware_properties
+        .product_type
+        .as_deref()
+        .context("device is missing a product type in `devicectl list devices` output")?;
+
+    let mut command = Command::new("xcodebuild");
+    command.args([
+        "-prepareDeviceSupport",
+        "-platform",
+        devicectl_platform_name(platform),
+        "-osVersion",
+        os_version,
+        "-modelCode",
+        model_code,
+        "-architecture",
+        &device.hardware_properties.cpu_type.name,
+    ]);
+    let debug = crate::util::debug_command(&command);
+    let (success, stdout, stderr) = command_output_allow_failure(&mut command)?;
+    let output = combine_command_output(&stdout, &stderr);
+    if error_mentions_locked_device(&output) {
+        bail!(locked_device_symbol_download_message(device));
+    }
+    if !success {
+        bail!("`{debug}` failed\nstdout:\n{}\nstderr:\n{}", stdout, stderr);
+    }
+
+    Ok(())
+}
+
+fn ensure_device_is_unlocked_for_symbol_download(
+    device: &PhysicalDevice,
+    platform: ApplePlatform,
+) -> Result<()> {
+    ensure_device_is_unlocked(
+        device,
+        platform,
+        locked_device_symbol_download_message(device),
+    )
+}
+
+fn ensure_device_is_unlocked_for_debugging(
+    device: &PhysicalDevice,
+    platform: ApplePlatform,
+) -> Result<()> {
+    ensure_device_is_unlocked(device, platform, locked_device_debug_message(device))
+}
+
+fn ensure_device_is_unlocked(
+    device: &PhysicalDevice,
+    platform: ApplePlatform,
+    failure_message: String,
+) -> Result<()> {
+    if platform == ApplePlatform::Macos {
+        return Ok(());
+    }
+
+    let output_path = NamedTempFile::new()?;
+    let mut command = Command::new("xcrun");
+    command.args([
+        "devicectl",
+        "device",
+        "info",
+        "lockState",
+        "--device",
+        &device.hardware_properties.udid,
+        "--json-output",
+        output_path
+            .path()
+            .to_str()
+            .context("temporary path contains invalid UTF-8")?,
+    ]);
+    let (success, stdout, stderr) = command_output_allow_failure(&mut command)?;
+    let output = combine_command_output(&stdout, &stderr);
+    if error_mentions_locked_device(&output) {
+        bail!(failure_message);
+    }
+    if !success || !output_path.path().exists() {
+        return Ok(());
+    }
+
+    let contents = fs::read_to_string(output_path.path())
+        .with_context(|| format!("failed to read {}", output_path.path().display()))?;
+    let details: serde_json::Value = serde_json::from_str(&contents)
+        .context("failed to parse `devicectl device info lockState` output")?;
+    if device_is_locked_from_details(&details).unwrap_or(false) {
+        bail!(failure_message);
+    }
+
+    Ok(())
+}
+
+fn resolve_device_symbol_root(
+    project: &ProjectContext,
+    device: &PhysicalDevice,
+    platform: ApplePlatform,
+) -> PathBuf {
+    let support_root = device_support_root(project, platform);
+    let candidates = device_support_label_candidates(device)
+        .into_iter()
+        .map(|label| support_root.join(label).join("Symbols"))
+        .collect::<Vec<_>>();
+    candidates
+        .iter()
+        .find(|candidate| device_symbol_root_ready(candidate))
+        .cloned()
+        .unwrap_or_else(|| {
+            candidates.into_iter().next().unwrap_or_else(|| {
+                support_root
+                    .join(format!(
+                        "Orbit {}",
+                        sanitize_device_support_component(&device.hardware_properties.udid)
+                    ))
+                    .join("Symbols")
+            })
+        })
+}
+
+fn device_support_label_from_device(device: &PhysicalDevice) -> Option<String> {
+    match (
+        device.device_properties.os_version_number.as_deref(),
+        device.device_properties.os_build_update.as_deref(),
+    ) {
+        (Some(version), Some(build)) if version != build => Some(format!("{version} ({build})")),
+        (Some(version), _) => Some(version.to_owned()),
+        (_, Some(build)) => Some(build.to_owned()),
+        _ => None,
+    }
+}
+
+fn device_support_root(project: &ProjectContext, platform: ApplePlatform) -> PathBuf {
+    dirs::home_dir()
+        .map(|home| {
+            home.join("Library")
+                .join("Developer")
+                .join("Xcode")
+                .join(device_support_directory(platform))
+        })
+        .unwrap_or_else(|| {
+            project
+                .app
+                .global_paths
+                .cache_dir
+                .join("device-support")
+                .join(platform.to_string())
+        })
+}
+
+fn device_support_label_candidates(device: &PhysicalDevice) -> Vec<String> {
+    let mut labels = Vec::new();
+    if let Some(label) = device_support_model_label_from_device(device) {
+        labels.push(label);
+    }
+    if let Some(label) = device_support_label_from_device(device) {
+        labels.push(label);
+    }
+    if labels.is_empty() {
+        labels.push(format!(
+            "Orbit {}",
+            sanitize_device_support_component(&device.hardware_properties.udid)
+        ));
+    }
+    labels
+}
+
+fn device_support_model_label_from_device(device: &PhysicalDevice) -> Option<String> {
+    let model = device.hardware_properties.product_type.as_deref()?;
+    let base = device_support_label_from_device(device)?;
+    Some(format!("{model} {base}"))
+}
+
+fn json_value_label(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(value) => Some(value.clone()),
+        serde_json::Value::Number(value) => Some(value.to_string()),
+        serde_json::Value::Array(values) => values.iter().find_map(json_value_label),
+        serde_json::Value::Object(map) => {
+            let major = map.get("major").and_then(serde_json::Value::as_u64);
+            let minor = map.get("minor").and_then(serde_json::Value::as_u64);
+            if let (Some(major), Some(minor)) = (major, minor) {
+                let patch = map.get("patch").and_then(serde_json::Value::as_u64);
+                return Some(match patch {
+                    Some(patch) => format!("{major}.{minor}.{patch}"),
+                    None => format!("{major}.{minor}"),
+                });
+            }
+
+            for key in [
+                "description",
+                "stringValue",
+                "value",
+                "buildVersion",
+                "productBuildVersion",
+                "build",
+                "trainName",
+                "name",
+            ] {
+                if let Some(label) = map.get(key).and_then(json_value_label) {
+                    return Some(label);
+                }
+            }
+
+            map.values().find_map(json_value_label)
+        }
+        serde_json::Value::Bool(_) | serde_json::Value::Null => None,
+    }
+}
+
+fn device_is_locked_from_details(details: &serde_json::Value) -> Option<bool> {
+    match details {
+        serde_json::Value::Object(map) => {
+            for (key, value) in map {
+                let key = key.to_ascii_lowercase();
+                if matches!(key.as_str(), "passcoderequired" | "ispasscoderequired") {
+                    if let Some(value) = value.as_bool() {
+                        return Some(value);
+                    }
+                }
+                if matches!(key.as_str(), "islocked" | "locked") {
+                    if let Some(value) = value.as_bool() {
+                        return Some(value);
+                    }
+                    if let Some(value) = json_value_label(value)
+                        .as_deref()
+                        .and_then(parse_lock_state_label)
+                    {
+                        return Some(value);
+                    }
+                }
+                if key.contains("lockstate") {
+                    if let Some(value) = parse_lock_state_value(value) {
+                        return Some(value);
+                    }
+                }
+            }
+
+            map.values().find_map(device_is_locked_from_details)
+        }
+        serde_json::Value::Array(values) => values.iter().find_map(device_is_locked_from_details),
+        _ => None,
+    }
+}
+
+fn parse_lock_state_value(value: &serde_json::Value) -> Option<bool> {
+    match value {
+        serde_json::Value::Bool(value) => Some(*value),
+        serde_json::Value::String(value) => parse_lock_state_label(value),
+        serde_json::Value::Object(map) => {
+            for key in ["name", "description", "stringValue", "value"] {
+                if let Some(value) = map.get(key).and_then(json_value_label) {
+                    if let Some(value) = parse_lock_state_label(&value) {
+                        return Some(value);
+                    }
+                }
+            }
+            map.values().find_map(parse_lock_state_value)
+        }
+        serde_json::Value::Array(values) => values.iter().find_map(parse_lock_state_value),
+        serde_json::Value::Number(_) | serde_json::Value::Null => None,
+    }
+}
+
+fn parse_lock_state_label(value: &str) -> Option<bool> {
+    let normalized = value.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        return None;
+    }
+    if normalized.contains("unlocked") {
+        return Some(false);
+    }
+    if normalized.contains("locked") {
+        return Some(true);
+    }
+    None
+}
+
+fn device_support_directory(platform: ApplePlatform) -> &'static str {
+    match platform {
+        ApplePlatform::Ios => "iOS DeviceSupport",
+        ApplePlatform::Macos => "macOS DeviceSupport",
+        ApplePlatform::Tvos => "tvOS DeviceSupport",
+        ApplePlatform::Visionos => "visionOS DeviceSupport",
+        ApplePlatform::Watchos => "watchOS DeviceSupport",
+    }
+}
+
+fn sanitize_device_support_component(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| match character {
+            '/' | '\\' | ':' => '-',
+            other => other,
+        })
+        .collect()
+}
+
+fn device_symbol_cache_dir(symbol_root: &Path) -> PathBuf {
+    symbol_root
+        .join("System")
+        .join("Library")
+        .join("Caches")
+        .join("com.apple.dyld")
+}
+
+fn device_symbol_root_ready(symbol_root: &Path) -> bool {
+    if symbol_root.join("usr").join("lib").join("dyld").exists() {
+        return true;
+    }
+    count_device_symbol_cache_files(symbol_root) > 0
+}
+
+fn count_device_symbol_cache_files(symbol_root: &Path) -> usize {
+    let cache_dir = device_symbol_cache_dir(symbol_root);
+    cache_dir
+        .read_dir()
+        .ok()
         .into_iter()
         .flatten()
-        .any(|entry| {
-            entry.ddi_metadata.is_usable && entry.ddi_metadata.content_is_compatible.unwrap_or(true)
-        }))
+        .flatten()
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with("dyld_shared_cache_"))
+        })
+        .count()
+}
+
+fn combine_command_output(stdout: &str, stderr: &str) -> String {
+    match (stdout.trim().is_empty(), stderr.trim().is_empty()) {
+        (true, true) => String::new(),
+        (false, true) => stdout.to_owned(),
+        (true, false) => stderr.to_owned(),
+        (false, false) => format!("{stdout}\n{stderr}"),
+    }
+}
+
+fn error_mentions_locked_device(message: &str) -> bool {
+    let normalized = message.to_ascii_lowercase();
+    normalized.contains("device is locked")
+        || normalized.contains("device needs to be unlocked")
+        || normalized.contains("unlock the device and try again")
+        || normalized.contains("operation failed since the device is locked")
+}
+
+fn locked_device_symbol_download_message(device: &PhysicalDevice) -> String {
+    format!(
+        "device symbol download requires an unlocked device. Unlock {} ({}) and try again.",
+        device.device_properties.name, device.hardware_properties.udid
+    )
+}
+
+fn locked_device_debug_message(device: &PhysicalDevice) -> String {
+    format!(
+        "device debugging requires an unlocked device. Unlock {} ({}) and try again.",
+        device.device_properties.name, device.hardware_properties.udid
+    )
+}
+
+fn lldb_quote_arg(value: &str) -> String {
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
 fn devicectl_platform_name(platform: ApplePlatform) -> &'static str {
@@ -2709,20 +4109,29 @@ fn physical_device_matches_platform(device: &PhysicalDevice, platform: ApplePlat
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
-    use plist::Dictionary;
+    use plist::{Dictionary, Value};
     use serde_json::json;
     use tempfile::TempDir;
 
     use super::{
-        ApplePlatform, DestinationKind, ExtensionManifest, SwiftPackageManifest,
-        SwiftPackageProduct, SwiftPackageTarget, SwiftPackageTargetDependency, TargetKind,
-        Toolchain, XcframeworkLibrary, embedded_dependency_root, extension_plist, json_to_plist,
-        merge_extension_attributes, ordered_package_targets, select_xcframework_library,
+        ApplePlatform, DestinationKind, DeviceRunningProcess, ExtensionManifest,
+        SwiftPackageManifest, SwiftPackageProduct, SwiftPackageTarget,
+        SwiftPackageTargetDependency, TargetKind, Toolchain, XcframeworkLibrary,
+        device_is_locked_from_details, device_support_label_from_device, embedded_dependency_root,
+        error_mentions_locked_device, extension_plist, find_running_process_for_installation,
+        json_to_plist, lldb_expect_attach_script, merge_extension_attributes,
+        merge_partial_info_plist, ordered_package_targets, prepare_swift_device_app_compile_plan,
+        relocate_bundle_debug_artifacts, select_xcframework_library,
+        swift_target_needs_executable_runtime_linker_args, use_split_swift_device_app_build,
+        write_info_plist,
     };
     use crate::context::{AppContext, GlobalPaths, ProjectContext, ProjectPaths};
-    use crate::manifest::Manifest;
+    use crate::manifest::{
+        IosDeviceFamily, IosInterfaceOrientation, IosSupportedOrientationsManifest,
+        IosTargetManifest, Manifest,
+    };
 
     fn fixture(path: &str) -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(path)
@@ -2771,6 +4180,436 @@ mod tests {
     }
 
     #[test]
+    fn derives_device_support_label_from_selected_device_metadata() {
+        let device = super::PhysicalDevice {
+            identifier: "device-id".to_owned(),
+            device_properties: super::PhysicalDeviceProperties {
+                name: "Example iPhone".to_owned(),
+                os_build_update: Some("22C161".to_owned()),
+                os_version_number: Some("18.2.1".to_owned()),
+            },
+            hardware_properties: super::PhysicalHardwareProperties {
+                cpu_type: super::PhysicalCpuType {
+                    name: "arm64e".to_owned(),
+                },
+                platform: "iOS".to_owned(),
+                product_type: Some("iPhone16,2".to_owned()),
+                udid: "00000000-0000000000000000".to_owned(),
+            },
+        };
+
+        assert_eq!(
+            device_support_label_from_device(&device).as_deref(),
+            Some("18.2.1 (22C161)")
+        );
+    }
+
+    #[test]
+    fn detects_locked_device_from_devicectl_lock_state_details() {
+        let details = json!({
+            "result": {
+                "device": {
+                    "lockState": {
+                        "name": "locked"
+                    }
+                }
+            }
+        });
+
+        assert_eq!(device_is_locked_from_details(&details), Some(true));
+    }
+
+    #[test]
+    fn detects_unlocked_device_from_devicectl_lock_state_details() {
+        let details = json!({
+            "result": {
+                "device": {
+                    "connectionProperties": {
+                        "lockState": "unlocked"
+                    }
+                }
+            }
+        });
+
+        assert_eq!(device_is_locked_from_details(&details), Some(false));
+    }
+
+    #[test]
+    fn detects_locked_device_from_passcode_required_field() {
+        let details = json!({
+            "result": {
+                "deviceIdentifier": "F1E218C7-32D3-5E36-BD5D-BC0CA366504B",
+                "passcodeRequired": true,
+                "unlockedSinceBoot": true
+            }
+        });
+
+        assert_eq!(device_is_locked_from_details(&details), Some(true));
+    }
+
+    #[test]
+    fn recognizes_locked_device_errors_from_tool_output() {
+        assert!(error_mentions_locked_device(
+            "The operation failed since the device is locked. Unlock the device and try again."
+        ));
+        assert!(error_mentions_locked_device("Device needs to be unlocked."));
+        assert!(!error_mentions_locked_device(
+            "Failed to connect to remote service."
+        ));
+    }
+
+    #[test]
+    fn writes_ios_swiftui_app_defaults_like_xcode() {
+        let (temp, project) = project_for_fixture("examples/ios-simulator-app/orbit.json");
+        let target = project
+            .manifest
+            .resolve_target(Some("ExampleIOSApp"))
+            .unwrap()
+            .clone();
+        let bundle_root = temp.path().join("ExampleIOSApp.app");
+        std::fs::create_dir_all(&bundle_root).unwrap();
+        let toolchain = Toolchain {
+            platform: ApplePlatform::Ios,
+            destination: DestinationKind::Device,
+            sdk_name: "iphoneos".to_owned(),
+            sdk_path: PathBuf::from("/tmp/iphoneos.sdk"),
+            deployment_target: "18.0".to_owned(),
+            architecture: "arm64".to_owned(),
+            target_triple: "arm64-apple-ios18.0".to_owned(),
+        };
+
+        write_info_plist(&project, &toolchain, &target, &bundle_root, "development").unwrap();
+
+        let plist = Value::from_file(bundle_root.join("Info.plist")).unwrap();
+        let dict = plist.as_dictionary().unwrap();
+        let device_family = dict
+            .get("UIDeviceFamily")
+            .and_then(Value::as_array)
+            .unwrap();
+        assert_eq!(
+            device_family
+                .iter()
+                .filter_map(Value::as_signed_integer)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(
+            dict.get("CFBundleDevelopmentRegion")
+                .and_then(Value::as_string),
+            Some("en")
+        );
+        assert!(dict.contains_key("UIApplicationSceneManifest"));
+        assert_eq!(
+            dict.get("UIRequiredDeviceCapabilities")
+                .and_then(Value::as_array)
+                .map(|values| {
+                    values
+                        .iter()
+                        .filter_map(Value::as_string)
+                        .collect::<Vec<_>>()
+                }),
+            Some(vec!["arm64"])
+        );
+        assert_eq!(
+            dict.get("UILaunchScreen")
+                .and_then(Value::as_dictionary)
+                .and_then(|launch_screen| launch_screen.get("UILaunchScreen"))
+                .and_then(Value::as_dictionary)
+                .map(Dictionary::is_empty),
+            Some(true)
+        );
+        assert!(dict.contains_key("UISupportedInterfaceOrientations~iphone"));
+        assert_eq!(
+            dict.get("UIApplicationSupportsIndirectInputEvents")
+                .and_then(Value::as_boolean),
+            Some(true)
+        );
+        assert_eq!(
+            std::fs::read_to_string(bundle_root.join("PkgInfo")).unwrap(),
+            "APPL????"
+        );
+    }
+
+    #[test]
+    fn applies_manifest_driven_ios_plist_metadata() {
+        let (temp, project) = project_for_fixture("examples/ios-simulator-app/orbit.json");
+        let mut target = project
+            .manifest
+            .resolve_target(Some("ExampleIOSApp"))
+            .unwrap()
+            .clone();
+        target.display_name = Some("Orbit Example".to_owned());
+        target.build_number = Some("42".to_owned());
+        target.info_plist.insert(
+            "NSCameraUsageDescription".to_owned(),
+            json!("Camera access is required."),
+        );
+        target.info_plist.insert(
+            "UIStatusBarStyle".to_owned(),
+            json!("UIStatusBarStyleLightContent"),
+        );
+        target.ios = Some(IosTargetManifest {
+            device_families: Some(vec![IosDeviceFamily::Iphone]),
+            supported_orientations: Some(IosSupportedOrientationsManifest {
+                iphone: Some(vec![IosInterfaceOrientation::Portrait]),
+                ipad: Some(vec![IosInterfaceOrientation::LandscapeLeft]),
+            }),
+            required_device_capabilities: Some(vec!["arm64".to_owned(), "metal".to_owned()]),
+            launch_screen: Some(BTreeMap::from([(
+                "UIColorName".to_owned(),
+                json!("LaunchBackground"),
+            )])),
+        });
+
+        let bundle_root = temp.path().join("ExampleIOSApp.app");
+        std::fs::create_dir_all(&bundle_root).unwrap();
+        let toolchain = Toolchain {
+            platform: ApplePlatform::Ios,
+            destination: DestinationKind::Device,
+            sdk_name: "iphoneos".to_owned(),
+            sdk_path: PathBuf::from("/tmp/iphoneos.sdk"),
+            deployment_target: "18.0".to_owned(),
+            architecture: "arm64".to_owned(),
+            target_triple: "arm64-apple-ios18.0".to_owned(),
+        };
+
+        write_info_plist(&project, &toolchain, &target, &bundle_root, "development").unwrap();
+
+        let plist = Value::from_file(bundle_root.join("Info.plist")).unwrap();
+        let dict = plist.as_dictionary().unwrap();
+        assert_eq!(
+            dict.get("CFBundleDisplayName").and_then(Value::as_string),
+            Some("Orbit Example")
+        );
+        assert_eq!(
+            dict.get("CFBundleVersion").and_then(Value::as_string),
+            Some("42")
+        );
+        assert_eq!(
+            dict.get("UIDeviceFamily")
+                .and_then(Value::as_array)
+                .map(|values| {
+                    values
+                        .iter()
+                        .filter_map(Value::as_signed_integer)
+                        .collect::<Vec<_>>()
+                }),
+            Some(vec![1])
+        );
+        assert_eq!(
+            dict.get("UIRequiredDeviceCapabilities")
+                .and_then(Value::as_array)
+                .map(|values| {
+                    values
+                        .iter()
+                        .filter_map(Value::as_string)
+                        .collect::<Vec<_>>()
+                }),
+            Some(vec!["arm64", "metal"])
+        );
+        assert_eq!(
+            dict.get("UISupportedInterfaceOrientations~iphone")
+                .and_then(Value::as_array)
+                .map(|values| {
+                    values
+                        .iter()
+                        .filter_map(Value::as_string)
+                        .collect::<Vec<_>>()
+                }),
+            Some(vec!["UIInterfaceOrientationPortrait"])
+        );
+        assert!(!dict.contains_key("UISupportedInterfaceOrientations~ipad"));
+        assert_eq!(
+            dict.get("UILaunchScreen")
+                .and_then(Value::as_dictionary)
+                .and_then(|launch_screen| launch_screen.get("UILaunchScreen"))
+                .and_then(Value::as_dictionary)
+                .and_then(|launch_screen| launch_screen.get("UIColorName"))
+                .and_then(Value::as_string),
+            Some("LaunchBackground")
+        );
+        assert_eq!(
+            dict.get("NSCameraUsageDescription")
+                .and_then(Value::as_string),
+            Some("Camera access is required.")
+        );
+        assert_eq!(
+            dict.get("UIStatusBarStyle").and_then(Value::as_string),
+            Some("UIStatusBarStyleLightContent")
+        );
+    }
+
+    #[test]
+    fn swift_runtime_linker_defaults_apply_to_launchable_targets() {
+        assert!(swift_target_needs_executable_runtime_linker_args(
+            TargetKind::App
+        ));
+        assert!(swift_target_needs_executable_runtime_linker_args(
+            TargetKind::Executable
+        ));
+        assert!(swift_target_needs_executable_runtime_linker_args(
+            TargetKind::WidgetExtension
+        ));
+        assert!(!swift_target_needs_executable_runtime_linker_args(
+            TargetKind::Framework
+        ));
+        assert!(!swift_target_needs_executable_runtime_linker_args(
+            TargetKind::StaticLibrary
+        ));
+    }
+
+    #[test]
+    fn uses_split_swift_build_for_ios_device_apps_only() {
+        let ios_device = Toolchain {
+            platform: ApplePlatform::Ios,
+            destination: DestinationKind::Device,
+            sdk_name: "iphoneos".to_owned(),
+            sdk_path: PathBuf::from("/tmp/iphoneos.sdk"),
+            deployment_target: "18.0".to_owned(),
+            architecture: "arm64".to_owned(),
+            target_triple: "arm64-apple-ios18.0".to_owned(),
+        };
+        let ios_simulator = Toolchain {
+            destination: DestinationKind::Simulator,
+            sdk_name: "iphonesimulator".to_owned(),
+            sdk_path: PathBuf::from("/tmp/iphonesimulator.sdk"),
+            target_triple: "arm64-apple-ios18.0-simulator".to_owned(),
+            ..ios_device.clone()
+        };
+
+        assert!(use_split_swift_device_app_build(
+            &ios_device,
+            TargetKind::App
+        ));
+        assert!(!use_split_swift_device_app_build(
+            &ios_device,
+            TargetKind::Framework
+        ));
+        assert!(!use_split_swift_device_app_build(
+            &ios_simulator,
+            TargetKind::App
+        ));
+    }
+
+    #[test]
+    fn prepares_support_file_for_ios_device_swift_app_compile_plan() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("App.swift");
+        std::fs::write(&source, "import SwiftUI\n").unwrap();
+
+        let plan =
+            prepare_swift_device_app_compile_plan(temp.path(), &[source.clone()], "ExampleIOSApp")
+                .unwrap();
+
+        assert_eq!(plan.object_path, temp.path().join("ExampleIOSApp.o"));
+        assert_eq!(
+            plan.module_path,
+            temp.path().join("ExampleIOSApp.swiftmodule")
+        );
+        assert_eq!(plan.source_files.first(), Some(&source));
+        assert_eq!(plan.source_files.len(), 2);
+        assert!(
+            plan.source_files
+                .last()
+                .is_some_and(|path| path.ends_with("__orbit_swift_support__.swift"))
+        );
+    }
+
+    #[test]
+    fn relocates_bundle_dsym_out_of_app_bundle() {
+        let temp = tempfile::tempdir().unwrap();
+        let target_dir = temp.path().join("ExampleIOSApp");
+        let bundle_root = target_dir.join("ExampleIOSApp.app");
+        std::fs::create_dir_all(&bundle_root).unwrap();
+        let binary_path = bundle_root.join("ExampleIOSApp");
+        std::fs::write(&binary_path, b"binary").unwrap();
+        let bundle_dsym = binary_path.with_extension("dSYM");
+        std::fs::create_dir_all(bundle_dsym.join("Contents")).unwrap();
+
+        relocate_bundle_debug_artifacts(&target_dir, &bundle_root, &binary_path).unwrap();
+
+        assert!(!bundle_dsym.exists());
+        assert!(target_dir.join("ExampleIOSApp.dSYM").exists());
+    }
+
+    #[test]
+    fn finds_running_process_for_installation_url() {
+        let processes = vec![
+            DeviceRunningProcess {
+                executable: Some("file:///private/var/containers/Bundle/Application/OTHER/Other.app/Other".to_owned()),
+                process_identifier: 41,
+            },
+            DeviceRunningProcess {
+                executable: Some("file:///private/var/containers/Bundle/Application/EXAMPLE/ExampleIOSApp.app/ExampleIOSApp".to_owned()),
+                process_identifier: 99,
+            },
+        ];
+
+        let process = find_running_process_for_installation(
+            &processes,
+            "file:///private/var/containers/Bundle/Application/EXAMPLE/ExampleIOSApp.app/",
+        )
+        .expect("expected matching process");
+
+        assert_eq!(process.process_identifier, 99);
+    }
+
+    #[test]
+    fn lldb_expect_script_waits_for_attach_before_continue() {
+        let script =
+            lldb_expect_attach_script(Some(Path::new("/tmp/iOS DeviceSupport/Symbols"))).unwrap();
+
+        assert!(script.contains("device process attach --pid $pid"));
+        assert!(script.contains("wait_for_log [format {Process %s stopped} $pid]"));
+        assert!(script.contains("send -- \"process continue\\r\""));
+        assert!(script.contains("settings append target.exec-search-paths"));
+        assert!(script.contains("interact"));
+    }
+
+    #[test]
+    fn merges_actool_partial_info_plist_into_bundle_info() {
+        let temp = tempfile::tempdir().unwrap();
+        let bundle_root = temp.path().join("Example.app");
+        std::fs::create_dir_all(&bundle_root).unwrap();
+        Value::Dictionary(Dictionary::from_iter([(
+            "CFBundleIdentifier".to_owned(),
+            Value::String("dev.orbit.example".to_owned()),
+        )]))
+        .to_file_xml(bundle_root.join("Info.plist"))
+        .unwrap();
+        let partial_path = temp.path().join("partial.plist");
+        Value::Dictionary(Dictionary::from_iter([
+            (
+                "NSAccentColorName".to_owned(),
+                Value::String("AccentColor".to_owned()),
+            ),
+            (
+                "CFBundleIcons".to_owned(),
+                Value::Dictionary(Dictionary::from_iter([(
+                    "CFBundlePrimaryIcon".to_owned(),
+                    Value::Dictionary(Dictionary::new()),
+                )])),
+            ),
+        ]))
+        .to_file_xml(&partial_path)
+        .unwrap();
+
+        merge_partial_info_plist(&bundle_root, &partial_path).unwrap();
+
+        let merged = Value::from_file(bundle_root.join("Info.plist")).unwrap();
+        let dict = merged.as_dictionary().unwrap();
+        assert_eq!(
+            dict.get("NSAccentColorName").and_then(Value::as_string),
+            Some("AccentColor")
+        );
+        assert!(
+            dict.get("CFBundleIcons")
+                .and_then(Value::as_dictionary)
+                .is_some()
+        );
+    }
+
+    #[test]
     fn embeds_watch_children_into_expected_subdirectories() {
         let (_temp, project) = project_for_fixture("examples/ios-watch-app/orbit.json");
         let app = project
@@ -2801,6 +4640,8 @@ mod tests {
             name: "OrbitFramework".to_owned(),
             kind: TargetKind::Framework,
             bundle_id: "dev.orbit.framework".to_owned(),
+            display_name: None,
+            build_number: None,
             platforms: vec![ApplePlatform::Watchos],
             sources: vec!["Sources/Framework".into()],
             resources: Vec::new(),
@@ -2810,6 +4651,8 @@ mod tests {
             system_libraries: Vec::new(),
             xcframeworks: Vec::new(),
             swift_packages: Vec::new(),
+            info_plist: BTreeMap::new(),
+            ios: None,
             entitlements: None,
             push: None,
             extension: None,

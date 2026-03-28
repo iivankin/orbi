@@ -87,6 +87,10 @@ pub struct TargetManifest {
     pub kind: TargetKind,
     pub bundle_id: String,
     #[serde(default)]
+    pub display_name: Option<String>,
+    #[serde(default)]
+    pub build_number: Option<String>,
+    #[serde(default)]
     pub platforms: Vec<ApplePlatform>,
     #[serde(default)]
     pub sources: Vec<PathBuf>,
@@ -104,6 +108,10 @@ pub struct TargetManifest {
     pub xcframeworks: Vec<XcframeworkDependency>,
     #[serde(default)]
     pub swift_packages: Vec<SwiftPackageDependency>,
+    #[serde(default)]
+    pub info_plist: BTreeMap<String, JsonValue>,
+    #[serde(default)]
+    pub ios: Option<IosTargetManifest>,
     pub entitlements: Option<PathBuf>,
     #[serde(default)]
     pub push: Option<PushManifest>,
@@ -129,6 +137,42 @@ pub enum TargetKind {
     WatchApp,
     WatchExtension,
     WidgetExtension,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct IosTargetManifest {
+    #[serde(default)]
+    pub device_families: Option<Vec<IosDeviceFamily>>,
+    #[serde(default)]
+    pub supported_orientations: Option<IosSupportedOrientationsManifest>,
+    #[serde(default)]
+    pub required_device_capabilities: Option<Vec<String>>,
+    #[serde(default)]
+    pub launch_screen: Option<BTreeMap<String, JsonValue>>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct IosSupportedOrientationsManifest {
+    #[serde(default)]
+    pub iphone: Option<Vec<IosInterfaceOrientation>>,
+    #[serde(default)]
+    pub ipad: Option<Vec<IosInterfaceOrientation>>,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum IosDeviceFamily {
+    Iphone,
+    Ipad,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum IosInterfaceOrientation {
+    Portrait,
+    PortraitUpsideDown,
+    LandscapeLeft,
+    LandscapeRight,
 }
 
 impl TargetKind {
@@ -262,6 +306,20 @@ impl Manifest {
             }
             if target.bundle_id.trim().is_empty() {
                 bail!("target `{}` must declare a bundle_id", target.name);
+            }
+            if target
+                .display_name
+                .as_deref()
+                .is_some_and(|value| value.trim().is_empty())
+            {
+                bail!("target `{}` declares an empty display_name", target.name);
+            }
+            if target
+                .build_number
+                .as_deref()
+                .is_some_and(|value| value.trim().is_empty())
+            {
+                bail!("target `{}` declares an empty build_number", target.name);
             }
             for dependency in &target.dependencies {
                 if !target_names.contains(dependency.as_str()) {

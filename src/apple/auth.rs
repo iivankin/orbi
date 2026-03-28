@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
@@ -97,6 +98,44 @@ enum PasswordSource {
     Prompt,
 }
 
+fn process_auth_cache() -> &'static Mutex<Option<UserAuth>> {
+    static CACHE: OnceLock<Mutex<Option<UserAuth>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(None))
+}
+
+fn cached_authenticated_user(request: &EnsureUserAuthRequest) -> Result<Option<UserAuth>> {
+    let cache = process_auth_cache()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("Apple auth cache is poisoned"))?;
+    Ok(cache
+        .as_ref()
+        .filter(|user| request_matches_user(request, user))
+        .cloned())
+}
+
+fn cache_authenticated_user(user: &UserAuth) -> Result<()> {
+    let mut cache = process_auth_cache()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("Apple auth cache is poisoned"))?;
+    *cache = Some(user.clone());
+    Ok(())
+}
+
+fn request_matches_user(request: &EnsureUserAuthRequest, user: &UserAuth) -> bool {
+    request
+        .apple_id
+        .as_deref()
+        .is_none_or(|apple_id| apple_id == user.apple_id)
+        && request
+            .team_id
+            .as_deref()
+            .is_none_or(|team_id| user.team_id.as_deref() == Some(team_id))
+        && request
+            .provider_id
+            .as_deref()
+            .is_none_or(|provider_id| user.provider_id.as_deref() == Some(provider_id))
+}
+
 pub fn best_effort_app_store_authenticate(project: &ProjectContext) -> Result<()> {
     let app = &project.app;
     if resolve_api_key_auth(app)?.is_some() {
@@ -107,6 +146,9 @@ pub fn best_effort_app_store_authenticate(project: &ProjectContext) -> Result<()
     }
 
     let request = project_user_auth_request(project, false);
+    if cached_authenticated_user(&request)?.is_some() {
+        return Ok(());
+    }
     if let Some(user) = resolve_user_auth_metadata(app)? {
         if let Some(session) = load_user_session(&user.apple_id)? {
             let mut authenticated_user = user.clone();
@@ -128,16 +170,6 @@ pub fn best_effort_app_store_authenticate(project: &ProjectContext) -> Result<()
         }
     }
 
-    println!(
-        "If you log in to your Apple account, Orbit can refresh the Apple session before run, build, and submit actions."
-    );
-    println!(
-        "This is optional, but commands that need Apple services will eventually require the session or another configured auth method."
-    );
-    if prompt_confirm("Do you want to log in to your Apple account?", false)? {
-        let user = ensure_user_authenticated(app, project_user_auth_request(project, true))?;
-        persist_project_auth_selection(project, &user)?;
-    }
     Ok(())
 }
 
@@ -150,6 +182,15 @@ pub fn ensure_user_authenticated(
     let mut user = resolved.user;
     let mut password = resolved.password;
     let mut password_source = resolved.password_source;
+
+    if let Some(cached) = cached_authenticated_user(&EnsureUserAuthRequest {
+        apple_id: Some(user.apple_id.clone()),
+        team_id: user.team_id.clone(),
+        provider_id: user.provider_id.clone(),
+        prompt_for_missing: false,
+    })? {
+        return Ok(cached);
+    }
 
     if let Some(session) = resolved.session {
         if let Some(authenticated) = apple_id::restore_session(
@@ -222,6 +263,16 @@ pub fn ensure_user_authenticated(
             Err(error) => return Err(error),
         }
     }
+}
+
+pub fn ensure_project_authenticated(project: &ProjectContext) -> Result<()> {
+    let app = &project.app;
+    if resolve_api_key_auth(app)?.is_some() {
+        return Ok(());
+    }
+
+    let user = ensure_user_authenticated(app, project_user_auth_request(project, app.interactive))?;
+    persist_project_auth_selection(project, &user)
 }
 
 pub fn resolve_submit_auth(project: &ProjectContext) -> Result<SubmitAuth> {
@@ -362,7 +413,8 @@ fn persist_user_state(
     let mut state = load_state(app)?;
     state.user = Some(user.clone());
     state.last_mode = Some(StoredAuthMode::User);
-    save_state(app, &state)
+    save_state(app, &state)?;
+    cache_authenticated_user(user)
 }
 
 fn resolve_user_inputs(
@@ -646,4 +698,58 @@ fn delete_secret(service: &str, account: &str) -> Result<()> {
     command.args(["delete-generic-password", "-a", account, "-s", service]);
     let _ = command_output_allow_failure(&mut command)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{EnsureUserAuthRequest, UserAuth, request_matches_user};
+
+    #[test]
+    fn request_match_allows_unspecified_fields() {
+        let user = UserAuth {
+            apple_id: "user@example.com".to_owned(),
+            team_id: Some("TEAM123456".to_owned()),
+            provider_id: Some("123456789".to_owned()),
+            provider_name: Some("Example Team".to_owned()),
+            last_validated_at_unix: Some(1),
+        };
+
+        assert!(request_matches_user(
+            &EnsureUserAuthRequest {
+                apple_id: Some("user@example.com".to_owned()),
+                ..Default::default()
+            },
+            &user
+        ));
+        assert!(request_matches_user(
+            &EnsureUserAuthRequest::default(),
+            &user
+        ));
+    }
+
+    #[test]
+    fn request_match_rejects_mismatched_team_or_provider() {
+        let user = UserAuth {
+            apple_id: "user@example.com".to_owned(),
+            team_id: Some("TEAM123456".to_owned()),
+            provider_id: Some("123456789".to_owned()),
+            provider_name: None,
+            last_validated_at_unix: None,
+        };
+
+        assert!(!request_matches_user(
+            &EnsureUserAuthRequest {
+                team_id: Some("TEAM999999".to_owned()),
+                ..Default::default()
+            },
+            &user
+        ));
+        assert!(!request_matches_user(
+            &EnsureUserAuthRequest {
+                provider_id: Some("987654321".to_owned()),
+                ..Default::default()
+            },
+            &user
+        ));
+    }
 }

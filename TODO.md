@@ -10,7 +10,7 @@ Known gaps:
 
 - [x] Add an ASC API key provisioning/signing path for CI using App Store Connect API for supported resources (`bundleIds`, `bundleIdCapabilities`, `certificates`, `devices`, `profiles`, `merchantIds`), and fail clearly when identifier-linking flows still require Apple ID portal sessions (for example App Groups, merchant IDs, and iCloud containers).
 - [x] Add a CLI command to export Orbit-managed signing credentials for CI use (`.p12`, password) from local Orbit state.
-- [ ] Add a CLI command to export Orbit-managed APNs auth keys (`.p8`) for backend/CI use.
+- [x] Add a CLI command to export Orbit-managed APNs auth keys (`.p8`) for backend/CI use.
 - [x] Add a CLI command to import signing credentials (`.p12`, password), into Orbit-managed signing state.
 - [x] Add `orbit clean` to remove either local Orbit caches/state or all Orbit-managed Apple Developer resources for the current project, so e2e tests can reset cleanly.
 - [x] Add comprehensive end-to-end tests that exercise Orbit-managed Apple setup, clean/reset flows, signing reuse/import-export, and CI-oriented signed build/submit scenarios.
@@ -18,7 +18,7 @@ Known gaps:
 - [x] Implement App Clip bundle ID creation/signing flow for `com.apple.developer.parent-application-identifiers`.
 - [x] Implement `orbit run` for watchOS targets.
 - [x] Implement `orbit run --debug` with debugger attach and breakpoint support.
-- [ ] Implement Xcode DeviceSupport-style device symbol download using private Apple device APIs, beyond the current DDI preparation step.
+- [x] Implement Xcode DeviceSupport-style device symbol download using private Apple device APIs, beyond the current DDI preparation step.
 - [x] Implement push notification setup beyond capability sync, including APNs key/certificate management and broadcast push configuration.
 - [x] Make Apple ID the primary auth path for device/signing portal operations instead of requiring ASC API keys for those flows.
 - [x] Expand entitlement support to cover the full set of Apple entitlement keys Orbit should understand.

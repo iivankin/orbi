@@ -202,8 +202,29 @@ pub fn command_output_allow_failure(command: &mut Command) -> Result<(bool, Stri
     ))
 }
 
+pub fn run_command_capture(command: &mut Command) -> Result<(String, String)> {
+    let debug = debug_command(command);
+    let output = command
+        .output()
+        .with_context(|| format!("failed to execute `{debug}`"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    if !output.status.success() {
+        bail!(
+            "`{debug}` failed with {}\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            stdout,
+            stderr
+        );
+    }
+    Ok((stdout, stderr))
+}
+
 pub fn run_command(command: &mut Command) -> Result<()> {
     let debug = debug_command(command);
+    if std::env::var_os("ORBIT_PRINT_COMMANDS").is_some() {
+        eprintln!("{debug}");
+    }
     let status = command
         .status()
         .with_context(|| format!("failed to execute `{debug}`"))?;

@@ -51,6 +51,10 @@ pub fn run() -> Result<()> {
                     let project = app.load_project(cli.manifest.as_deref())?;
                     apple_signing::export_signing_credentials(&project, args)
                 }
+                AppleSigningCommand::ExportPush(args) => {
+                    let project = app.load_project(cli.manifest.as_deref())?;
+                    apple_signing::export_push_auth_key(&project, args)
+                }
                 AppleSigningCommand::Import(args) => {
                     let project = app.load_project(cli.manifest.as_deref())?;
                     apple_signing::import_signing_credentials(&project, args)

@@ -20,7 +20,7 @@ pub const CLAP_STYLING: Styles = Styles::styled()
 #[command(arg_required_else_help = true)]
 #[command(styles = CLAP_STYLING)]
 #[command(
-    after_help = "Examples:\n  orbit run --simulator\n  orbit build --profile release\n  orbit submit --wait\n  orbit clean --all\n  orbit apple device list --refresh\n  orbit apple signing export --profile development\n  orbit apple signing import --profile development --p12 ./signing.p12 --password secret"
+    after_help = "Examples:\n  orbit run --simulator\n  orbit build --profile release\n  orbit submit --wait\n  orbit clean --all\n  orbit apple device list --refresh\n  orbit apple signing export --profile development\n  orbit apple signing export-push --output ./AuthKey_ORBIT.p8\n  orbit apple signing import --profile development --p12 ./signing.p12 --password secret"
 )]
 pub struct Cli {
     #[arg(long, global = true)]
@@ -184,6 +184,7 @@ pub enum DevicePlatform {
 pub enum AppleSigningCommand {
     Sync(SigningSyncArgs),
     Export(SigningExportArgs),
+    ExportPush(SigningExportPushArgs),
     Import(SigningImportArgs),
 }
 
@@ -214,6 +215,15 @@ pub struct SigningExportArgs {
     pub platform: Option<TargetPlatform>,
 
     #[arg(long)]
+    pub output_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+pub struct SigningExportPushArgs {
+    #[arg(long, conflicts_with = "output_dir")]
+    pub output: Option<PathBuf>,
+
+    #[arg(long, conflicts_with = "output")]
     pub output_dir: Option<PathBuf>,
 }
 
