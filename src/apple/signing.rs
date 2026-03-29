@@ -624,8 +624,8 @@ pub fn prepare_signing(
     let auth = ensure_portal_authenticated(
         &project.app,
         EnsureUserAuthRequest {
-            team_id: project.manifest.team_id.clone(),
-            provider_id: project.manifest.provider_id.clone(),
+            team_id: project.resolved_manifest.team_id.clone(),
+            provider_id: project.resolved_manifest.provider_id.clone(),
             prompt_for_missing: project.app.interactive,
             ..Default::default()
         },
@@ -727,11 +727,13 @@ pub fn prepare_signing(
                 &mut client,
                 project,
                 &mut state,
-                platform,
-                &bundle_id,
-                profile_type,
-                &certificate,
-                &device_ids,
+                &PortalProfileRequest {
+                    platform: portal_profile_platform(platform),
+                    profile_type,
+                    bundle_id: &bundle_id,
+                    certificate: &certificate,
+                    device_ids: &device_ids,
+                },
             )
         },
     )?;
@@ -806,8 +808,8 @@ pub fn prepare_package_signing(
     let auth = ensure_portal_authenticated(
         &project.app,
         EnsureUserAuthRequest {
-            team_id: project.manifest.team_id.clone(),
-            provider_id: project.manifest.provider_id.clone(),
+            team_id: project.resolved_manifest.team_id.clone(),
+            provider_id: project.resolved_manifest.provider_id.clone(),
             prompt_for_missing: project.app.interactive,
             ..Default::default()
         },
@@ -1118,7 +1120,7 @@ fn ensure_bundle_id_with_api_key(
     }
 
     client.create_bundle_id(
-        &orbit_managed_app_name(&project.manifest.name),
+        &orbit_managed_app_name(&project.resolved_manifest.name),
         &target.bundle_id,
         asc_bundle_id_platform(platform),
     )
@@ -1505,7 +1507,7 @@ fn ensure_profile_with_api_key(
         ),
         profile_type,
         &bundle_id.id,
-        &[certificate.id.clone()],
+        std::slice::from_ref(&certificate.id),
         device_ids,
     )?;
     persist_asc_profile(
@@ -1612,7 +1614,7 @@ fn host_app_for_app_clip<'a>(
     }
 
     let mut hosts = project
-        .manifest
+        .resolved_manifest
         .targets
         .iter()
         .filter(|candidate| {
@@ -1640,7 +1642,9 @@ fn hosted_app_clip_targets<'a>(
 ) -> Result<Vec<&'a TargetManifest>> {
     let mut hosted = Vec::new();
     for dependency_name in &target.dependencies {
-        let dependency = project.manifest.resolve_target(Some(dependency_name))?;
+        let dependency = project
+            .resolved_manifest
+            .resolve_target(Some(dependency_name))?;
         if is_app_clip_target(project, dependency)? {
             hosted.push(dependency);
         }
@@ -1816,10 +1820,10 @@ fn provisioning_profile_application_identifier_prefix(path: &Path) -> Result<Str
 }
 
 fn load_provisioning_profile_dictionary(path: &Path) -> Result<Dictionary> {
-    if let Ok(value) = Value::from_file(path) {
-        if let Some(dictionary) = value.into_dictionary() {
-            return Ok(dictionary);
-        }
+    if let Ok(value) = Value::from_file(path)
+        && let Some(dictionary) = value.into_dictionary()
+    {
+        return Ok(dictionary);
     }
 
     let output =
@@ -1854,9 +1858,8 @@ fn replace_entitlement_placeholders_in_value(
     application_identifier_prefix: &str,
 ) -> bool {
     match value {
-        Value::Array(values) => values.iter_mut().fold(false, |changed, value| {
-            changed
-                || replace_entitlement_placeholders_in_value(value, application_identifier_prefix)
+        Value::Array(values) => values.iter_mut().any(|value| {
+            replace_entitlement_placeholders_in_value(value, application_identifier_prefix)
         }),
         Value::Dictionary(dictionary) => replace_entitlement_placeholders_in_dictionary(
             dictionary,
@@ -1911,10 +1914,10 @@ fn merge_managed_signing_entitlements(
 ) -> bool {
     let mut changed = false;
     for key in MANAGED_SIGNING_ENTITLEMENTS {
-        let Some(value) = profile_entitlements.get(*key) else {
+        let Some(value) = profile_entitlements.get(key) else {
             continue;
         };
-        if target.get(*key) == Some(value) {
+        if target.get(key) == Some(value) {
             continue;
         }
         target.insert((*key).to_owned(), value.clone());
@@ -1984,7 +1987,7 @@ fn ensure_bundle_id(
     }
 
     client.create_app(
-        &orbit_managed_app_name(&project.manifest.name),
+        &orbit_managed_app_name(&project.resolved_manifest.name),
         &target.bundle_id,
         matches!(platform, ApplePlatform::Macos),
     )
@@ -2578,19 +2581,22 @@ fn ensure_certificate(
     Ok(certificate)
 }
 
+struct PortalProfileRequest<'a> {
+    platform: PortalProfilePlatform,
+    profile_type: &'a str,
+    bundle_id: &'a PortalAppId,
+    certificate: &'a ManagedCertificate,
+    device_ids: &'a [String],
+}
+
 fn ensure_profile(
     client: &mut PortalClient,
     project: &ProjectContext,
     state: &mut SigningState,
-    platform: ApplePlatform,
-    bundle_id: &PortalAppId,
-    profile_type: &str,
-    certificate: &ManagedCertificate,
-    device_ids: &[String],
+    request: &PortalProfileRequest<'_>,
 ) -> Result<ManagedProfile> {
-    let portal_platform = portal_profile_platform(platform);
-    let profiles = client.list_profiles(portal_platform)?;
-    let bundle_identifier = &bundle_id.identifier;
+    let profiles = client.list_profiles(request.platform)?;
+    let bundle_identifier = &request.bundle_id.identifier;
     let mut remote_profile_ids = HashSet::new();
     let mut stale_orbit_profiles = Vec::new();
 
@@ -2599,7 +2605,7 @@ fn ensure_profile(
         let Some(app) = &profile.app else {
             continue;
         };
-        if app.id != bundle_id.id {
+        if app.id != request.bundle_id.id {
             continue;
         }
 
@@ -2614,97 +2620,80 @@ fn ensure_profile(
             .map(|device| device.id.clone())
             .collect::<Vec<_>>();
 
-        let matches_certificate = certificate_links.contains(&certificate.id);
-        let matches_devices = canonical_ids(&device_links) == canonical_ids(device_ids);
+        let matches_certificate = certificate_links.contains(&request.certificate.id);
+        let matches_devices = canonical_ids(&device_links) == canonical_ids(request.device_ids);
 
         if matches_certificate && matches_devices {
-            let managed = persist_profile(
-                client,
-                project,
-                state,
-                portal_platform,
-                profile_type,
-                bundle_identifier,
-                certificate,
-                &device_links,
-                profile,
-            )?;
+            let managed = persist_profile(client, project, state, request, &device_links, profile)?;
             cleanup_stale_profile_state(
                 state,
                 bundle_identifier,
-                profile_type,
+                request.profile_type,
                 &remote_profile_ids,
             );
             return Ok(managed);
         }
 
-        if is_orbit_managed_profile(state, &profile.id, bundle_identifier, profile_type) {
+        if is_orbit_managed_profile(state, &profile.id, bundle_identifier, request.profile_type) {
             stale_orbit_profiles.push(profile.id.clone());
         }
     }
 
     for profile_id in stale_orbit_profiles {
         client
-            .delete_profile(portal_platform, &profile_id)
+            .delete_profile(request.platform, &profile_id)
             .with_context(|| format!("failed to repair provisioning profile `{profile_id}`"))?;
         state.profiles.retain(|profile| profile.id != profile_id);
     }
-    cleanup_stale_profile_state(state, bundle_identifier, profile_type, &remote_profile_ids);
+    cleanup_stale_profile_state(
+        state,
+        bundle_identifier,
+        request.profile_type,
+        &remote_profile_ids,
+    );
 
     let remote = client.create_profile(
-        portal_platform,
+        request.platform,
         &format!(
             "*[orbit] {} {} {}",
             bundle_identifier,
-            profile_type,
+            request.profile_type,
             crate::util::timestamp_slug()
         ),
-        profile_type,
-        &bundle_id.id,
-        &[certificate.id.clone()],
-        device_ids,
+        request.profile_type,
+        &request.bundle_id.id,
+        std::slice::from_ref(&request.certificate.id),
+        request.device_ids,
     )?;
-    persist_profile(
-        client,
-        project,
-        state,
-        portal_platform,
-        profile_type,
-        bundle_identifier,
-        certificate,
-        device_ids,
-        remote,
-    )
+    persist_profile(client, project, state, request, request.device_ids, remote)
 }
 
 fn persist_profile(
     client: &mut PortalClient,
     project: &ProjectContext,
     state: &mut SigningState,
-    platform: PortalProfilePlatform,
-    profile_type: &str,
-    bundle_identifier: &str,
-    certificate: &ManagedCertificate,
+    request: &PortalProfileRequest<'_>,
     device_ids: &[String],
     remote: PortalProvisioningProfile,
 ) -> Result<ManagedProfile> {
     let paths = team_signing_paths(project, client.team_id());
     ensure_dir(&paths.profiles_dir)?;
-    let profile_bytes = client.download_profile(platform, &remote.id)?;
-    let profile_path = paths
-        .profiles_dir
-        .join(format!("{}-{}.mobileprovision", remote.id, profile_type));
+    let profile_bytes = client.download_profile(request.platform, &remote.id)?;
+    let profile_path = paths.profiles_dir.join(format!(
+        "{}-{}.mobileprovision",
+        remote.id, request.profile_type
+    ));
     fs::write(&profile_path, profile_bytes)
         .with_context(|| format!("failed to write {}", profile_path.display()))?;
 
     state.profiles.retain(|profile| profile.id != remote.id);
     let profile = ManagedProfile {
         id: remote.id,
-        profile_type: profile_type.to_owned(),
-        bundle_id: bundle_identifier.to_owned(),
+        profile_type: request.profile_type.to_owned(),
+        bundle_id: request.bundle_id.identifier.clone(),
         path: profile_path,
         uuid: remote.uuid.clone(),
-        certificate_ids: vec![certificate.id.clone()],
+        certificate_ids: vec![request.certificate.id.clone()],
         device_ids: device_ids.to_vec(),
     };
     state.profiles.push(profile.clone());
@@ -3135,7 +3124,7 @@ fn resolve_local_team_id_if_known(project: &ProjectContext) -> Result<Option<Str
     Ok(std::env::var("ORBIT_APPLE_TEAM_ID")
         .ok()
         .or_else(|| std::env::var("EXPO_APPLE_TEAM_ID").ok())
-        .or_else(|| project.manifest.team_id.clone())
+        .or_else(|| project.resolved_manifest.team_id.clone())
         .or_else(|| {
             resolve_user_auth_metadata(&project.app)
                 .ok()
@@ -3220,8 +3209,8 @@ pub fn clean_remote_signing_state(project: &ProjectContext) -> Result<RemoteSign
     let auth = ensure_portal_authenticated(
         &project.app,
         EnsureUserAuthRequest {
-            team_id: project.manifest.team_id.clone(),
-            provider_id: project.manifest.provider_id.clone(),
+            team_id: project.resolved_manifest.team_id.clone(),
+            provider_id: project.resolved_manifest.provider_id.clone(),
             prompt_for_missing: project.app.interactive,
             ..Default::default()
         },
@@ -3232,10 +3221,10 @@ pub fn clean_remote_signing_state(project: &ProjectContext) -> Result<RemoteSign
     let mut client = PortalClient::from_session(&auth.session, team_id.clone())?;
     let state = load_state(project, &team_id)?;
     let bundle_ids = project_bundle_ids(project);
-    let orbit_app_name = orbit_managed_app_name(&project.manifest.name);
+    let orbit_app_name = orbit_managed_app_name(&project.resolved_manifest.name);
     let mut summary = RemoteSigningCleanSummary::default();
 
-    for platform in project.manifest.platforms.keys().copied() {
+    for platform in project.resolved_manifest.platforms.keys().copied() {
         for profile in client.list_profiles(portal_profile_platform(platform))? {
             let Some(app) = &profile.app else {
                 continue;
@@ -3247,8 +3236,10 @@ pub fn clean_remote_signing_state(project: &ProjectContext) -> Result<RemoteSign
         }
     }
 
-    for target in &project.manifest.targets {
-        let platform = project.manifest.resolve_platform_for_target(target, None)?;
+    for target in &project.resolved_manifest.targets {
+        let platform = project
+            .resolved_manifest
+            .resolve_platform_for_target(target, None)?;
         let mac = matches!(platform, ApplePlatform::Macos);
         if let Some(app) = client.find_app_by_bundle_id(&target.bundle_id, mac)?
             && app.name == orbit_app_name
@@ -3343,7 +3334,7 @@ struct ProjectEntitlementIdentifiers {
 
 fn project_bundle_ids(project: &ProjectContext) -> HashSet<String> {
     project
-        .manifest
+        .resolved_manifest
         .targets
         .iter()
         .map(|target| target.bundle_id.clone())
@@ -3357,11 +3348,13 @@ fn project_entitlement_identifiers(
     let mut merchant_ids_by_mac = HashMap::<bool, HashSet<String>>::new();
     let mut cloud_containers = HashSet::new();
 
-    for target in &project.manifest.targets {
+    for target in &project.resolved_manifest.targets {
         let Some(entitlements_path) = &target.entitlements else {
             continue;
         };
-        let platform = project.manifest.resolve_platform_for_target(target, None)?;
+        let platform = project
+            .resolved_manifest
+            .resolve_platform_for_target(target, None)?;
         let plan =
             capability_sync_plan_from_entitlements(&project.root.join(entitlements_path), &[])?;
         app_groups.extend(collect_identifier_values(&plan.updates, |relationships| {
@@ -3807,13 +3800,12 @@ fn import_certificate_into_keychain(
         .collect::<Vec<_>>();
     let expected_common_name = read_der_certificate_common_name(&certificate.certificate_der_path)?
         .or_else(|| certificate.display_name.clone());
-    if let Some(expected_common_name) = expected_common_name {
-        if let Some((hash, _)) = identities
+    if let Some(expected_common_name) = expected_common_name
+        && let Some((hash, _)) = identities
             .iter()
             .find(|(_, name)| name == &expected_common_name)
-        {
-            return Ok(hash.clone());
-        }
+    {
+        return Ok(hash.clone());
     }
 
     if let [identity] = identities.as_slice() {
@@ -3845,8 +3837,8 @@ mod tests {
     use crate::apple::capabilities::{CapabilityRelationships, CapabilityUpdate, RemoteCapability};
     use crate::context::{AppContext, GlobalPaths, ProjectContext, ProjectPaths};
     use crate::manifest::{
-        ApplePlatform, BuildConfiguration, DistributionKind, Manifest, ManifestSchema,
-        PlatformManifest, TargetKind, TargetManifest,
+        ApplePlatform, BuildConfiguration, DistributionKind, ManifestSchema, PlatformManifest,
+        ResolvedManifest, TargetKind, TargetManifest,
     };
 
     fn test_project() -> (TempDir, ProjectContext) {
@@ -3864,7 +3856,7 @@ mod tests {
         std::fs::create_dir_all(&data_dir).unwrap();
         std::fs::create_dir_all(&cache_dir).unwrap();
 
-        let manifest = Manifest {
+        let manifest = ResolvedManifest {
             name: "OrbitFixture".to_owned(),
             version: "0.1.0".to_owned(),
             team_id: Some("TEAM123456".to_owned()),
@@ -3921,7 +3913,7 @@ mod tests {
             root: root.clone(),
             manifest_path,
             manifest_schema: ManifestSchema::AppleAppV1,
-            manifest,
+            resolved_manifest: manifest,
             project_paths: ProjectPaths {
                 orbit_dir,
                 build_dir,
@@ -4045,7 +4037,7 @@ mod tests {
             ),
         ]));
         entitlements.to_file_xml(&entitlements_path).unwrap();
-        project.manifest.targets[0].entitlements = Some("App.entitlements".into());
+        project.resolved_manifest.targets[0].entitlements = Some("App.entitlements".into());
 
         let identifiers = project_entitlement_identifiers(&project).unwrap();
         assert_eq!(
@@ -4082,10 +4074,10 @@ mod tests {
         .to_file_xml(&profile_path)
         .unwrap();
 
-        project.manifest.targets[0]
+        project.resolved_manifest.targets[0]
             .dependencies
             .push("ExampleClip".to_owned());
-        project.manifest.targets.push(TargetManifest {
+        project.resolved_manifest.targets.push(TargetManifest {
             name: "ExampleClip".to_owned(),
             kind: TargetKind::App,
             bundle_id: "dev.orbit.fixture.clip".to_owned(),
@@ -4108,7 +4100,7 @@ mod tests {
         });
 
         let clip = project
-            .manifest
+            .resolved_manifest
             .resolve_target(Some("ExampleClip"))
             .unwrap();
         assert!(target_is_app_clip(&project, clip).unwrap());
@@ -4135,7 +4127,10 @@ mod tests {
             Some(true)
         );
 
-        let host = project.manifest.resolve_target(Some("ExampleApp")).unwrap();
+        let host = project
+            .resolved_manifest
+            .resolve_target(Some("ExampleApp"))
+            .unwrap();
         let host_entitlements = materialize_signing_entitlements(&project, host, &profile_path)
             .unwrap()
             .unwrap();
@@ -4189,7 +4184,10 @@ mod tests {
         .to_file_xml(&profile_path)
         .unwrap();
 
-        let target = project.manifest.resolve_target(Some("ExampleApp")).unwrap();
+        let target = project
+            .resolved_manifest
+            .resolve_target(Some("ExampleApp"))
+            .unwrap();
         let generated = materialize_signing_entitlements(&project, target, &profile_path)
             .unwrap()
             .unwrap();
@@ -4255,9 +4253,12 @@ mod tests {
         ]))
         .to_file_xml(&profile_path)
         .unwrap();
-        project.manifest.targets[0].entitlements = Some("App.entitlements".into());
+        project.resolved_manifest.targets[0].entitlements = Some("App.entitlements".into());
 
-        let target = project.manifest.resolve_target(Some("ExampleApp")).unwrap();
+        let target = project
+            .resolved_manifest
+            .resolve_target(Some("ExampleApp"))
+            .unwrap();
         let generated = materialize_signing_entitlements(&project, target, &profile_path)
             .unwrap()
             .unwrap();

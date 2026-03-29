@@ -33,14 +33,14 @@ pub fn resolve_platform(
     prompt: &str,
 ) -> Result<ApplePlatform> {
     if let Some(platform) = requested {
-        if project.manifest.platforms.contains_key(&platform) {
+        if project.resolved_manifest.platforms.contains_key(&platform) {
             return Ok(platform);
         }
         bail!("platform `{platform}` is not declared in the manifest");
     }
 
     let mut platforms = project
-        .manifest
+        .resolved_manifest
         .platforms
         .keys()
         .copied()
@@ -76,7 +76,7 @@ pub fn resolve_build_distribution(
 ) -> Result<DistributionKind> {
     let distribution = requested.unwrap_or(DistributionKind::Development);
     project
-        .manifest
+        .resolved_manifest
         .validate_distribution(platform, distribution)?;
     Ok(distribution)
 }
@@ -105,9 +105,11 @@ pub fn profile_for_run() -> ProfileManifest {
     ProfileManifest::new(BuildConfiguration::Debug, DistributionKind::Development)
 }
 
-pub fn build_target_for_platform<'a>(
-    project: &'a ProjectContext,
+pub fn build_target_for_platform(
+    project: &ProjectContext,
     platform: ApplePlatform,
-) -> Result<&'a TargetManifest> {
-    project.manifest.default_build_target_for_platform(platform)
+) -> Result<&TargetManifest> {
+    project
+        .resolved_manifest
+        .default_build_target_for_platform(platform)
 }

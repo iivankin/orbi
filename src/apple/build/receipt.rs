@@ -23,32 +23,35 @@ pub struct BuildReceipt {
     pub submit_eligible: bool,
 }
 
+#[derive(Debug, Clone)]
+pub struct BuildReceiptInput {
+    pub target: String,
+    pub platform: ApplePlatform,
+    pub configuration: BuildConfiguration,
+    pub distribution: DistributionKind,
+    pub destination: String,
+    pub bundle_id: String,
+    pub bundle_path: PathBuf,
+    pub artifact_path: PathBuf,
+}
+
 impl BuildReceipt {
-    pub fn new(
-        target: impl Into<String>,
-        platform: ApplePlatform,
-        configuration: BuildConfiguration,
-        distribution: DistributionKind,
-        destination: impl Into<String>,
-        bundle_id: impl Into<String>,
-        bundle_path: PathBuf,
-        artifact_path: PathBuf,
-    ) -> Self {
+    pub fn new(input: BuildReceiptInput) -> Self {
         Self {
             id: timestamp_slug(),
-            target: target.into(),
-            platform,
-            configuration,
-            distribution,
-            destination: destination.into(),
-            bundle_id: bundle_id.into(),
-            bundle_path,
-            artifact_path,
+            target: input.target,
+            platform: input.platform,
+            configuration: input.configuration,
+            distribution: input.distribution,
+            destination: input.destination,
+            bundle_id: input.bundle_id,
+            bundle_path: input.bundle_path,
+            artifact_path: input.artifact_path,
             created_at_unix: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs(),
-            submit_eligible: distribution.supports_submit(),
+            submit_eligible: input.distribution.supports_submit(),
         }
     }
 }

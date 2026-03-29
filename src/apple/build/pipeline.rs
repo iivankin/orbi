@@ -17,7 +17,9 @@ use super::external::{
     ExternalLinkInputs, PackageBuildOutput, apply_external_link_inputs, compile_swift_package,
     resolve_external_link_inputs,
 };
-use crate::apple::build::receipt::{BuildReceipt, list_receipts, load_receipt, write_receipt};
+use crate::apple::build::receipt::{
+    BuildReceipt, BuildReceiptInput, list_receipts, load_receipt, write_receipt,
+};
 use crate::apple::build::toolchain::{DestinationKind, Toolchain};
 use crate::apple::runtime::{
     apple_platform_from_cli, build_target_for_platform, distribution_from_cli, profile_for_build,
@@ -43,6 +45,17 @@ struct BuildRequest {
     destination: DestinationKind,
     output: Option<PathBuf>,
     provisioning_udids: Option<Vec<String>>,
+}
+
+struct SwiftCompilePlan<'a> {
+    target_kind: TargetKind,
+    swift_sources: &'a [PathBuf],
+    package_outputs: &'a [PackageBuildOutput],
+    external_link_inputs: &'a ExternalLinkInputs,
+    object_files: &'a [PathBuf],
+    module_name: &'a str,
+    product_path: &'a Path,
+    module_output_path: Option<&'a Path>,
 }
 
 #[derive(Debug, Clone)]
@@ -292,11 +305,11 @@ pub fn submit_artifact(project: &ProjectContext, args: &SubmitArgs) -> Result<()
 
 fn build_project(project: &ProjectContext, request: &BuildRequest) -> Result<BuildOutcome> {
     let root_target = project
-        .manifest
+        .resolved_manifest
         .resolve_target(Some(&request.target_name))?;
     let platform = request.platform;
     let platform_manifest = project
-        .manifest
+        .resolved_manifest
         .platforms
         .get(&platform)
         .context("platform configuration missing from manifest")?;
@@ -316,7 +329,9 @@ fn build_project(project: &ProjectContext, request: &BuildRequest) -> Result<Bui
         .join(toolchain.destination.as_str());
     ensure_dir(&build_root)?;
 
-    let ordered_targets = project.manifest.topological_targets(&root_target.name)?;
+    let ordered_targets = project
+        .resolved_manifest
+        .topological_targets(&root_target.name)?;
     let mut built_targets = HashMap::new();
     let signing_required = build_requires_signing(profile, request.destination);
     for target in &ordered_targets {
@@ -366,16 +381,16 @@ fn build_project(project: &ProjectContext, request: &BuildRequest) -> Result<Bui
         profile,
     )?;
 
-    let mut receipt = BuildReceipt::new(
-        &root_target.name,
+    let mut receipt = BuildReceipt::new(BuildReceiptInput {
+        target: root_target.name.clone(),
         platform,
-        profile.configuration,
-        profile.distribution,
-        request.destination.as_str(),
-        &root_target.bundle_id,
-        root_target_built.bundle_path.clone(),
+        configuration: profile.configuration,
+        distribution: profile.distribution,
+        destination: request.destination.as_str().to_owned(),
+        bundle_id: root_target.bundle_id.clone(),
+        bundle_path: root_target_built.bundle_path.clone(),
         artifact_path,
-    );
+    });
     if !matches!(root_target.kind, TargetKind::App | TargetKind::WatchApp) {
         receipt.submit_eligible = false;
     }
@@ -457,15 +472,16 @@ fn compile_target(
                 compile_swift_target(
                     toolchain,
                     profile,
-                    target.kind,
-                    &intermediates_dir,
-                    &swift_sources,
-                    &package_outputs,
-                    &external_link_inputs,
-                    &c_objects,
-                    &target.name,
-                    &product.binary_path,
-                    product.module_output_path.as_deref(),
+                    SwiftCompilePlan {
+                        target_kind: target.kind,
+                        swift_sources: &swift_sources,
+                        package_outputs: &package_outputs,
+                        external_link_inputs: &external_link_inputs,
+                        object_files: &c_objects,
+                        module_name: &target.name,
+                        product_path: &product.binary_path,
+                        module_output_path: product.module_output_path.as_deref(),
+                    },
                 )
             },
         )?;
@@ -712,7 +728,7 @@ fn resolve_target_sources(
     extensions: &[&str],
 ) -> Result<Vec<PathBuf>> {
     let mut sources = Vec::new();
-    for root in project.manifest.shared_source_roots() {
+    for root in project.resolved_manifest.shared_source_roots() {
         let path = resolve_path(&project.root, &root);
         if path.exists() {
             sources.extend(collect_files_with_extensions(&path, extensions)?);
@@ -773,26 +789,18 @@ fn compile_c_family_sources(
 fn compile_swift_target(
     toolchain: &Toolchain,
     profile: &ProfileManifest,
-    target_kind: TargetKind,
-    _intermediates_dir: &Path,
-    swift_sources: &[PathBuf],
-    package_outputs: &[PackageBuildOutput],
-    external_link_inputs: &ExternalLinkInputs,
-    object_files: &[PathBuf],
-    module_name: &str,
-    product_path: &Path,
-    module_output_path: Option<&Path>,
+    plan: SwiftCompilePlan<'_>,
 ) -> Result<()> {
     let mut command = toolchain.swiftc();
     command.arg("-parse-as-library");
     command.arg("-target").arg(&toolchain.target_triple);
-    command.arg("-module-name").arg(module_name);
+    command.arg("-module-name").arg(plan.module_name);
     if profile.is_debug() {
         command.args(["-Onone", "-g"]);
     } else {
         command.arg("-O");
     }
-    match target_kind {
+    match plan.target_kind {
         TargetKind::StaticLibrary => {
             command.arg("-emit-library");
             command.arg("-static");
@@ -803,35 +811,35 @@ fn compile_swift_target(
         _ => {}
     }
     if matches!(
-        target_kind,
+        plan.target_kind,
         TargetKind::StaticLibrary | TargetKind::DynamicLibrary | TargetKind::Framework
     ) {
         command.arg("-emit-module");
-        if let Some(module_output_path) = module_output_path {
+        if let Some(module_output_path) = plan.module_output_path {
             ensure_parent_dir(module_output_path)?;
             command.arg("-emit-module-path").arg(module_output_path);
         }
     }
-    command.arg("-o").arg(product_path);
+    command.arg("-o").arg(plan.product_path);
     if matches!(
-        target_kind,
+        plan.target_kind,
         TargetKind::AppExtension | TargetKind::WatchExtension | TargetKind::WidgetExtension
     ) {
         // Extension bundles do not define `main`; the system loader enters through NSExtensionMain.
         command.args(["-Xlinker", "-e", "-Xlinker", "_NSExtensionMain"]);
     }
-    for package in package_outputs {
+    for package in plan.package_outputs {
         command.arg("-I").arg(&package.module_dir);
         command.arg("-L").arg(&package.library_dir);
         for library in &package.link_libraries {
             command.arg("-l").arg(library);
         }
     }
-    apply_external_link_inputs(&mut command, external_link_inputs);
-    for object_file in object_files {
+    apply_external_link_inputs(&mut command, plan.external_link_inputs);
+    for object_file in plan.object_files {
         command.arg(object_file);
     }
-    for source in swift_sources {
+    for source in plan.swift_sources {
         command.arg(source);
     }
     run_command(&mut command)
@@ -1033,7 +1041,7 @@ fn write_info_plist(
     );
     plist.insert(
         "CFBundleShortVersionString".to_owned(),
-        Value::String(project.manifest.version.clone()),
+        Value::String(project.resolved_manifest.version.clone()),
     );
     plist.insert(
         "CFBundleVersion".to_owned(),
@@ -1041,7 +1049,7 @@ fn write_info_plist(
             target
                 .build_number
                 .clone()
-                .unwrap_or_else(|| project.manifest.version.clone()),
+                .unwrap_or_else(|| project.resolved_manifest.version.clone()),
         ),
     );
     plist.insert(
@@ -1383,7 +1391,7 @@ fn parent_bundle_id(
     parent_kind: TargetKind,
 ) -> Option<String> {
     project
-        .manifest
+        .resolved_manifest
         .targets
         .iter()
         .find(|candidate| {
@@ -1746,7 +1754,9 @@ fn embed_dependencies(
     built_root_target: &mut BuiltTarget,
 ) -> Result<()> {
     for dependency_name in &root_target.dependencies {
-        let dependency_target = project.manifest.resolve_target(Some(dependency_name))?;
+        let dependency_target = project
+            .resolved_manifest
+            .resolve_target(Some(dependency_name))?;
         let built = built_targets
             .get(dependency_name)
             .with_context(|| format!("missing built dependency `{dependency_name}`"))?;
@@ -2367,19 +2377,18 @@ fn wait_for_device_process_for_installation(
             return Ok(process.clone());
         }
 
-        if let Some(child) = launch_child.as_deref_mut() {
-            if let Some(status) = child.try_wait()? {
-                if !status.success() {
-                    if let Some(signal) = status.signal() {
-                        bail!(
-                            "`devicectl device process launch --console --start-stopped` exited from signal {signal} before Orbit could attach LLDB"
-                        );
-                    }
-                    bail!(
-                        "`devicectl device process launch --console --start-stopped` exited with {status} before Orbit could attach LLDB"
-                    );
-                }
+        if let Some(child) = launch_child.as_deref_mut()
+            && let Some(status) = child.try_wait()?
+            && !status.success()
+        {
+            if let Some(signal) = status.signal() {
+                bail!(
+                    "`devicectl device process launch --console --start-stopped` exited from signal {signal} before Orbit could attach LLDB"
+                );
             }
+            bail!(
+                "`devicectl device process launch --console --start-stopped` exited with {status} before Orbit could attach LLDB"
+            );
         }
 
         thread::sleep(Duration::from_millis(250));
@@ -2563,8 +2572,7 @@ fn submit_with_altool(project: &ProjectContext, receipt: &BuildReceipt, wait: bo
     run_altool_command(project, receipt, true, false)?;
 
     let mut command = build_altool_command(project, receipt, false, wait)?;
-    let result = run_command(&mut command);
-    Ok(result?)
+    run_command(&mut command)
 }
 
 fn build_altool_command(
@@ -3232,10 +3240,10 @@ fn device_is_locked_from_details(details: &serde_json::Value) -> Option<bool> {
         serde_json::Value::Object(map) => {
             for (key, value) in map {
                 let key = key.to_ascii_lowercase();
-                if matches!(key.as_str(), "passcoderequired" | "ispasscoderequired") {
-                    if let Some(value) = value.as_bool() {
-                        return Some(value);
-                    }
+                if matches!(key.as_str(), "passcoderequired" | "ispasscoderequired")
+                    && let Some(value) = value.as_bool()
+                {
+                    return Some(value);
                 }
                 if matches!(key.as_str(), "islocked" | "locked") {
                     if let Some(value) = value.as_bool() {
@@ -3248,10 +3256,10 @@ fn device_is_locked_from_details(details: &serde_json::Value) -> Option<bool> {
                         return Some(value);
                     }
                 }
-                if key.contains("lockstate") {
-                    if let Some(value) = parse_lock_state_value(value) {
-                        return Some(value);
-                    }
+                if key.contains("lockstate")
+                    && let Some(value) = parse_lock_state_value(value)
+                {
+                    return Some(value);
                 }
             }
 
@@ -3268,10 +3276,10 @@ fn parse_lock_state_value(value: &serde_json::Value) -> Option<bool> {
         serde_json::Value::String(value) => parse_lock_state_label(value),
         serde_json::Value::Object(map) => {
             for key in ["name", "description", "stringValue", "value"] {
-                if let Some(value) = map.get(key).and_then(json_value_label) {
-                    if let Some(value) = parse_lock_state_label(&value) {
-                        return Some(value);
-                    }
+                if let Some(value) = map.get(key).and_then(json_value_label)
+                    && let Some(value) = parse_lock_state_label(&value)
+                {
+                    return Some(value);
                 }
             }
             map.values().find_map(parse_lock_state_value)
@@ -3441,11 +3449,11 @@ mod tests {
         SwiftPackageTargetDependency, XcframeworkLibrary, ordered_package_targets,
         select_xcframework_library,
     };
-    use crate::apple::build::receipt::BuildReceipt;
+    use crate::apple::build::receipt::{BuildReceipt, BuildReceiptInput};
     use crate::context::{AppContext, GlobalPaths, ProjectContext, ProjectPaths};
     use crate::manifest::{
         BuildConfiguration, DistributionKind, IosDeviceFamily, IosInterfaceOrientation,
-        IosSupportedOrientationsManifest, IosTargetManifest, Manifest, ManifestSchema,
+        IosSupportedOrientationsManifest, IosTargetManifest, ManifestSchema, ResolvedManifest,
     };
 
     fn fixture(path: &str) -> PathBuf {
@@ -3462,7 +3470,7 @@ mod tests {
         let build_dir = orbit_dir.join("build");
         let artifacts_dir = orbit_dir.join("artifacts");
         let receipts_dir = orbit_dir.join("receipts");
-        let manifest = Manifest::load(&manifest_path, &orbit_dir).unwrap();
+        let manifest = ResolvedManifest::load(&manifest_path, &orbit_dir).unwrap();
         std::fs::create_dir_all(&data_dir).unwrap();
         std::fs::create_dir_all(&cache_dir).unwrap();
         std::fs::create_dir_all(&build_dir).unwrap();
@@ -3484,7 +3492,7 @@ mod tests {
             root,
             manifest_path,
             manifest_schema: ManifestSchema::AppleAppV1,
-            manifest,
+            resolved_manifest: manifest,
             project_paths: ProjectPaths {
                 orbit_dir,
                 build_dir,
@@ -3578,7 +3586,7 @@ mod tests {
     fn writes_ios_app_defaults_without_scene_manifest_inference() {
         let (temp, project) = project_for_fixture("examples/ios-simulator-app/orbit.json");
         let target = project
-            .manifest
+            .resolved_manifest
             .resolve_target(Some("ExampleIOSApp"))
             .unwrap()
             .clone();
@@ -3650,7 +3658,7 @@ mod tests {
     fn applies_manifest_driven_ios_plist_metadata() {
         let (temp, project) = project_for_fixture("examples/ios-simulator-app/orbit.json");
         let mut target = project
-            .manifest
+            .resolved_manifest
             .resolve_target(Some("ExampleIOSApp"))
             .unwrap()
             .clone();
@@ -3759,7 +3767,7 @@ mod tests {
     fn defaults_bundle_display_name_to_target_name() {
         let (temp, project) = project_for_fixture("examples/macos-app/orbit.json");
         let target = project
-            .manifest
+            .resolved_manifest
             .resolve_target(Some("ExampleMacApp"))
             .unwrap()
             .clone();
@@ -3793,7 +3801,7 @@ mod tests {
     fn writes_macos_app_metadata_under_contents() {
         let (temp, project) = project_for_fixture("examples/macos-app/orbit.json");
         let target = project
-            .manifest
+            .resolved_manifest
             .resolve_target(Some("ExampleMacApp"))
             .unwrap()
             .clone();
@@ -3845,16 +3853,16 @@ mod tests {
         std::fs::create_dir_all(standard_binary.parent().unwrap()).unwrap();
         std::fs::write(&standard_binary, b"binary").unwrap();
 
-        let receipt = BuildReceipt::new(
-            "ExampleMacApp",
-            ApplePlatform::Macos,
-            BuildConfiguration::Debug,
-            DistributionKind::Development,
-            "local",
-            "dev.orbit.examples.examplemacapp",
-            bundle_root.clone(),
-            bundle_root.clone(),
-        );
+        let receipt = BuildReceipt::new(BuildReceiptInput {
+            target: "ExampleMacApp".to_owned(),
+            platform: ApplePlatform::Macos,
+            configuration: BuildConfiguration::Debug,
+            distribution: DistributionKind::Development,
+            destination: "local".to_owned(),
+            bundle_id: "dev.orbit.examples.examplemacapp".to_owned(),
+            bundle_path: bundle_root.clone(),
+            artifact_path: bundle_root.clone(),
+        });
 
         assert_eq!(macos_executable_path(&receipt).unwrap(), standard_binary);
     }
@@ -3940,12 +3948,15 @@ mod tests {
     fn embeds_watch_children_into_expected_subdirectories() {
         let (_temp, project) = project_for_fixture("examples/ios-watch-app/orbit.json");
         let app = project
-            .manifest
+            .resolved_manifest
             .resolve_target(Some("ExampleCompanionApp"))
             .unwrap();
-        let watch_app = project.manifest.resolve_target(Some("WatchApp")).unwrap();
+        let watch_app = project
+            .resolved_manifest
+            .resolve_target(Some("WatchApp"))
+            .unwrap();
         let watch_extension = project
-            .manifest
+            .resolved_manifest
             .resolve_target(Some("WatchExtension"))
             .unwrap();
         assert_eq!(
@@ -3993,8 +4004,14 @@ mod tests {
     #[test]
     fn embeds_app_clips_into_appclips_directory() {
         let (_temp, project) = project_for_fixture("examples/ios-app-clip/orbit.json");
-        let app = project.manifest.resolve_target(Some("ExampleApp")).unwrap();
-        let clip = project.manifest.resolve_target(Some("AppClip")).unwrap();
+        let app = project
+            .resolved_manifest
+            .resolve_target(Some("ExampleApp"))
+            .unwrap();
+        let clip = project
+            .resolved_manifest
+            .resolve_target(Some("AppClip"))
+            .unwrap();
 
         assert_eq!(
             embedded_dependency_root(&project, ApplePlatform::Ios, app, clip).unwrap(),
@@ -4053,12 +4070,11 @@ mod tests {
         }))
         .unwrap();
         let dictionary = value.as_dictionary().unwrap();
-        assert_eq!(
+        assert!(
             dictionary
                 .get("Enabled")
                 .and_then(plist::Value::as_boolean)
-                .unwrap(),
-            true
+                .unwrap()
         );
         assert_eq!(
             dictionary

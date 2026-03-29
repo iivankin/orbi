@@ -613,13 +613,12 @@ impl AppleIdClient {
         interactive: bool,
     ) -> Result<Option<StoredProvider>> {
         let mut available = olympus.available_providers;
-        if let Some(current) = olympus.provider.clone() {
-            if !available
+        if let Some(current) = olympus.provider.clone()
+            && !available
                 .iter()
                 .any(|candidate| candidate.provider_id == current.provider_id)
-            {
-                available.push(current);
-            }
+        {
+            available.push(current);
         }
 
         let current = olympus.provider;

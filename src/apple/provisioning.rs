@@ -314,18 +314,16 @@ fn build_capability_relationship(
     }
 
     let mut settings = Vec::new();
-    if enabled {
-        if let Some((key, option)) = capability_setting(update)? {
-            settings.push(json!({
-                "key": key,
-                "options": [
-                    {
-                        "key": option,
-                        "enabled": true,
-                    }
-                ]
-            }));
-        }
+    if enabled && let Some((key, option)) = capability_setting(update)? {
+        settings.push(json!({
+            "key": key,
+            "options": [
+                {
+                    "key": option,
+                    "enabled": true,
+                }
+            ]
+        }));
     }
 
     Ok(json!({

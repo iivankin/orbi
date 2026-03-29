@@ -1,0 +1,50 @@
+mod support;
+
+use std::fs;
+
+use support::{
+    base_command, create_home, create_passthrough_mock, create_watch_workspace,
+    create_watch_xcrun_mock, read_log, run_and_capture,
+};
+
+#[test]
+fn watchos_run_debug_uses_simctl_and_lldb() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = create_watch_workspace(temp.path());
+    let home = create_home(temp.path());
+    let mock_bin = temp.path().join("mock-bin");
+    let log_path = temp.path().join("commands.log");
+    let sdk_root = temp.path().join("sdk");
+    fs::create_dir_all(&mock_bin).unwrap();
+
+    create_watch_xcrun_mock(&mock_bin, &sdk_root);
+    create_passthrough_mock(&mock_bin, "lldb");
+    create_passthrough_mock(&mock_bin, "open");
+
+    let mut command = base_command(&workspace, &home, &mock_bin, &log_path);
+    command.args([
+        "--non-interactive",
+        "--manifest",
+        workspace.join("orbit.json").to_str().unwrap(),
+        "run",
+        "--platform",
+        "watchos",
+        "--simulator",
+        "--debug",
+    ]);
+    let output = run_and_capture(&mut command);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let log = read_log(&log_path);
+    assert!(log.contains("xcrun simctl install WATCH-UDID"));
+    assert!(log.contains(
+        "xcrun simctl launch --wait-for-debugger --terminate-running-process WATCH-UDID dev.orbit.fixture.watch.watchkitapp"
+    ));
+    assert!(log.contains("lldb --file"));
+    assert!(log.contains("process attach -i -w -n WatchApp"));
+    assert!(log.contains("process continue"));
+}

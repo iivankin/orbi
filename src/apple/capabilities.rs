@@ -746,10 +746,10 @@ fn capability_sync_plan_from_dictionary(
                 );
             }
             SyncOperation::Skip => {
-                if !updates.contains_key(descriptor.capability_type) {
-                    if let Some(index) = existing_index {
-                        remaining_remote.remove(index);
-                    }
+                if !updates.contains_key(descriptor.capability_type)
+                    && let Some(index) = existing_index
+                {
+                    remaining_remote.remove(index);
                 }
             }
         }
@@ -857,7 +857,7 @@ fn compute_sync_operation(
             let Some(existing) = existing else {
                 return Ok(SyncOperation::Enable);
             };
-            if existing.is_enabled() && (!existing.settings.is_empty() == wants_broadcast) {
+            if existing.is_enabled() && (existing.settings.is_empty() != wants_broadcast) {
                 Ok(SyncOperation::Skip)
             } else {
                 Ok(SyncOperation::Enable)

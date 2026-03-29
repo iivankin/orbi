@@ -6,8 +6,8 @@ use serde::Deserialize;
 
 pub use crate::apple::manifest::{
     ApplePlatform, BuildConfiguration, DistributionKind, ExtensionManifest, IosDeviceFamily,
-    IosInterfaceOrientation, IosSupportedOrientationsManifest, IosTargetManifest, Manifest,
-    PlatformManifest, ProfileManifest, PushCredentialKind, PushManifest, SwiftPackageDependency,
+    IosInterfaceOrientation, IosSupportedOrientationsManifest, IosTargetManifest, PlatformManifest,
+    ProfileManifest, PushCredentialKind, PushManifest, ResolvedManifest, SwiftPackageDependency,
     TargetKind, TargetManifest, XcframeworkDependency,
 };
 

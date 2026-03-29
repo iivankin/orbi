@@ -8,7 +8,7 @@ use crate::context::ProjectContext;
 use crate::util::prompt_confirm;
 
 pub fn clean_project(project: &ProjectContext, args: &CleanArgs) -> Result<()> {
-    let clean_local_build_state = args.local || args.all || (!args.apple && !args.all);
+    let clean_local_build_state = args.local || args.all || !args.apple;
     let clean_apple = args.apple || args.all;
 
     if !clean_local_build_state && !clean_apple {

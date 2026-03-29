@@ -155,7 +155,7 @@ pub(crate) fn resolve_xcframework_dependency(
         inputs.module_search_paths.push(headers_root);
     }
 
-    let explicit_name = dependency.library.as_ref().map(|name| name.as_str());
+    let explicit_name = dependency.library.as_deref();
     let file_name = library_path
         .file_name()
         .and_then(OsStr::to_str)

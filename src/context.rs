@@ -4,7 +4,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use walkdir::WalkDir;
 
-use crate::manifest::{Manifest, ManifestSchema, detect_schema};
+use crate::manifest::{ManifestSchema, ResolvedManifest, detect_schema};
 use crate::util::{
     ensure_dir, prompt_select, read_json_file_if_exists, resolve_path, write_json_file,
 };
@@ -22,7 +22,7 @@ pub struct ProjectContext {
     pub root: PathBuf,
     pub manifest_path: PathBuf,
     pub manifest_schema: ManifestSchema,
-    pub manifest: Manifest,
+    pub resolved_manifest: ResolvedManifest,
     pub project_paths: ProjectPaths,
 }
 
@@ -95,14 +95,14 @@ impl AppContext {
         ensure_dir(&artifacts_dir)?;
         ensure_dir(&receipts_dir)?;
         let manifest_schema = detect_schema(&manifest_path)?;
-        let manifest = Manifest::load(&manifest_path, &orbit_dir)?;
+        let resolved_manifest = ResolvedManifest::load(&manifest_path, &orbit_dir)?;
 
         Ok(ProjectContext {
             app: self.clone(),
             root,
             manifest_path,
             manifest_schema,
-            manifest,
+            resolved_manifest,
             project_paths: ProjectPaths {
                 orbit_dir,
                 build_dir,

@@ -176,7 +176,6 @@ pub fn refresh_cache(app: &AppContext) -> Result<DeviceCache> {
                 .map(cached_device_from_portal),
         );
     }
-    let mut devices = devices;
     devices.sort_by(|left, right| {
         left.platform
             .cmp(&right.platform)
@@ -191,10 +190,10 @@ pub fn refresh_cache(app: &AppContext) -> Result<DeviceCache> {
 fn load_import_file(path: &Path) -> Result<Vec<ImportedDevice>> {
     let contents =
         fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
-    if path.extension().and_then(|value| value.to_str()) == Some("json") {
-        if let Ok(items) = serde_json::from_str::<Vec<ImportedDevice>>(&contents) {
-            return Ok(items);
-        }
+    if path.extension().and_then(|value| value.to_str()) == Some("json")
+        && let Ok(items) = serde_json::from_str::<Vec<ImportedDevice>>(&contents)
+    {
+        return Ok(items);
     }
 
     let mut items = Vec::new();

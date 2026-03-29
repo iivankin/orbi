@@ -15,7 +15,7 @@ pub const SCHEMA_FILENAME: &str = "apple-app.v1.json";
 pub use authoring::AppManifest;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Manifest {
+pub struct ResolvedManifest {
     pub name: String,
     pub version: String,
     pub team_id: Option<String>,
@@ -291,13 +291,13 @@ pub struct ExtensionManifest {
     pub extra: BTreeMap<String, JsonValue>,
 }
 
-impl Manifest {
+impl ResolvedManifest {
     pub fn load(path: &Path, orbit_dir: &Path) -> Result<Self> {
         normalize::load_manifest(path, orbit_dir)
     }
 
     pub fn validate_distribution(
-        self: &Self,
+        &self,
         platform: ApplePlatform,
         distribution: DistributionKind,
     ) -> Result<()> {
@@ -344,12 +344,12 @@ impl Manifest {
         &self,
         platform: ApplePlatform,
     ) -> Result<&TargetManifest> {
-        if platform == ApplePlatform::Watchos {
-            if let Some(target) = self.targets.iter().find(|target| {
+        if platform == ApplePlatform::Watchos
+            && let Some(target) = self.targets.iter().find(|target| {
                 target.kind == TargetKind::WatchApp && target.supports_platform(platform)
-            }) {
-                return Ok(target);
-            }
+            })
+        {
+            return Ok(target);
         }
 
         self.targets
@@ -463,7 +463,7 @@ impl Manifest {
     }
 }
 
-fn target_is_app_clip(manifest: &Manifest, target: &TargetManifest) -> bool {
+fn target_is_app_clip(manifest: &ResolvedManifest, target: &TargetManifest) -> bool {
     target.kind == TargetKind::App
         && manifest.targets.iter().any(|candidate| {
             candidate

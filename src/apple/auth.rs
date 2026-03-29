@@ -150,24 +150,24 @@ pub fn best_effort_app_store_authenticate(project: &ProjectContext) -> Result<()
     if cached_authenticated_user(&request)?.is_some() {
         return Ok(());
     }
-    if let Some(user) = resolve_user_auth_metadata(app)? {
-        if let Some(session) = load_user_session(&user.apple_id)? {
-            let mut authenticated_user = user.clone();
-            if let Some(authenticated) = apple_id::restore_session(
-                &session,
-                request.team_id.as_deref(),
-                request.provider_id.as_deref(),
-                app.interactive,
-            )? {
-                apply_authenticated_user(&mut authenticated_user, &authenticated);
-                persist_user_state(app, &authenticated_user, Some(&authenticated.session))?;
-                persist_project_auth_selection(project, &authenticated_user)?;
-                print_success(auth_success_message(
-                    "Reused saved Apple session",
-                    &authenticated_user,
-                ));
-                return Ok(());
-            }
+    if let Some(user) = resolve_user_auth_metadata(app)?
+        && let Some(session) = load_user_session(&user.apple_id)?
+    {
+        let mut authenticated_user = user.clone();
+        if let Some(authenticated) = apple_id::restore_session(
+            &session,
+            request.team_id.as_deref(),
+            request.provider_id.as_deref(),
+            app.interactive,
+        )? {
+            apply_authenticated_user(&mut authenticated_user, &authenticated);
+            persist_user_state(app, &authenticated_user, Some(&authenticated.session))?;
+            persist_project_auth_selection(project, &authenticated_user)?;
+            print_success(auth_success_message(
+                "Reused saved Apple session",
+                &authenticated_user,
+            ));
+            return Ok(());
         }
     }
 
@@ -193,18 +193,18 @@ pub fn ensure_user_authenticated(
         return Ok(cached);
     }
 
-    if let Some(session) = resolved.session {
-        if let Some(authenticated) = apple_id::restore_session(
+    if let Some(session) = resolved.session
+        && let Some(authenticated) = apple_id::restore_session(
             &session,
             user.team_id.as_deref(),
             user.provider_id.as_deref(),
             app.interactive,
-        )? {
-            apply_authenticated_user(&mut user, &authenticated);
-            persist_user_state(app, &user, Some(&authenticated.session))?;
-            print_success(auth_success_message("Reused saved Apple session", &user));
-            return Ok(user);
-        }
+        )?
+    {
+        apply_authenticated_user(&mut user, &authenticated);
+        persist_user_state(app, &user, Some(&authenticated.session))?;
+        print_success(auth_success_message("Reused saved Apple session", &user));
+        return Ok(user);
     }
 
     loop {
@@ -543,8 +543,8 @@ fn project_user_auth_request(
 ) -> EnsureUserAuthRequest {
     EnsureUserAuthRequest {
         apple_id: None,
-        team_id: project.manifest.team_id.clone(),
-        provider_id: project.manifest.provider_id.clone(),
+        team_id: project.resolved_manifest.team_id.clone(),
+        provider_id: project.resolved_manifest.provider_id.clone(),
         prompt_for_missing,
     }
 }
@@ -593,7 +593,8 @@ fn persist_auth_selection_fields(
         .context("manifest file must contain a top-level object")?;
     let mut changed = false;
     changed |= sync_optional_string_field(object, "team_id", team_id, looks_like_apple_team_id);
-    changed |= sync_optional_string_field(object, "provider_id", provider_id, looks_like_provider_id);
+    changed |=
+        sync_optional_string_field(object, "provider_id", provider_id, looks_like_provider_id);
     if changed {
         write_json_file(manifest_path, &manifest)?;
     }
@@ -797,12 +798,9 @@ mod tests {
         )
         .unwrap();
 
-        let changed = persist_auth_selection_fields(
-            &manifest_path,
-            Some("TEAM123456"),
-            Some("128120286"),
-        )
-        .unwrap();
+        let changed =
+            persist_auth_selection_fields(&manifest_path, Some("TEAM123456"), Some("128120286"))
+                .unwrap();
         assert!(changed);
 
         let manifest: serde_json::Value =

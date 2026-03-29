@@ -12,19 +12,31 @@ use super::authoring::{
 };
 use super::entitlements::build_entitlements_dictionary;
 use super::{
-    ApplePlatform, ExtensionManifest, IosTargetManifest, Manifest, PlatformManifest, PushManifest,
-    SwiftPackageDependency, TargetKind, TargetManifest, XcframeworkDependency,
+    ApplePlatform, ExtensionManifest, IosTargetManifest, PlatformManifest, PushManifest,
+    ResolvedManifest, SwiftPackageDependency, TargetKind, TargetManifest, XcframeworkDependency,
 };
 use crate::util::ensure_dir;
 
-pub fn load_manifest(path: &Path, orbit_dir: &Path) -> Result<Manifest> {
+struct NormalizedExternalDependencies {
+    frameworks: Vec<String>,
+    weak_frameworks: Vec<String>,
+    system_libraries: Vec<String>,
+    xcframeworks: Vec<XcframeworkDependency>,
+    swift_packages: Vec<SwiftPackageDependency>,
+}
+
+pub fn load_manifest(path: &Path, orbit_dir: &Path) -> Result<ResolvedManifest> {
     let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
     let manifest: AppManifest = serde_json::from_slice(&bytes)
         .with_context(|| format!("failed to parse {}", path.display()))?;
     normalize_manifest(path, orbit_dir, manifest)
 }
 
-fn normalize_manifest(_path: &Path, orbit_dir: &Path, app: AppManifest) -> Result<Manifest> {
+fn normalize_manifest(
+    _path: &Path,
+    orbit_dir: &Path,
+    app: AppManifest,
+) -> Result<ResolvedManifest> {
     validate_semver_version(&app.version)?;
     validate_root_manifest(&app)?;
 
@@ -38,7 +50,7 @@ fn normalize_manifest(_path: &Path, orbit_dir: &Path, app: AppManifest) -> Resul
         .filter(|platform| *platform != ApplePlatform::Watchos)
         .collect::<Vec<_>>();
 
-    let mut manifest = Manifest {
+    let mut manifest = ResolvedManifest {
         name: app.name.clone(),
         version: app.version.clone(),
         team_id: app.team_id.clone(),
@@ -109,8 +121,7 @@ fn normalize_manifest(_path: &Path, orbit_dir: &Path, app: AppManifest) -> Resul
         app.push.as_ref(),
         None,
     )?;
-    let (frameworks, weak_frameworks, system_libraries, xcframeworks, swift_packages) =
-        normalize_external_dependencies(&app.dependencies)?;
+    let external_dependencies = normalize_external_dependencies(&app.dependencies)?;
 
     manifest.targets.push(TargetManifest {
         name: app.name.clone(),
@@ -122,11 +133,11 @@ fn normalize_manifest(_path: &Path, orbit_dir: &Path, app: AppManifest) -> Resul
         sources: app.sources.clone(),
         resources: app.resources.clone(),
         dependencies: root_dependencies,
-        frameworks,
-        weak_frameworks,
-        system_libraries,
-        xcframeworks,
-        swift_packages,
+        frameworks: external_dependencies.frameworks,
+        weak_frameworks: external_dependencies.weak_frameworks,
+        system_libraries: external_dependencies.system_libraries,
+        xcframeworks: external_dependencies.xcframeworks,
+        swift_packages: external_dependencies.swift_packages,
         info_plist: normalize_info_plist(&app.info),
         ios: Some(IosTargetManifest::default()),
         entitlements: root_entitlements,
@@ -200,8 +211,7 @@ fn build_extension_target(
         extension.platforms.clone()
     };
     let (kind, point_identifier) = normalize_extension_kind(extension.kind);
-    let (frameworks, weak_frameworks, system_libraries, xcframeworks, swift_packages) =
-        normalize_external_dependencies(&extension.dependencies)?;
+    let external_dependencies = normalize_external_dependencies(&extension.dependencies)?;
 
     Ok(TargetManifest {
         name: target_name.to_owned(),
@@ -213,11 +223,11 @@ fn build_extension_target(
         sources: extension.sources.clone(),
         resources: extension.resources.clone(),
         dependencies: Vec::new(),
-        frameworks,
-        weak_frameworks,
-        system_libraries,
-        xcframeworks,
-        swift_packages,
+        frameworks: external_dependencies.frameworks,
+        weak_frameworks: external_dependencies.weak_frameworks,
+        system_libraries: external_dependencies.system_libraries,
+        xcframeworks: external_dependencies.xcframeworks,
+        swift_packages: external_dependencies.swift_packages,
         info_plist: normalize_info_plist(&extension.info),
         ios: None,
         entitlements: write_entitlements_if_needed(
@@ -243,8 +253,7 @@ fn build_watch_app_target(
     watch: &super::authoring::WatchConfig,
     generated_entitlements_dir: &Path,
 ) -> Result<TargetManifest> {
-    let (frameworks, weak_frameworks, system_libraries, xcframeworks, swift_packages) =
-        normalize_external_dependencies(&watch.dependencies)?;
+    let external_dependencies = normalize_external_dependencies(&watch.dependencies)?;
     Ok(TargetManifest {
         name: target_name.to_owned(),
         kind: TargetKind::WatchApp,
@@ -255,11 +264,11 @@ fn build_watch_app_target(
         sources: watch.sources.clone(),
         resources: watch.resources.clone(),
         dependencies: vec![watch_extension_name.to_owned()],
-        frameworks,
-        weak_frameworks,
-        system_libraries,
-        xcframeworks,
-        swift_packages,
+        frameworks: external_dependencies.frameworks,
+        weak_frameworks: external_dependencies.weak_frameworks,
+        system_libraries: external_dependencies.system_libraries,
+        xcframeworks: external_dependencies.xcframeworks,
+        swift_packages: external_dependencies.swift_packages,
         info_plist: normalize_info_plist(&watch.info),
         ios: None,
         entitlements: write_entitlements_if_needed(
@@ -280,8 +289,7 @@ fn build_watch_extension_target(
     generated_entitlements_dir: &Path,
 ) -> Result<TargetManifest> {
     let watch = app.watch.as_ref().context("watch manifest missing")?;
-    let (frameworks, weak_frameworks, system_libraries, xcframeworks, swift_packages) =
-        normalize_external_dependencies(&watch.extension.dependencies)?;
+    let external_dependencies = normalize_external_dependencies(&watch.extension.dependencies)?;
     Ok(TargetManifest {
         name: target_name.to_owned(),
         kind: TargetKind::WatchExtension,
@@ -292,11 +300,11 @@ fn build_watch_extension_target(
         sources: watch.extension.sources.clone(),
         resources: watch.extension.resources.clone(),
         dependencies: Vec::new(),
-        frameworks,
-        weak_frameworks,
-        system_libraries,
-        xcframeworks,
-        swift_packages,
+        frameworks: external_dependencies.frameworks,
+        weak_frameworks: external_dependencies.weak_frameworks,
+        system_libraries: external_dependencies.system_libraries,
+        xcframeworks: external_dependencies.xcframeworks,
+        swift_packages: external_dependencies.swift_packages,
         info_plist: normalize_info_plist(&watch.extension.info),
         ios: None,
         entitlements: write_entitlements_if_needed(
@@ -321,8 +329,7 @@ fn build_app_clip_target(
     generated_entitlements_dir: &Path,
 ) -> Result<TargetManifest> {
     let app_clip = app.app_clip.as_ref().context("app clip manifest missing")?;
-    let (frameworks, weak_frameworks, system_libraries, xcframeworks, swift_packages) =
-        normalize_external_dependencies(&app_clip.dependencies)?;
+    let external_dependencies = normalize_external_dependencies(&app_clip.dependencies)?;
     Ok(TargetManifest {
         name: target_name.to_owned(),
         kind: TargetKind::App,
@@ -333,11 +340,11 @@ fn build_app_clip_target(
         sources: app_clip.sources.clone(),
         resources: app_clip.resources.clone(),
         dependencies: Vec::new(),
-        frameworks,
-        weak_frameworks,
-        system_libraries,
-        xcframeworks,
-        swift_packages,
+        frameworks: external_dependencies.frameworks,
+        weak_frameworks: external_dependencies.weak_frameworks,
+        system_libraries: external_dependencies.system_libraries,
+        xcframeworks: external_dependencies.xcframeworks,
+        swift_packages: external_dependencies.swift_packages,
         info_plist: normalize_info_plist(&app_clip.info),
         ios: Some(IosTargetManifest::default()),
         entitlements: write_entitlements_if_needed(
@@ -367,13 +374,7 @@ fn normalize_extension_kind(kind: ExtensionKind) -> (TargetKind, &'static str) {
 
 fn normalize_external_dependencies(
     dependencies: &BTreeMap<String, DependencySpec>,
-) -> Result<(
-    Vec<String>,
-    Vec<String>,
-    Vec<String>,
-    Vec<XcframeworkDependency>,
-    Vec<SwiftPackageDependency>,
-)> {
+) -> Result<NormalizedExternalDependencies> {
     let mut frameworks = Vec::new();
     let mut weak_frameworks = Vec::new();
     let system_libraries = Vec::new();
@@ -416,13 +417,13 @@ fn normalize_external_dependencies(
         weak_frameworks.shrink_to_fit();
     }
 
-    Ok((
+    Ok(NormalizedExternalDependencies {
         frameworks,
         weak_frameworks,
         system_libraries,
         xcframeworks,
         swift_packages,
-    ))
+    })
 }
 
 fn normalize_info_plist(info: &InfoManifest) -> BTreeMap<String, JsonValue> {
@@ -454,7 +455,7 @@ fn write_entitlements_if_needed(
     Ok(Some(path))
 }
 
-fn validate_internal_manifest(manifest: &Manifest) -> Result<()> {
+fn validate_internal_manifest(manifest: &ResolvedManifest) -> Result<()> {
     if manifest.platforms.is_empty() {
         bail!("manifest must declare at least one Apple platform");
     }
