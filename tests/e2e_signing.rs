@@ -4,7 +4,7 @@ use std::fs;
 
 use support::{
     base_command, create_home, create_p12, create_security_mock, create_signing_workspace,
-    read_log, run_and_capture,
+    run_and_capture,
 };
 
 #[test]
@@ -143,60 +143,4 @@ fn signing_import_export_and_clean_round_trip() {
     ]);
     let second_export_output = run_and_capture(&mut second_export);
     assert!(!second_export_output.status.success());
-}
-
-#[test]
-fn push_auth_key_export_copies_team_scoped_p8() {
-    let temp = tempfile::tempdir().unwrap();
-    let workspace = create_signing_workspace(temp.path());
-    let home = create_home(temp.path());
-    let mock_bin = temp.path().join("mock-bin");
-    let log_path = temp.path().join("commands.log");
-    fs::create_dir_all(&mock_bin).unwrap();
-
-    let team_dir = home.join("Library/Application Support/orbit/teams/TEAM123456");
-    let push_keys_dir = team_dir.join("push-keys");
-    fs::create_dir_all(&push_keys_dir).unwrap();
-    let push_key_path = push_keys_dir.join("PUSHKEY123.p8");
-    fs::write(&push_key_path, b"push-auth-key").unwrap();
-    fs::write(
-        team_dir.join("signing.json"),
-        serde_json::to_vec_pretty(&serde_json::json!({
-            "certificates": [],
-            "profiles": [],
-            "push_keys": [{
-                "id": "PUSHKEY123",
-                "name": "@orbit/apns",
-                "path": push_key_path
-            }],
-            "push_certificates": []
-        }))
-        .unwrap(),
-    )
-    .unwrap();
-
-    let export_path = temp.path().join("AuthKey_PUSHKEY123.p8");
-    let mut export = base_command(&workspace, &home, &mock_bin, &log_path);
-    export.args([
-        "--non-interactive",
-        "--manifest",
-        workspace.join("orbit.json").to_str().unwrap(),
-        "apple",
-        "signing",
-        "export-push",
-        "--output",
-        export_path.to_str().unwrap(),
-    ]);
-    let output = run_and_capture(&mut export);
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("team_id: TEAM123456"));
-    assert!(stdout.contains("key_id: PUSHKEY123"));
-    assert_eq!(fs::read(&export_path).unwrap(), b"push-auth-key");
-    let _ = read_log(&log_path);
 }

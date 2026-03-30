@@ -52,27 +52,11 @@ impl AppContext {
     pub fn new(non_interactive: bool) -> Result<Self> {
         let cwd =
             std::env::current_dir().context("failed to resolve the current working directory")?;
-        let data_dir = dirs::data_local_dir()
-            .context("failed to resolve the user data directory")?
-            .join("orbit");
-        let cache_dir = dirs::cache_dir()
-            .unwrap_or_else(|| data_dir.join("cache"))
-            .join("orbit");
-        let keychain_path = data_dir.join("orbit.keychain-db");
-
-        ensure_dir(&data_dir)?;
-        ensure_dir(&cache_dir)?;
 
         Ok(Self {
             cwd,
             interactive: !non_interactive,
-            global_paths: GlobalPaths {
-                auth_state_path: data_dir.join("auth.json"),
-                device_cache_path: data_dir.join("devices.json"),
-                data_dir,
-                cache_dir,
-                keychain_path,
-            },
+            global_paths: resolve_global_paths()?,
         })
     }
 
@@ -166,4 +150,37 @@ impl AppContext {
             }
         }
     }
+}
+
+fn resolve_global_paths() -> Result<GlobalPaths> {
+    let data_dir_override = env_path("ORBIT_DATA_DIR");
+    let data_dir = match &data_dir_override {
+        Some(path) => path.clone(),
+        None => dirs::data_local_dir()
+            .context("failed to resolve the user data directory")?
+            .join("orbit"),
+    };
+    let cache_dir = match env_path("ORBIT_CACHE_DIR") {
+        Some(path) => path,
+        None if data_dir_override.is_some() => data_dir.join("cache"),
+        None => dirs::cache_dir()
+            .unwrap_or_else(|| data_dir.join("cache"))
+            .join("orbit"),
+    };
+    let keychain_path = data_dir.join("orbit.keychain-db");
+
+    ensure_dir(&data_dir)?;
+    ensure_dir(&cache_dir)?;
+
+    Ok(GlobalPaths {
+        auth_state_path: data_dir.join("auth.json"),
+        device_cache_path: data_dir.join("devices.json"),
+        data_dir,
+        cache_dir,
+        keychain_path,
+    })
+}
+
+fn env_path(name: &str) -> Option<PathBuf> {
+    std::env::var_os(name).map(PathBuf::from)
 }

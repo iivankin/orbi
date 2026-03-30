@@ -2,10 +2,11 @@ mod support;
 
 use std::fs;
 
+use support::submit_mock::spawn_submit_mock;
 use support::{
     base_command, clear_log, create_api_key, create_build_xcrun_mock, create_ditto_mock,
     create_home, create_passthrough_mock, create_security_mock, create_signing_workspace,
-    latest_receipt_path, read_log, run_and_capture, spawn_asc_mock,
+    create_submit_swinfo_mock, latest_receipt_path, read_log, run_and_capture, spawn_asc_mock,
 };
 
 #[test]
@@ -23,6 +24,7 @@ fn app_store_build_submit_and_clean_complete_full_lifecycle() {
     create_security_mock(&mock_bin, &security_db);
     create_passthrough_mock(&mock_bin, "codesign");
     create_ditto_mock(&mock_bin);
+    create_submit_swinfo_mock(&mock_bin);
 
     let api_key_path = temp.path().join("AuthKey_TEST.p8");
     create_api_key(&api_key_path);
@@ -33,6 +35,7 @@ fn app_store_build_submit_and_clean_complete_full_lifecycle() {
         "ExampleApp",
         false,
     );
+    let submit_server = spawn_submit_mock(temp.path(), "dev.orbit.fixture");
 
     let mut build = base_command(&workspace, &home, &mock_bin, &log_path);
     build.env("ORBIT_ASC_BASE_URL", &server.base_url);
@@ -73,12 +76,19 @@ fn app_store_build_submit_and_clean_complete_full_lifecycle() {
 
     let mut submit = base_command(&workspace, &home, &mock_bin, &log_path);
     submit.env("ORBIT_ASC_BASE_URL", &server.base_url);
+    submit.env("ORBIT_CONTENT_DELIVERY_BASE_URL", &submit_server.base_url);
     submit.env("ORBIT_ASC_API_KEY_PATH", &api_key_path);
     submit.env("ORBIT_ASC_KEY_ID", "KEY1234567");
     submit.env(
         "ORBIT_ASC_ISSUER_ID",
         "00000000-0000-0000-0000-000000000000",
     );
+    submit.env(
+        "ORBIT_TRANSPORTER_SWINFO_PATH",
+        mock_bin.join("swinfo").to_str().unwrap(),
+    );
+    submit.env("ORBIT_TRANSPORTER_USE_SWINFO_ASSET_DESCRIPTION", "1");
+    submit.env("ORBIT_SUBMIT_HOST_OS_IDENTIFIER", "Mac OS X 26.0.0 (arm64)");
     submit.args([
         "--non-interactive",
         "--manifest",
@@ -95,8 +105,8 @@ fn app_store_build_submit_and_clean_complete_full_lifecycle() {
     );
 
     let submit_log = read_log(&log_path);
-    assert!(submit_log.contains("xcrun altool --validate-app"));
-    assert!(submit_log.contains("xcrun altool --upload-package"));
+    assert!(submit_log.contains("swinfo -f"));
+    assert!(!submit_log.contains("altool"));
     assert!(!submit_log.contains("swiftc"));
 
     let mut clean = base_command(&workspace, &home, &mock_bin, &log_path);
@@ -116,7 +126,9 @@ fn app_store_build_submit_and_clean_complete_full_lifecycle() {
     assert!(!workspace.join(".orbit").exists());
 
     let requests = server.requests();
+    let submit_requests = submit_server.requests();
     server.shutdown();
+    submit_server.shutdown();
     assert!(
         requests
             .iter()
@@ -137,4 +149,13 @@ fn app_store_build_submit_and_clean_complete_full_lifecycle() {
             .iter()
             .any(|request| request.starts_with("POST /v1/apps"))
     );
+    assert!(submit_requests.iter().any(|request| {
+        request.starts_with("POST /WebObjects/MZLabelService.woa/json/MZITunesSoftwareService")
+    }));
+    assert!(submit_requests.iter().any(|request| {
+        request.starts_with("POST /MZContentDeliveryService/iris/provider/provider-test/v1/builds")
+    }));
+    assert!(submit_requests.iter().any(|request| request.starts_with(
+        "POST /MZContentDeliveryService/iris/provider/provider-test/v1/metricsAndLogging"
+    )));
 }

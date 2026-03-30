@@ -76,9 +76,10 @@
       "$ref": "#/$defs/entitlementsManifest",
       "description": "Inline Orbit entitlement DSL."
     },
-    "push": {
-      "$ref": "#/$defs/pushConfig",
-      "description": "APNs configuration for the root app."
+    "pushBroadcastForLiveActivities": {
+      "type": "boolean",
+      "default": false,
+      "description": "Request Broadcast Push Notifications for Live Activities."
     },
     "extensions": {
       "type": "object",
@@ -745,6 +746,10 @@
           "$ref": "#/$defs/booleanFlag",
           "description": "Enables time-sensitive notifications."
         },
+        "push_notifications": {
+          "$ref": "#/$defs/booleanFlag",
+          "description": "Enables Push Notifications."
+        },
         "group_activities": {
           "$ref": "#/$defs/booleanFlag",
           "description": "Enables Group Activities."
@@ -1002,26 +1007,6 @@
         }
       }
     },
-    "pushConfig": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["environment"],
-      "properties": {
-        "environment": {
-          "type": "string",
-          "enum": ["development", "production"]
-        },
-        "credential": {
-          "type": "string",
-          "enum": ["auth-key", "certificate"],
-          "default": "auth-key"
-        },
-        "broadcast": {
-          "type": "boolean",
-          "default": false
-        }
-      }
-    },
     "entryConfig": {
       "type": "object",
       "additionalProperties": false,
@@ -1064,9 +1049,6 @@
         },
         "entitlements": {
           "$ref": "#/$defs/entitlementsManifest"
-        },
-        "push": {
-          "$ref": "#/$defs/pushConfig"
         },
         "entry": {
           "$ref": "#/$defs/entryConfig"
@@ -1142,9 +1124,6 @@
         },
         "entitlements": {
           "$ref": "#/$defs/entitlementsManifest"
-        },
-        "push": {
-          "$ref": "#/$defs/pushConfig"
         }
       }
     },

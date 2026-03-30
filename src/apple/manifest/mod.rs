@@ -270,17 +270,7 @@ pub struct XcframeworkDependency {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PushManifest {
     #[serde(default)]
-    pub broadcast: bool,
-    #[serde(default)]
-    pub credential: PushCredentialKind,
-}
-
-#[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum PushCredentialKind {
-    #[default]
-    AuthKey,
-    Certificate,
+    pub broadcast_for_live_activities: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

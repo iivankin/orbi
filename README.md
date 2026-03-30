@@ -66,10 +66,7 @@ More complete app:
       "network": ["client"]
     }
   },
-  "push": {
-    "environment": "production",
-    "credential": "auth-key"
-  },
+  "pushBroadcastForLiveActivities": false,
   "extensions": {
     "tunnel": {
       "kind": "packet-tunnel",
@@ -239,14 +236,15 @@ Orbit should generate the underlying Apple entitlements file from this block.
 Push stays at the top level:
 
 ```json
-"push": {
-  "environment": "development",
-  "credential": "auth-key"
-}
+"entitlements": {
+  "push_notifications": true
+},
+"pushBroadcastForLiveActivities": false
 ```
 
-- `environment`: how the app should be signed for APNs, usually `development` or `production`.
-- `credential`: which APNs credential Orbit should manage, such as `auth-key` or `certificate`.
+- `entitlements.push_notifications`: enables ordinary Push Notifications capability.
+- `pushBroadcastForLiveActivities`: optional advanced flag for Broadcast Push Notifications for Live Activities.
+- Orbit manages the app-side push capability and entitlements only. APNs server credentials stay outside Orbit.
 
 ### Extensions
 
@@ -381,6 +379,14 @@ macOS Developer ID build:
 orbit build --platform macos --distribution developer-id --release
 ```
 
+For macOS Developer ID builds, Orbit automatically verifies the produced artifact with:
+
+- `codesign -dv --verbose=4` on the app bundle
+- `pkgutil --check-signature` on the installer package
+- `spctl -a -vvv --type install` on the installer package
+
+Before notarization, Gatekeeper is expected to report `Unnotarized Developer ID`. Orbit treats that as the expected pre-notary state rather than a build failure.
+
 ### Submit
 
 Submit the latest matching receipt:
@@ -394,6 +400,27 @@ Submit a specific receipt:
 ```sh
 orbit submit --receipt .orbit/receipts/abc123.json --wait
 ```
+
+### Clean
+
+Remove local Orbit state and Orbit-managed Apple resources for the current manifest:
+
+```sh
+orbit clean --all
+```
+
+Remote cleanup is intentionally conservative:
+
+- Orbit removes Orbit-managed provisioning profiles, bundle IDs, app groups, merchant IDs, and iCloud containers.
+- Orbit does not revoke remote signing certificates during cleanup.
+- Orbit always removes local signing material from `.orbit`, so a future build may still re-import or reuse an existing remote certificate.
+
+### Operational Notes
+
+- Apple ID auth now runs through GrandSlam/AuthKit and Developer Services. Orbit no longer relies on the old browser-cookie Apple login path for normal build, signing, submit, or notary flows.
+- `Associated Domains` is removed from the local entitlement file when you delete it from `orbit.json`, but Orbit does not force-disable the remote App ID capability. This matches current Xcode behavior: the signed app stops carrying the entitlement, while the App ID service can remain enabled remotely.
+- Xcode-like notarization works only if the Apple team is configured for notarization. A rejected submission with status code `7000` means the account still needs Apple-side notarization setup.
+- After a successful notarization wait, Orbit automatically validates the stapled package with `xcrun stapler validate` and re-runs Gatekeeper/package-signature checks.
 
 ### Apple Device Management
 
@@ -427,10 +454,4 @@ Export signing materials:
 
 ```sh
 orbit apple signing export --platform ios --output-dir ./signing
-```
-
-Export APNs credentials:
-
-```sh
-orbit apple signing export-push --output ./AuthKey_ORBIT.p8
 ```

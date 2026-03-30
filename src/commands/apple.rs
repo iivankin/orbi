@@ -1,7 +1,9 @@
 use anyhow::Result;
 
 use crate::apple;
-use crate::cli::{AppleCommand, AppleDeviceCommand, AppleSigningCommand, Cli, Command};
+use crate::cli::{
+    AppleCommand, AppleDebugCommand, AppleDeviceCommand, AppleSigningCommand, Cli, Command,
+};
 use crate::context::AppContext;
 
 pub fn execute(app: &AppContext, cli: &Cli) -> Result<()> {
@@ -16,7 +18,7 @@ pub fn execute(app: &AppContext, cli: &Cli) -> Result<()> {
         }
         Command::Submit(args) => {
             let project = app.load_project(cli.manifest.as_deref())?;
-            apple::build::submit_artifact(&project, args)
+            apple::submit::submit_artifact(&project, args)
         }
         Command::Clean(args) => {
             let project = app.load_project(cli.manifest.as_deref())?;
@@ -38,14 +40,22 @@ pub fn execute(app: &AppContext, cli: &Cli) -> Result<()> {
                     let project = app.load_project(cli.manifest.as_deref())?;
                     apple::signing::export_signing_credentials(&project, args)
                 }
-                AppleSigningCommand::ExportPush(args) => {
-                    let project = app.load_project(cli.manifest.as_deref())?;
-                    apple::signing::export_push_auth_key(&project, args)
-                }
                 AppleSigningCommand::Import(args) => {
                     let project = app.load_project(cli.manifest.as_deref())?;
                     apple::signing::import_signing_credentials(&project, args)
                 }
+            },
+            AppleCommand::Debug { command } => match command.as_ref() {
+                AppleDebugCommand::GrandSlam(args) => {
+                    apple::grand_slam::debug_grand_slam(app, args.as_ref())
+                }
+                AppleDebugCommand::DeveloperServices(args) => {
+                    apple::debug::debug_developer_services(app, cli.manifest.as_deref(), args)
+                }
+                AppleDebugCommand::NotaryStatus(args) => {
+                    apple::debug::debug_notary_status(app, cli.manifest.as_deref(), args)
+                }
+                AppleDebugCommand::AscSession(args) => apple::debug::debug_asc_session(app, args),
             },
         },
     }

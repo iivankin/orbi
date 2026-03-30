@@ -72,6 +72,8 @@ pub struct IncludedResource {
     pub resource_type: String,
     #[serde(default)]
     pub attributes: serde_json::Value,
+    #[serde(default)]
+    pub relationships: HashMap<String, Relationship>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -85,6 +87,8 @@ pub struct DeviceAttributes {
     pub status: Option<String>,
     #[serde(default)]
     pub model: Option<String>,
+    #[serde(rename = "addedDate", default)]
+    pub added_date: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

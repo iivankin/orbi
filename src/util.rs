@@ -3,7 +3,7 @@ use std::fmt::Display;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
 use dialoguer::{Confirm, Input, MultiSelect, Password, Select, theme::ColorfulTheme};
@@ -103,6 +103,11 @@ impl CliSpinner {
     pub fn finish_success(self, message: impl Into<String>) {
         self.progress_bar.finish_and_clear();
         print_success(message.into());
+    }
+
+    pub fn set_message(&self, message: impl Into<String>) {
+        self.progress_bar.set_message(message.into());
+        self.progress_bar.tick();
     }
 
     pub fn finish_clear(self) {
@@ -294,6 +299,17 @@ pub fn timestamp_slug() -> String {
         .unwrap_or_default()
         .as_secs();
     seconds.to_string()
+}
+
+pub fn format_elapsed(duration: Duration) -> String {
+    let seconds = duration.as_secs();
+    let minutes = seconds / 60;
+    let remaining_seconds = seconds % 60;
+    if minutes == 0 {
+        format!("{remaining_seconds}s")
+    } else {
+        format!("{minutes}m {remaining_seconds:02}s")
+    }
 }
 
 pub fn debug_command(command: &Command) -> String {

@@ -26,6 +26,14 @@ pub fn clean_project(project: &ProjectContext, args: &CleanArgs) -> Result<()> {
         return Ok(());
     }
 
+    // Remote cleanup needs the pre-clean signing state to know which
+    // Orbit-managed profiles and identifiers belong to this project.
+    let remote_summary = if clean_apple {
+        Some(clean_remote_signing_state(project))
+    } else {
+        None
+    };
+
     if clean_local_build_state && project.project_paths.orbit_dir.exists() {
         fs::remove_dir_all(&project.project_paths.orbit_dir)?;
         println!(
@@ -44,18 +52,15 @@ pub fn clean_project(project: &ProjectContext, args: &CleanArgs) -> Result<()> {
     }
 
     if clean_apple {
-        let summary = clean_remote_signing_state(project)?;
+        let summary = remote_summary.expect("remote summary must be initialized")?;
         println!("removed_remote_profiles: {}", summary.removed_profiles);
         println!("removed_remote_apps: {}", summary.removed_apps);
         println!("removed_remote_app_groups: {}", summary.removed_app_groups);
         println!("removed_remote_merchants: {}", summary.removed_merchants);
         println!(
-            "removed_remote_certificates: {}",
-            summary.removed_certificates
+            "removed_remote_cloud_containers: {}",
+            summary.removed_cloud_containers
         );
-        for identifier in summary.skipped_cloud_containers {
-            println!("skipped_cloud_container: {identifier}");
-        }
     }
 
     Ok(())

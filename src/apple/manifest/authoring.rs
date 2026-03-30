@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
 
-use super::{ApplePlatform, PushCredentialKind};
+use super::ApplePlatform;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -32,8 +32,8 @@ pub struct AppManifest {
     pub info: InfoManifest,
     #[serde(default)]
     pub entitlements: EntitlementsManifest,
-    #[serde(default)]
-    pub push: Option<PushConfig>,
+    #[serde(rename = "pushBroadcastForLiveActivities", default)]
+    pub push_broadcast_for_live_activities: bool,
     #[serde(default)]
     pub extensions: BTreeMap<String, ExtensionConfig>,
     #[serde(default)]
@@ -118,6 +118,8 @@ pub struct EntitlementsManifest {
     pub communication_notifications: bool,
     #[serde(default)]
     pub time_sensitive_notifications: bool,
+    #[serde(default)]
+    pub push_notifications: bool,
     #[serde(default)]
     pub group_activities: bool,
     #[serde(default)]
@@ -227,23 +229,6 @@ pub enum SandboxFilePermission {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct PushConfig {
-    pub environment: PushEnvironmentConfig,
-    #[serde(default)]
-    pub credential: PushCredentialKind,
-    #[serde(default)]
-    pub broadcast: bool,
-}
-
-#[derive(Debug, Clone, Copy, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum PushEnvironmentConfig {
-    Development,
-    Production,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ExtensionConfig {
     pub kind: ExtensionKind,
     #[serde(default)]
@@ -258,8 +243,6 @@ pub struct ExtensionConfig {
     pub info: InfoManifest,
     #[serde(default)]
     pub entitlements: EntitlementsManifest,
-    #[serde(default)]
-    pub push: Option<PushConfig>,
     #[serde(default)]
     pub entry: Option<EntryConfig>,
 }
@@ -325,8 +308,6 @@ pub struct AppClipConfig {
     pub info: InfoManifest,
     #[serde(default)]
     pub entitlements: EntitlementsManifest,
-    #[serde(default)]
-    pub push: Option<PushConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

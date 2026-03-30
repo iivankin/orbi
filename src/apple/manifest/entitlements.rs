@@ -2,10 +2,7 @@ use anyhow::{Result, bail};
 use plist::{Dictionary, Value as PlistValue};
 use serde_json::Value as JsonValue;
 
-use super::authoring::{
-    EntitlementsManifest, PushConfig, PushEnvironmentConfig, SandboxFilePermission,
-    SandboxNetworkPermission,
-};
+use super::authoring::{EntitlementsManifest, SandboxFilePermission, SandboxNetworkPermission};
 
 const DEV_PROD_OPTIONS: &[&str] = &["development", "production"];
 const ICLOUD_SERVICE_OPTIONS: &[&str] = &[
@@ -95,10 +92,9 @@ macro_rules! insert_string_array_entitlements {
 
 pub fn build_entitlements_dictionary(
     entitlements: &EntitlementsManifest,
-    push: Option<&PushConfig>,
     app_clip_parent_bundle_id: Option<&str>,
 ) -> Result<Option<Dictionary>> {
-    if entitlements.is_empty() && push.is_none() && app_clip_parent_bundle_id.is_none() {
+    if entitlements.is_empty() && app_clip_parent_bundle_id.is_none() {
         return Ok(None);
     }
 
@@ -198,19 +194,6 @@ pub fn build_entitlements_dictionary(
                 PlistValue::Boolean(true),
             );
         }
-    }
-
-    if let Some(push) = push {
-        dictionary.insert(
-            "aps-environment".to_owned(),
-            PlistValue::String(
-                match push.environment {
-                    PushEnvironmentConfig::Development => "development",
-                    PushEnvironmentConfig::Production => "production",
-                }
-                .to_owned(),
-            ),
-        );
     }
 
     if let Some(parent_bundle_id) = app_clip_parent_bundle_id {
@@ -394,7 +377,7 @@ fn json_to_plist(value: &JsonValue) -> Result<PlistValue> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::apple::manifest::{PushCredentialKind, authoring::SandboxConfig};
+    use crate::apple::manifest::authoring::SandboxConfig;
 
     #[test]
     fn builds_dictionary_for_supported_first_class_entitlements() {
@@ -434,16 +417,9 @@ mod tests {
             .collect(),
             ..Default::default()
         };
-        let push = PushConfig {
-            environment: PushEnvironmentConfig::Development,
-            credential: PushCredentialKind::AuthKey,
-            broadcast: false,
-        };
-
-        let dictionary =
-            build_entitlements_dictionary(&entitlements, Some(&push), Some("dev.orbit.demo"))
-                .expect("dictionary should build")
-                .expect("dictionary should exist");
+        let dictionary = build_entitlements_dictionary(&entitlements, Some("dev.orbit.demo"))
+            .expect("dictionary should build")
+            .expect("dictionary should exist");
 
         assert_eq!(
             dictionary.get("com.apple.security.application-groups"),
@@ -466,10 +442,6 @@ mod tests {
             Some(&PlistValue::Boolean(true))
         );
         assert_eq!(
-            dictionary.get("aps-environment"),
-            Some(&PlistValue::String("development".to_owned()))
-        );
-        assert_eq!(
             dictionary.get("com.apple.developer.parent-application-identifiers"),
             Some(&PlistValue::Array(vec![PlistValue::String(
                 "$(AppIdentifierPrefix)dev.orbit.demo".to_owned()
@@ -488,7 +460,7 @@ mod tests {
             ..Default::default()
         };
 
-        let error = build_entitlements_dictionary(&entitlements, None, None)
+        let error = build_entitlements_dictionary(&entitlements, None)
             .expect_err("invalid value should fail");
         assert!(
             error
@@ -511,7 +483,7 @@ mod tests {
             ..Default::default()
         };
 
-        let error = build_entitlements_dictionary(&entitlements, None, None)
+        let error = build_entitlements_dictionary(&entitlements, None)
             .expect_err("extra override should fail");
         assert!(
             error

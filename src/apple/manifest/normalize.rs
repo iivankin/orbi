@@ -7,8 +7,7 @@ use plist::Value as PlistValue;
 use serde_json::Value as JsonValue;
 
 use super::authoring::{
-    AppManifest, DependencySpec, EntitlementsManifest, ExtensionConfig, ExtensionKind,
-    InfoManifest, PushConfig,
+    AppManifest, DependencySpec, EntitlementsManifest, ExtensionConfig, ExtensionKind, InfoManifest,
 };
 use super::entitlements::build_entitlements_dictionary;
 use super::{
@@ -114,13 +113,8 @@ fn normalize_manifest(
         )?);
     }
 
-    let root_entitlements = write_entitlements_if_needed(
-        &generated_entitlements_dir,
-        "app",
-        &app.entitlements,
-        app.push.as_ref(),
-        None,
-    )?;
+    let root_entitlements =
+        write_entitlements_if_needed(&generated_entitlements_dir, "app", &app.entitlements, None)?;
     let external_dependencies = normalize_external_dependencies(&app.dependencies)?;
 
     manifest.targets.push(TargetManifest {
@@ -141,7 +135,10 @@ fn normalize_manifest(
         info_plist: normalize_info_plist(&app.info),
         ios: Some(IosTargetManifest::default()),
         entitlements: root_entitlements,
-        push: app.push.as_ref().map(normalize_push),
+        push: normalize_push(
+            app.entitlements.push_notifications,
+            app.push_broadcast_for_live_activities,
+        ),
         extension: None,
     });
 
@@ -234,10 +231,9 @@ fn build_extension_target(
             generated_entitlements_dir,
             id,
             &extension.entitlements,
-            extension.push.as_ref(),
             None,
         )?,
-        push: extension.push.as_ref().map(normalize_push),
+        push: normalize_push(extension.entitlements.push_notifications, false),
         extension: Some(ExtensionManifest {
             point_identifier: point_identifier.to_owned(),
             principal_class: entry.class.clone(),
@@ -276,9 +272,8 @@ fn build_watch_app_target(
             "watch-app",
             &watch.entitlements,
             None,
-            None,
         )?,
-        push: None,
+        push: normalize_push(watch.entitlements.push_notifications, false),
         extension: None,
     })
 }
@@ -312,9 +307,8 @@ fn build_watch_extension_target(
             "watch-extension",
             &watch.extension.entitlements,
             None,
-            None,
         )?,
-        push: None,
+        push: normalize_push(watch.extension.entitlements.push_notifications, false),
         extension: Some(ExtensionManifest {
             point_identifier: "com.apple.watchkit".to_owned(),
             principal_class: watch.extension.entry.class.clone(),
@@ -351,10 +345,9 @@ fn build_app_clip_target(
             generated_entitlements_dir,
             "app-clip",
             &app_clip.entitlements,
-            app_clip.push.as_ref(),
             Some(&app.bundle_id),
         )?,
-        push: app_clip.push.as_ref().map(normalize_push),
+        push: normalize_push(app_clip.entitlements.push_notifications, false),
         extension: None,
     })
 }
@@ -430,21 +423,25 @@ fn normalize_info_plist(info: &InfoManifest) -> BTreeMap<String, JsonValue> {
     info.extra.clone()
 }
 
-fn normalize_push(push: &PushConfig) -> PushManifest {
-    PushManifest {
-        broadcast: push.broadcast,
-        credential: push.credential,
+fn normalize_push(
+    push_notifications: bool,
+    push_broadcast_for_live_activities: bool,
+) -> Option<PushManifest> {
+    if !push_notifications && !push_broadcast_for_live_activities {
+        return None;
     }
+    Some(PushManifest {
+        broadcast_for_live_activities: push_broadcast_for_live_activities,
+    })
 }
 
 fn write_entitlements_if_needed(
     generated_dir: &Path,
     slug: &str,
     entitlements: &EntitlementsManifest,
-    push: Option<&PushConfig>,
     app_clip_parent_bundle_id: Option<&str>,
 ) -> Result<Option<PathBuf>> {
-    let dictionary = build_entitlements_dictionary(entitlements, push, app_clip_parent_bundle_id)?;
+    let dictionary = build_entitlements_dictionary(entitlements, app_clip_parent_bundle_id)?;
     let Some(dictionary) = dictionary else {
         return Ok(None);
     };

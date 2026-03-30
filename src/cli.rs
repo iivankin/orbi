@@ -20,7 +20,7 @@ pub const CLAP_STYLING: Styles = Styles::styled()
 #[command(arg_required_else_help = true)]
 #[command(styles = CLAP_STYLING)]
 #[command(
-    after_help = "Examples:\n  orbit run --platform ios --simulator\n  orbit build --platform ios --distribution development\n  orbit build --platform ios --distribution app-store --release\n  orbit submit --platform ios --wait\n  orbit clean --all\n  orbit apple device list --refresh\n  orbit apple signing export --platform ios --distribution development\n  orbit apple signing export-push --output ./AuthKey_ORBIT.p8\n  orbit apple signing import --platform ios --distribution development --p12 ./signing.p12 --password secret"
+    after_help = "Examples:\n  orbit run --platform ios --simulator\n  orbit build --platform ios --distribution development\n  orbit build --platform ios --distribution app-store --release\n  orbit submit --platform ios --wait\n  orbit clean --all\n  orbit apple device list --refresh\n  orbit apple signing export --platform ios --distribution development\n  orbit apple signing import --platform ios --distribution development --p12 ./signing.p12 --password secret"
 )]
 pub struct Cli {
     #[arg(long, global = true)]
@@ -39,7 +39,7 @@ pub enum Command {
     Build(BuildArgs),
     Submit(SubmitArgs),
     Clean(CleanArgs),
-    Apple(AppleArgs),
+    Apple(Box<AppleArgs>),
 }
 
 #[derive(Debug, Args)]
@@ -124,6 +124,10 @@ pub enum AppleCommand {
         #[command(subcommand)]
         command: AppleSigningCommand,
     },
+    Debug {
+        #[command(subcommand)]
+        command: Box<AppleDebugCommand>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -184,8 +188,90 @@ pub enum DevicePlatform {
 pub enum AppleSigningCommand {
     Sync(SigningSyncArgs),
     Export(SigningExportArgs),
-    ExportPush(SigningExportPushArgs),
     Import(SigningImportArgs),
+}
+
+#[derive(Debug, Subcommand)]
+pub enum AppleDebugCommand {
+    GrandSlam(Box<AppleGrandSlamDebugArgs>),
+    DeveloperServices(AppleDeveloperServicesDebugArgs),
+    NotaryStatus(AppleNotaryStatusDebugArgs),
+    AscSession(AppleAscSessionDebugArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct AppleGrandSlamDebugArgs {
+    #[arg(long)]
+    pub skip_lookup: bool,
+
+    #[arg(long)]
+    pub skip_fetch_global_configs: bool,
+
+    #[arg(long)]
+    pub skip_srp: bool,
+
+    #[arg(long, default_value = "iTunes")]
+    pub service: String,
+
+    #[arg(long)]
+    pub client_identifier: Option<String>,
+
+    #[arg(long)]
+    pub client_info: Option<String>,
+
+    #[arg(long)]
+    pub user_agent: Option<String>,
+
+    #[arg(long)]
+    pub accept_language: Option<String>,
+
+    #[arg(long)]
+    pub locale: Option<String>,
+
+    #[arg(long)]
+    pub device_id: Option<String>,
+
+    #[arg(long)]
+    pub serial_number: Option<String>,
+
+    #[arg(long)]
+    pub md: Option<String>,
+
+    #[arg(long = "md-m")]
+    pub md_m: Option<String>,
+
+    #[arg(long = "md-rinfo")]
+    pub md_rinfo: Option<String>,
+
+    #[arg(long)]
+    pub probe_content_delivery: bool,
+
+    #[arg(long)]
+    pub dump_plist: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct AppleNotaryStatusDebugArgs {
+    #[arg(long)]
+    pub submission_id: String,
+}
+
+#[derive(Debug, Args)]
+pub struct AppleDeveloperServicesDebugArgs {
+    #[arg(long)]
+    pub bundle_id: Option<String>,
+
+    #[arg(long)]
+    pub certificate_type: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct AppleAscSessionDebugArgs {
+    #[arg(
+        long,
+        default_value = "https://api.appstoreconnect.apple.com/v1/apps?limit=1"
+    )]
+    pub url: String,
 }
 
 #[derive(Debug, Args)]
@@ -212,15 +298,6 @@ pub struct SigningExportArgs {
     pub distribution: Option<DistributionArg>,
 
     #[arg(long)]
-    pub output_dir: Option<PathBuf>,
-}
-
-#[derive(Debug, Args)]
-pub struct SigningExportPushArgs {
-    #[arg(long, conflicts_with = "output_dir")]
-    pub output: Option<PathBuf>,
-
-    #[arg(long, conflicts_with = "output")]
     pub output_dir: Option<PathBuf>,
 }
 

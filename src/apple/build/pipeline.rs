@@ -13,19 +13,19 @@ use plist::{Dictionary, Value};
 use serde::Deserialize;
 use tempfile::{NamedTempFile, tempdir};
 
+use super::default_icon;
 use super::external::{
     ExternalLinkInputs, PackageBuildOutput, apply_external_link_inputs, compile_swift_package,
     resolve_external_link_inputs,
 };
-use crate::apple::build::receipt::{
-    BuildReceipt, BuildReceiptInput, list_receipts, load_receipt, write_receipt,
-};
+use crate::apple::build::receipt::{BuildReceipt, BuildReceiptInput, write_receipt};
 use crate::apple::build::toolchain::{DestinationKind, Toolchain};
+use crate::apple::build::verify::{should_verify_developer_id_artifact, verify_post_build};
 use crate::apple::runtime::{
     apple_platform_from_cli, build_target_for_platform, distribution_from_cli, profile_for_build,
     profile_for_run, resolve_build_distribution, resolve_platform,
 };
-use crate::cli::{BuildArgs, RunArgs, SubmitArgs};
+use crate::cli::{BuildArgs, RunArgs};
 use crate::context::ProjectContext;
 use crate::manifest::{
     ApplePlatform, DistributionKind, ExtensionManifest, IosDeviceFamily, IosInterfaceOrientation,
@@ -81,6 +81,7 @@ pub struct BuildOutcome {
 #[derive(Debug, Clone, Copy, Default)]
 struct ResourceWorkSummary {
     asset_catalogs: usize,
+    generated_default_app_icon: bool,
     interface_resources: usize,
     strings_files: usize,
     core_data_models: usize,
@@ -92,6 +93,9 @@ impl ResourceWorkSummary {
         let mut parts = Vec::new();
         if self.asset_catalogs > 0 {
             parts.push(format!("{} asset catalog(s)", self.asset_catalogs));
+        }
+        if self.generated_default_app_icon {
+            parts.push("generated default app icon".to_owned());
         }
         if self.interface_resources > 0 {
             parts.push(format!("{} interface file(s)", self.interface_resources));
@@ -193,6 +197,16 @@ pub fn build_artifact(project: &ProjectContext, args: &BuildArgs) -> Result<()> 
         outcome.receipt.target,
         profile_description(&request.profile)
     ));
+    if should_verify_developer_id_artifact(&outcome.receipt) {
+        build_progress_step(
+            format!(
+                "Verifying Developer ID artifact {}",
+                outcome.receipt.artifact_path.display()
+            ),
+            |summary: &String| summary.clone(),
+            || verify_post_build(&outcome.receipt),
+        )?;
+    }
     println!("artifact: {}", outcome.receipt.artifact_path.display());
     println!("receipt: {}", outcome.receipt_path.display());
     Ok(())
@@ -285,24 +299,6 @@ pub fn run_on_destination(project: &ProjectContext, args: &RunArgs) -> Result<()
     }
 }
 
-pub fn submit_artifact(project: &ProjectContext, args: &SubmitArgs) -> Result<()> {
-    let receipt = resolve_submit_receipt(project, args)?;
-
-    crate::apple::auth::best_effort_app_store_authenticate(project)?;
-
-    match receipt.platform {
-        ApplePlatform::Ios
-        | ApplePlatform::Tvos
-        | ApplePlatform::Visionos
-        | ApplePlatform::Watchos => submit_with_altool(project, &receipt, args.wait),
-        ApplePlatform::Macos => match receipt.distribution {
-            DistributionKind::DeveloperId => submit_with_notarytool(project, &receipt, args.wait),
-            DistributionKind::MacAppStore => submit_with_altool(project, &receipt, args.wait),
-            other => bail!("macOS submit is not supported for {:?} builds", other),
-        },
-    }
-}
-
 fn build_project(project: &ProjectContext, request: &BuildRequest) -> Result<BuildOutcome> {
     let root_target = project
         .resolved_manifest
@@ -365,7 +361,12 @@ fn build_project(project: &ProjectContext, request: &BuildRequest) -> Result<Bui
                 profile,
                 request.provisioning_udids.clone(),
             )?;
-            crate::apple::signing::sign_bundle(platform, &built_target.bundle_path, &material)?;
+            crate::apple::signing::sign_bundle(
+                platform,
+                request.profile.distribution,
+                &built_target.bundle_path,
+                &material,
+            )?;
         }
     }
 
@@ -525,7 +526,7 @@ fn compile_target(
         )?;
     }
     if target.kind.is_bundle() {
-        if !target.resources.is_empty() {
+        if should_process_resources(toolchain.platform, target) {
             build_progress_step(
                 format!("Processing resources for target `{}`", target.name),
                 |summary: &ResourceWorkSummary| {
@@ -651,75 +652,6 @@ fn validate_run_platform(platform: ApplePlatform) -> Result<()> {
         | ApplePlatform::Visionos
         | ApplePlatform::Watchos => Ok(()),
     }
-}
-
-fn resolve_submit_receipt(project: &ProjectContext, args: &SubmitArgs) -> Result<BuildReceipt> {
-    let requested_platform = args.platform.map(apple_platform_from_cli);
-    let requested_distribution = distribution_from_cli(args.distribution);
-
-    if let Some(receipt_path) = &args.receipt {
-        let receipt = load_receipt(receipt_path)?;
-        if !receipt.submit_eligible {
-            bail!(
-                "receipt `{}` is not submit-eligible because it was built for `{:?}` distribution",
-                receipt.id,
-                receipt.distribution
-            );
-        }
-        if requested_platform.is_some_and(|platform| receipt.platform != platform) {
-            bail!(
-                "receipt `{}` targets platform `{}`, not the requested `{}`",
-                receipt.id,
-                receipt.platform,
-                requested_platform
-                    .map(|platform| platform.to_string())
-                    .unwrap_or_default()
-            );
-        }
-        if requested_distribution.is_some_and(|distribution| receipt.distribution != distribution) {
-            bail!(
-                "receipt `{}` uses distribution `{}`, not the requested `{}`",
-                receipt.id,
-                receipt.distribution.as_str(),
-                requested_distribution
-                    .map(DistributionKind::as_str)
-                    .unwrap_or_default()
-            );
-        }
-        return Ok(receipt);
-    }
-
-    let mut receipts = list_receipts(
-        &project.project_paths.receipts_dir,
-        requested_platform,
-        requested_distribution,
-    )?;
-    receipts.retain(|receipt| receipt.submit_eligible);
-    receipts.sort_by(|left, right| right.created_at_unix.cmp(&left.created_at_unix));
-    if receipts.is_empty() {
-        bail!("could not find a submit-eligible build receipt");
-    }
-    if receipts.len() == 1 || !project.app.interactive {
-        return Ok(receipts.remove(0));
-    }
-
-    let labels = receipts.iter().map(receipt_label).collect::<Vec<_>>();
-    let index = prompt_select("Select a build receipt to submit", &labels)?;
-    Ok(receipts.remove(index))
-}
-
-fn receipt_label(receipt: &BuildReceipt) -> String {
-    format!(
-        "{} | {} | {} | {} | {}",
-        receipt.id,
-        receipt.target,
-        profile_description(&ProfileManifest::new(
-            receipt.configuration,
-            receipt.distribution
-        )),
-        receipt.destination,
-        receipt.artifact_path.display()
-    )
 }
 
 fn resolve_target_sources(
@@ -1018,6 +950,7 @@ fn write_info_plist(
     bundle_root: &Path,
 ) -> Result<()> {
     let mut plist = Dictionary::new();
+    let build_metadata = toolchain.bundle_build_metadata()?;
     plist.insert(
         "CFBundleIdentifier".to_owned(),
         Value::String(target.bundle_id.clone()),
@@ -1065,6 +998,39 @@ fn write_info_plist(
         Value::Array(vec![Value::String(
             toolchain.info_plist_supported_platform().to_owned(),
         )]),
+    );
+    plist.insert(
+        "BuildMachineOSBuild".to_owned(),
+        Value::String(build_metadata.build_machine_os_build),
+    );
+    plist.insert(
+        "DTCompiler".to_owned(),
+        Value::String(build_metadata.compiler),
+    );
+    plist.insert(
+        "DTPlatformBuild".to_owned(),
+        Value::String(build_metadata.platform_build),
+    );
+    plist.insert(
+        "DTPlatformName".to_owned(),
+        Value::String(build_metadata.platform_name),
+    );
+    plist.insert(
+        "DTPlatformVersion".to_owned(),
+        Value::String(build_metadata.platform_version),
+    );
+    plist.insert(
+        "DTSDKBuild".to_owned(),
+        Value::String(build_metadata.sdk_build),
+    );
+    plist.insert(
+        "DTSDKName".to_owned(),
+        Value::String(build_metadata.sdk_name),
+    );
+    plist.insert("DTXcode".to_owned(), Value::String(build_metadata.xcode));
+    plist.insert(
+        "DTXcodeBuild".to_owned(),
+        Value::String(build_metadata.xcode_build),
     );
 
     match target.kind {
@@ -1438,17 +1404,17 @@ fn process_resources(
         )?;
     }
 
+    let compiled_asset_catalogs =
+        compile_asset_catalogs(toolchain, target.kind, &asset_catalogs, bundle_root)?;
+
     let summary = ResourceWorkSummary {
         asset_catalogs: asset_catalogs.len(),
+        generated_default_app_icon: compiled_asset_catalogs.generated_default_app_icon,
         interface_resources: interface_jobs.len(),
         strings_files: strings_jobs.len(),
         core_data_models: core_data_jobs.len(),
         copied_resources: copy_jobs.len(),
     };
-
-    if !asset_catalogs.is_empty() {
-        compile_asset_catalogs(toolchain, target.kind, &asset_catalogs, bundle_root)?;
-    }
     for (source, relative) in interface_jobs {
         compile_interface_resource(toolchain, &source, &resources_root.join(relative))?;
     }
@@ -1469,6 +1435,11 @@ fn process_resources(
     }
 
     Ok(summary)
+}
+
+fn should_process_resources(platform: ApplePlatform, target: &TargetManifest) -> bool {
+    !target.resources.is_empty()
+        || default_icon::should_generate_default_app_icon(platform, target.kind)
 }
 
 fn discover_resources(
@@ -1616,12 +1587,24 @@ fn discover_resources(
     Ok(())
 }
 
+struct CompiledAssetCatalogs {
+    generated_default_app_icon: bool,
+}
+
 fn compile_asset_catalogs(
     toolchain: &Toolchain,
     target_kind: TargetKind,
     asset_catalogs: &[PathBuf],
     bundle_root: &Path,
-) -> Result<()> {
+) -> Result<CompiledAssetCatalogs> {
+    let prepared_catalogs =
+        default_icon::prepare_asset_catalogs(toolchain.platform, target_kind, asset_catalogs)?;
+    if prepared_catalogs.catalogs().is_empty() {
+        return Ok(CompiledAssetCatalogs {
+            generated_default_app_icon: false,
+        });
+    }
+
     let partial_plist = NamedTempFile::new()?;
     let resources_root = bundle_resources_root(toolchain, target_kind, bundle_root);
     let mut command = toolchain.actool_command();
@@ -1639,20 +1622,29 @@ fn compile_asset_catalogs(
     for device in toolchain.actool_target_device() {
         command.arg("--target-device").arg(device);
     }
-    if asset_catalog_contains_named_set(asset_catalogs, "AccentColor.colorset") {
+    if asset_catalog_contains_named_set(prepared_catalogs.catalogs(), "AccentColor.colorset") {
         command.arg("--accent-color").arg("AccentColor");
     }
-    if asset_catalog_contains_named_set(asset_catalogs, "AppIcon.appiconset") {
+    if prepared_catalogs.has_app_icon() {
         command.arg("--app-icon").arg("AppIcon");
     }
-    for catalog in asset_catalogs {
+    for catalog in prepared_catalogs.catalogs() {
         command.arg(catalog);
     }
     command_output(&mut command)?;
     merge_partial_info_plist(
         bundle_metadata_root(toolchain, target_kind, bundle_root),
         partial_plist.path(),
-    )
+    )?;
+    default_icon::ensure_icon_metadata(
+        toolchain.platform,
+        target_kind,
+        &bundle_metadata_root(toolchain, target_kind, bundle_root),
+        prepared_catalogs.has_app_icon(),
+    )?;
+    Ok(CompiledAssetCatalogs {
+        generated_default_app_icon: prepared_catalogs.generated_default_app_icon(),
+    })
 }
 
 fn asset_catalog_contains_named_set(asset_catalogs: &[PathBuf], expected_name: &str) -> bool {
@@ -2567,190 +2559,6 @@ fn select_simulator_device(
     Ok(flattened.remove(index))
 }
 
-fn submit_with_altool(project: &ProjectContext, receipt: &BuildReceipt, wait: bool) -> Result<()> {
-    ensure_submit_app_record(project, receipt)?;
-    run_altool_command(project, receipt, true, false)?;
-
-    let mut command = build_altool_command(project, receipt, false, wait)?;
-    run_command(&mut command)
-}
-
-fn build_altool_command(
-    project: &ProjectContext,
-    receipt: &BuildReceipt,
-    validate_only: bool,
-    wait: bool,
-) -> Result<Command> {
-    let auth = crate::apple::auth::resolve_submit_auth(project)?;
-    let mut command = Command::new("xcrun");
-    command.arg("altool");
-    command.arg(if validate_only {
-        "--validate-app"
-    } else {
-        "--upload-package"
-    });
-    command.arg(&receipt.artifact_path);
-    if wait && !validate_only {
-        command.arg("--wait");
-    }
-
-    match auth {
-        crate::apple::auth::SubmitAuth::ApiKey {
-            key_id,
-            issuer_id,
-            api_key_path,
-        } => {
-            let file_name = api_key_path
-                .file_name()
-                .context("API key path is missing a file name")?;
-            let private_keys_dir = project.app.global_paths.cache_dir.join("private_keys");
-            ensure_dir(&private_keys_dir)?;
-            copy_file(&api_key_path, &private_keys_dir.join(file_name))?;
-            command.arg("--api-key").arg(key_id);
-            command.arg("--api-issuer").arg(issuer_id);
-            command.env("API_PRIVATE_KEYS_DIR", &private_keys_dir);
-        }
-        crate::apple::auth::SubmitAuth::AppleId {
-            apple_id,
-            password,
-            team_id: _,
-            provider_id,
-        } => {
-            command.arg("--username").arg(apple_id);
-            command.arg("--password").arg("@env:ORBIT_ALTOOL_PASSWORD");
-            command.env("ORBIT_ALTOOL_PASSWORD", password);
-            if let Some(provider_id) = provider_id {
-                command.arg("--provider-public-id").arg(provider_id);
-            }
-        }
-    }
-
-    Ok(command)
-}
-
-fn run_altool_command(
-    project: &ProjectContext,
-    receipt: &BuildReceipt,
-    validate_only: bool,
-    wait: bool,
-) -> Result<()> {
-    let mut command = build_altool_command(project, receipt, validate_only, wait)?;
-    run_command(&mut command)
-}
-
-fn submit_with_notarytool(
-    project: &ProjectContext,
-    receipt: &BuildReceipt,
-    wait: bool,
-) -> Result<()> {
-    let auth = crate::apple::auth::resolve_submit_auth(project)?;
-    let mut command = Command::new("xcrun");
-    command.arg("notarytool");
-    command.arg("submit");
-    command.arg(&receipt.artifact_path);
-    command.arg("--output-format").arg("json");
-    if wait {
-        command.arg("--wait");
-    }
-
-    match auth {
-        crate::apple::auth::SubmitAuth::ApiKey {
-            key_id,
-            issuer_id,
-            api_key_path,
-        } => {
-            command.arg("--key").arg(api_key_path);
-            command.arg("--key-id").arg(key_id);
-            command.arg("--issuer").arg(issuer_id);
-        }
-        crate::apple::auth::SubmitAuth::AppleId {
-            apple_id,
-            password,
-            team_id,
-            provider_id: _,
-        } => {
-            let team_id = team_id.context(
-                "notarization with Apple ID requires a configured Apple Developer team ID",
-            )?;
-            command.arg("--apple-id").arg(apple_id);
-            command.arg("--password").arg("@env:ORBIT_NOTARY_PASSWORD");
-            command.arg("--team-id").arg(team_id);
-            command.env("ORBIT_NOTARY_PASSWORD", password);
-        }
-    }
-
-    let output = command_output(&mut command)?;
-    if wait {
-        let response: NotarySubmitResponse =
-            serde_json::from_str(&output).context("failed to parse notarytool submit response")?;
-        if !response.status.eq_ignore_ascii_case("accepted")
-            && !response.status.eq_ignore_ascii_case("success")
-        {
-            bail!(
-                "notarytool completed with status `{}` for submission {}",
-                response.status,
-                response.id
-            );
-        }
-        let mut staple = Command::new("xcrun");
-        staple.arg("stapler");
-        staple.arg("staple");
-        staple.arg(&receipt.artifact_path);
-        run_command(&mut staple)?;
-    }
-    Ok(())
-}
-
-fn ensure_submit_app_record(project: &ProjectContext, receipt: &BuildReceipt) -> Result<()> {
-    if !matches!(
-        receipt.distribution,
-        DistributionKind::AppStore | DistributionKind::MacAppStore
-    ) {
-        return Ok(());
-    }
-    let Some(api_key_auth) = crate::apple::auth::resolve_api_key_auth(&project.app)? else {
-        return Ok(());
-    };
-    let client = crate::apple::asc_api::AscClient::new(api_key_auth)?;
-    let bundle_id = client
-        .find_bundle_id(&receipt.bundle_id)?
-        .with_context(|| {
-            format!(
-                "missing App Store Connect bundle ID for `{}`",
-                receipt.bundle_id
-            )
-        })?;
-    if client.find_app_by_bundle_id(&bundle_id.data.id)?.is_some() {
-        return Ok(());
-    }
-
-    let app_name = receipt.target.clone();
-    let sku = app_store_sku(&receipt.bundle_id);
-    let _ = client.create_app_record(&app_name, &sku, "en-US", &bundle_id.data.id)?;
-    Ok(())
-}
-
-fn app_store_sku(bundle_id: &str) -> String {
-    let mut sku = bundle_id
-        .chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() {
-                character.to_ascii_uppercase()
-            } else {
-                '-'
-            }
-        })
-        .collect::<String>();
-    sku.truncate(255);
-    sku
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct NotarySubmitResponse {
-    id: String,
-    status: String,
-}
-
 fn compile_swift_packages(
     project: &ProjectContext,
     toolchain: &Toolchain,
@@ -3622,6 +3430,13 @@ mod tests {
                 .and_then(Value::as_string),
             Some("en")
         );
+        assert_eq!(
+            dict.get("DTPlatformName").and_then(Value::as_string),
+            Some("iphoneos")
+        );
+        assert!(dict.contains_key("DTSDKName"));
+        assert!(dict.contains_key("DTXcode"));
+        assert!(dict.contains_key("DTXcodeBuild"));
         assert!(!dict.contains_key("UIApplicationSceneManifest"));
         assert_eq!(
             dict.get("UIRequiredDeviceCapabilities")
@@ -3761,6 +3576,16 @@ mod tests {
             dict.get("UIStatusBarStyle").and_then(Value::as_string),
             Some("UIStatusBarStyleLightContent")
         );
+        assert_eq!(
+            dict.get("DTPlatformName").and_then(Value::as_string),
+            Some("iphoneos")
+        );
+        assert!(dict.contains_key("BuildMachineOSBuild"));
+        assert!(dict.contains_key("DTPlatformBuild"));
+        assert!(dict.contains_key("DTSDKBuild"));
+        assert!(dict.contains_key("DTSDKName"));
+        assert!(dict.contains_key("DTXcode"));
+        assert!(dict.contains_key("DTXcodeBuild"));
     }
 
     #[test]

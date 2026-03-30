@@ -13,30 +13,22 @@ use crate::apple::asc_api::{
     AscClient, BundleIdAttributes, CapabilityOption, CapabilitySetting, Resource,
     remote_capabilities_from_included,
 };
-use crate::apple::auth::{
-    EnsureUserAuthRequest, ensure_portal_authenticated, resolve_api_key_auth,
-    resolve_user_auth_metadata,
-};
+use crate::apple::auth::{resolve_api_key_auth, resolve_user_auth_metadata};
 use crate::apple::capabilities::{
     CapabilityRelationships, CapabilitySyncOptions, CapabilityUpdate, RemoteCapability,
-    capability_sync_plan_from_entitlements, capability_sync_plan_from_entitlements_with_options,
-};
-use crate::apple::portal::{
-    PortalAppId, PortalAuthKey, PortalClient, PortalDeviceClass, PortalProfilePlatform,
-    PortalProvisioningProfile,
+    capability_sync_plan_from_dictionary_with_options, capability_sync_plan_from_entitlements,
 };
 use crate::apple::provisioning::{
-    ProvisioningCapabilityRelationships, ProvisioningCapabilityUpdate, ProvisioningClient,
+    ProvisioningBundleId, ProvisioningCapabilityRelationships, ProvisioningCapabilityUpdate,
+    ProvisioningClient, ProvisioningDevice, ProvisioningProfile,
 };
 use crate::apple::runtime::{
     apple_platform_from_cli, build_target_for_platform, distribution_from_cli,
     profile_for_distribution, resolve_build_distribution, resolve_platform,
 };
-use crate::cli::{SigningExportArgs, SigningExportPushArgs, SigningImportArgs, SigningSyncArgs};
+use crate::cli::{SigningExportArgs, SigningImportArgs, SigningSyncArgs};
 use crate::context::ProjectContext;
-use crate::manifest::{
-    ApplePlatform, DistributionKind, ProfileManifest, PushCredentialKind, TargetManifest,
-};
+use crate::manifest::{ApplePlatform, DistributionKind, ProfileManifest, TargetManifest};
 use crate::util::{
     CliSpinner, copy_file, ensure_dir, ensure_parent_dir, prompt_confirm, prompt_multi_select,
     prompt_password, prompt_select, read_json_file_if_exists, run_command_capture, write_json_file,
@@ -85,11 +77,11 @@ const ASC_OPTION_DATA_PROTECTION_PROTECTED_UNLESS_OPEN: &str = "PROTECTED_UNLESS
 const ASC_OPTION_DATA_PROTECTION_PROTECTED_UNTIL_FIRST_USER_AUTH: &str =
     "PROTECTED_UNTIL_FIRST_USER_AUTH";
 const ASC_OPTION_PUSH_BROADCAST: &str = "PUSH_NOTIFICATION_FEATURE_BROADCAST";
-const ORBIT_PUSH_AUTH_KEY_NAME: &str = "@orbit/apns";
 const APP_IDENTIFIER_PREFIX_PLACEHOLDER: &str = "$(AppIdentifierPrefix)";
 const TEAM_IDENTIFIER_PREFIX_PLACEHOLDER: &str = "$(TeamIdentifierPrefix)";
 const MANAGED_SIGNING_ENTITLEMENTS: &[&str] = &[
     "application-identifier",
+    "aps-environment",
     "com.apple.developer.team-identifier",
     "com.apple.developer.ubiquity-kvstore-identifier",
     "get-task-allow",
@@ -107,10 +99,6 @@ const MANAGED_SIGNING_ENTITLEMENTS: &[&str] = &[
 struct SigningState {
     certificates: Vec<ManagedCertificate>,
     profiles: Vec<ManagedProfile>,
-    #[serde(default)]
-    push_keys: Vec<ManagedPushKey>,
-    #[serde(default)]
-    push_certificates: Vec<ManagedPushCertificate>,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize, Default)]
@@ -167,30 +155,8 @@ fn capability_sync_success_message(
     }
 }
 
-fn push_setup_success_message(
-    target: &TargetManifest,
-    credential: &Option<PushCredentialMaterial>,
-) -> String {
-    match credential {
-        Some(PushCredentialMaterial::AuthKey { key_id, .. }) => {
-            format!(
-                "Push auth key ready for target `{}`: {key_id}.",
-                target.name
-            )
-        }
-        Some(PushCredentialMaterial::Certificate {
-            certificate_id,
-            environment,
-            ..
-        }) => format!(
-            "Push certificate ready for target `{}` ({environment}): {certificate_id}.",
-            target.name
-        ),
-        None => format!(
-            "No push credential changes were needed for target `{}`.",
-            target.name
-        ),
-    }
+fn certificate_has_local_signing_material(certificate: &ManagedCertificate) -> bool {
+    certificate.system_signing_identity.is_some() || certificate.p12_path.exists()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -201,6 +167,10 @@ struct ManagedCertificate {
     #[serde(default)]
     origin: CertificateOrigin,
     display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    system_keychain_path: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    system_signing_identity: Option<String>,
     private_key_path: PathBuf,
     certificate_der_path: PathBuf,
     p12_path: PathBuf,
@@ -218,27 +188,19 @@ struct ManagedProfile {
     device_ids: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ManagedPushKey {
+#[derive(Debug, Clone)]
+struct ManagedBundleId {
     id: String,
-    name: String,
-    path: PathBuf,
+    identifier: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ManagedPushCertificate {
-    id: String,
-    certificate_type: String,
-    serial_number: String,
-    bundle_id: String,
-    environment: PushEnvironment,
-    #[serde(default)]
-    origin: CertificateOrigin,
-    display_name: Option<String>,
-    private_key_path: PathBuf,
-    certificate_der_path: PathBuf,
-    p12_path: PathBuf,
-    p12_password_account: String,
+impl From<&ProvisioningBundleId> for ManagedBundleId {
+    fn from(value: &ProvisioningBundleId) -> Self {
+        Self {
+            id: value.id.clone(),
+            identifier: value.identifier.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -249,13 +211,19 @@ struct AscCapabilityMutation {
     delete: bool,
 }
 
+struct DeviceSelectionContext<'a> {
+    state: &'a SigningState,
+    bundle_identifier: &'a str,
+    profile_type: &'a str,
+    certificate_id: &'a str,
+}
+
 #[derive(Debug, Clone)]
 pub struct SigningMaterial {
     pub signing_identity: String,
     pub keychain_path: PathBuf,
     pub provisioning_profile_path: PathBuf,
     pub entitlements_path: Option<PathBuf>,
-    pub push_credential: Option<PushCredentialMaterial>,
 }
 
 #[derive(Debug, Clone)]
@@ -265,17 +233,9 @@ pub struct PackageSigningMaterial {
 }
 
 #[derive(Debug, Clone)]
-pub enum PushCredentialMaterial {
-    AuthKey {
-        key_id: String,
-        key_path: PathBuf,
-    },
-    Certificate {
-        certificate_id: String,
-        p12_path: PathBuf,
-        p12_password_account: String,
-        environment: PushEnvironment,
-    },
+struct SigningIdentity {
+    hash: String,
+    keychain_path: PathBuf,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
@@ -299,15 +259,12 @@ struct TeamSigningPaths {
     state_path: PathBuf,
     certificates_dir: PathBuf,
     profiles_dir: PathBuf,
-    push_keys_dir: PathBuf,
-    push_certificates_dir: PathBuf,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct LocalSigningCleanSummary {
     pub removed_profiles: usize,
     pub removed_certificates: usize,
-    pub removed_push_certificates: usize,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -316,9 +273,7 @@ pub struct RemoteSigningCleanSummary {
     pub removed_profiles: usize,
     pub removed_app_groups: usize,
     pub removed_merchants: usize,
-    pub removed_certificates: usize,
-    pub removed_push_certificates: usize,
-    pub skipped_cloud_containers: Vec<String>,
+    pub removed_cloud_containers: usize,
 }
 
 pub fn sync_signing(project: &ProjectContext, args: &SigningSyncArgs) -> Result<()> {
@@ -337,16 +292,7 @@ pub fn sync_signing(project: &ProjectContext, args: &SigningSyncArgs) -> Result<
         return Ok(());
     }
 
-    let device_udids = if matches!(
-        profile.distribution,
-        DistributionKind::Development | DistributionKind::AdHoc
-    ) {
-        Some(select_device_udids(project, distribution, platform)?)
-    } else {
-        None
-    };
-
-    let material = prepare_signing(project, target, platform, &profile, device_udids)?;
+    let material = prepare_signing(project, target, platform, &profile, None)?;
     println!("identity: {}", material.signing_identity);
     println!("keychain: {}", material.keychain_path.display());
     println!(
@@ -355,25 +301,6 @@ pub fn sync_signing(project: &ProjectContext, args: &SigningSyncArgs) -> Result<
     );
     if let Some(entitlements_path) = &material.entitlements_path {
         println!("entitlements: {}", entitlements_path.display());
-    }
-    if let Some(push_credential) = &material.push_credential {
-        match push_credential {
-            PushCredentialMaterial::AuthKey { key_id, key_path } => {
-                println!("push_auth_key_id: {key_id}");
-                println!("push_auth_key: {}", key_path.display());
-            }
-            PushCredentialMaterial::Certificate {
-                certificate_id,
-                p12_path,
-                p12_password_account,
-                environment,
-            } => {
-                println!("push_certificate_id: {certificate_id}");
-                println!("push_certificate_environment: {environment}");
-                println!("push_certificate: {}", p12_path.display());
-                println!("push_certificate_password_account: {p12_password_account}");
-            }
-        }
     }
     Ok(())
 }
@@ -456,68 +383,6 @@ pub fn export_signing_credentials(
     Ok(())
 }
 
-pub fn export_push_auth_key(project: &ProjectContext, args: &SigningExportPushArgs) -> Result<()> {
-    let team_id = resolve_local_team_id(project)?;
-    let state = load_state(project, &team_id)?;
-    let local_keys = state
-        .push_keys
-        .iter()
-        .filter(|key| key.path.exists())
-        .collect::<Vec<_>>();
-    let key = match local_keys.as_slice() {
-        [] => bail!(
-            "no Orbit-managed APNs auth key was found under Apple team `{team_id}`; run `orbit apple signing sync` for a push-enabled target first"
-        ),
-        [key] => *key,
-        many => many
-            .iter()
-            .find(|candidate| candidate.name == ORBIT_PUSH_AUTH_KEY_NAME)
-            .copied()
-            .or_else(|| {
-                if project.app.interactive {
-                    let labels = many
-                        .iter()
-                        .map(|candidate| {
-                            format!(
-                                "{} ({}) [{}]",
-                                candidate.id,
-                                candidate.name,
-                                candidate.path.display()
-                            )
-                        })
-                        .collect::<Vec<_>>();
-                    prompt_select("Select an APNs auth key to export", &labels)
-                        .ok()
-                        .and_then(|index| many.get(index).copied())
-                } else {
-                    None
-                }
-            })
-            .context(
-                "multiple Orbit-managed APNs auth keys were found locally; remove stale entries or rerun the command interactively to select one",
-            )?,
-    };
-
-    let output_path = match (&args.output, &args.output_dir) {
-        (Some(path), None) => path.clone(),
-        (None, Some(directory)) => directory.join(format!("AuthKey_{}.p8", key.id)),
-        (None, None) => project
-            .project_paths
-            .artifacts_dir
-            .join("apns-export")
-            .join(format!("AuthKey_{}.p8", key.id)),
-        (Some(_), Some(_)) => unreachable!("clap enforces conflicting args"),
-    };
-    ensure_parent_dir(&output_path)?;
-    copy_file(&key.path, &output_path)?;
-
-    println!("team_id: {team_id}");
-    println!("key_id: {}", key.id);
-    println!("name: {}", key.name);
-    println!("p8: {}", output_path.display());
-    Ok(())
-}
-
 pub fn import_signing_credentials(
     project: &ProjectContext,
     args: &SigningImportArgs,
@@ -570,6 +435,8 @@ pub fn import_signing_credentials(
         serial_number: serial_number.clone(),
         origin: CertificateOrigin::Imported,
         display_name,
+        system_keychain_path: None,
+        system_signing_identity: None,
         private_key_path,
         certificate_der_path,
         p12_path: imported_p12_path,
@@ -621,21 +488,9 @@ pub fn prepare_signing(
         return prepare_signing_with_api_key(project, target, platform, profile, device_udids);
     }
 
-    let auth = ensure_portal_authenticated(
-        &project.app,
-        EnsureUserAuthRequest {
-            team_id: project.resolved_manifest.team_id.clone(),
-            provider_id: project.resolved_manifest.provider_id.clone(),
-            prompt_for_missing: project.app.interactive,
-            ..Default::default()
-        },
-    )?;
-    let team_id = auth.user.team_id.clone().context(
-        "signing requires an Apple Developer team selection; log in again and choose a team if prompted",
-    )?;
-    let mut client = PortalClient::from_session(&auth.session, team_id.clone())?;
-    let provisioning = ProvisioningClient::from_session(&auth.session, team_id)?;
-    let mut state = load_state(project, client.team_id())?;
+    let team_id = resolve_local_team_id(project)?;
+    let mut provisioning = ProvisioningClient::authenticate(&project.app, team_id.clone())?;
+    let mut state = load_state(project, &team_id)?;
 
     if let Some(host_target) = host_app_for_app_clip(project, target)? {
         let _ = signing_progress_step(
@@ -643,10 +498,10 @@ pub fn prepare_signing(
                 "Ensuring host bundle identifier `{}` for target `{}`",
                 host_target.bundle_id, target.name
             ),
-            |bundle_id: &PortalAppId| {
+            |bundle_id: &ProvisioningBundleId| {
                 format!("Host bundle identifier ready: {}.", bundle_id.identifier)
             },
-            || ensure_bundle_id(&mut client, project, host_target, platform),
+            || ensure_bundle_id_with_developer_services(&mut provisioning, project, host_target),
         )?;
     }
 
@@ -655,32 +510,22 @@ pub fn prepare_signing(
             "Ensuring bundle identifier `{}` for target `{}`",
             target.bundle_id, target.name
         ),
-        |bundle_id: &PortalAppId| {
+        |bundle_id: &ProvisioningBundleId| {
             format!(
                 "Bundle identifier ready for target `{}`: {}.",
                 target.name, bundle_id.identifier
             )
         },
-        || ensure_bundle_id(&mut client, project, target, platform),
+        || ensure_bundle_id_with_developer_services(&mut provisioning, project, target),
     )?;
     let _ = signing_progress_step(
         format!("Syncing capabilities for `{}`", bundle_id.identifier),
         |outcome: &CapabilitySyncOutcome| {
             capability_sync_success_message(&bundle_id.identifier, *outcome)
         },
-        || {
-            sync_capabilities(
-                &mut client,
-                &provisioning,
-                project,
-                target,
-                platform,
-                &bundle_id,
-            )
-        },
+        || sync_capabilities(&mut provisioning, project, target, &bundle_id),
     )?;
 
-    let certificate_type = certificate_type(platform, profile)?;
     let certificate = signing_progress_step(
         format!("Ensuring signing certificate for target `{}`", target.name),
         |certificate: &ManagedCertificate| {
@@ -689,14 +534,33 @@ pub fn prepare_signing(
                 target.name, certificate.serial_number
             )
         },
-        || ensure_certificate(&mut client, project, &mut state, certificate_type),
+        || {
+            ensure_certificate_for_apple_id(
+                &mut provisioning,
+                project,
+                &mut state,
+                platform,
+                profile,
+            )
+        },
     )?;
-    let profile_type = profile_type(platform, profile)?;
+    let profile_type = asc_profile_type(platform, profile)?;
     let device_ids = if matches!(
         profile.distribution,
         DistributionKind::Development | DistributionKind::AdHoc
     ) {
-        let selected_udids = device_udids.unwrap_or_default();
+        let selected_udids = resolve_requested_device_udids(
+            project,
+            profile.distribution,
+            platform,
+            DeviceSelectionContext {
+                state: &state,
+                bundle_identifier: &bundle_id.identifier,
+                profile_type,
+                certificate_id: &certificate.id,
+            },
+            device_udids,
+        )?;
         signing_progress_step(
             format!(
                 "Resolving Apple devices for provisioning profile for target `{}`",
@@ -709,7 +573,14 @@ pub fn prepare_signing(
                     target.name
                 )
             },
-            || resolve_device_ids(project, &mut client, platform, &selected_udids),
+            || {
+                resolve_device_ids_with_developer_services(
+                    project,
+                    &mut provisioning,
+                    platform,
+                    &selected_udids,
+                )
+            },
         )?
     } else {
         Vec::new()
@@ -723,53 +594,29 @@ pub fn prepare_signing(
             )
         },
         || {
-            ensure_profile(
-                &mut client,
+            ensure_profile_with_developer_services(
+                &mut provisioning,
                 project,
                 &mut state,
-                &PortalProfileRequest {
-                    platform: portal_profile_platform(platform),
-                    profile_type,
-                    bundle_id: &bundle_id,
-                    certificate: &certificate,
-                    device_ids: &device_ids,
-                },
+                &ManagedBundleId::from(&bundle_id),
+                profile_type,
+                &certificate,
+                &device_ids,
             )
         },
     )?;
-    let push_credential = if push_configuration(project, target)?.is_some() {
-        signing_progress_step(
-            format!("Ensuring push credentials for target `{}`", target.name),
-            |credential: &Option<PushCredentialMaterial>| {
-                push_setup_success_message(target, credential)
-            },
-            || {
-                ensure_push_setup(
-                    &mut client,
-                    project,
-                    &mut state,
-                    target,
-                    platform,
-                    &bundle_id,
-                )
-            },
-        )?
-    } else {
-        None
-    };
-
     let signing_identity = signing_progress_step(
         format!(
             "Importing signing certificate into Orbit keychain for target `{}`",
             target.name
         ),
-        |identity: &String| {
+        |identity: &SigningIdentity| {
             format!(
                 "Signing identity ready for target `{}`: {}.",
-                target.name, identity
+                target.name, identity.hash
             )
         },
-        || import_certificate_into_keychain(project, &certificate),
+        || resolve_signing_identity(project, &certificate),
     )?;
     let entitlements_path = signing_progress_step(
         format!("Preparing entitlements for target `{}`", target.name),
@@ -786,14 +633,13 @@ pub fn prepare_signing(
         },
         || materialize_signing_entitlements(project, target, &provisioning_profile.path),
     )?;
-    save_state(project, client.team_id(), &state)?;
+    save_state(project, &team_id, &state)?;
 
     Ok(SigningMaterial {
-        signing_identity,
-        keychain_path: project.app.global_paths.keychain_path.clone(),
+        signing_identity: signing_identity.hash,
+        keychain_path: signing_identity.keychain_path,
         provisioning_profile_path: provisioning_profile.path,
         entitlements_path,
-        push_credential,
     })
 }
 
@@ -805,20 +651,9 @@ pub fn prepare_package_signing(
         return prepare_package_signing_with_api_key(project, profile);
     }
 
-    let auth = ensure_portal_authenticated(
-        &project.app,
-        EnsureUserAuthRequest {
-            team_id: project.resolved_manifest.team_id.clone(),
-            provider_id: project.resolved_manifest.provider_id.clone(),
-            prompt_for_missing: project.app.interactive,
-            ..Default::default()
-        },
-    )?;
-    let team_id = auth.user.team_id.clone().context(
-        "installer signing requires an Apple Developer team selection; log in again and choose a team if prompted",
-    )?;
-    let mut client = PortalClient::from_session(&auth.session, team_id)?;
-    let mut state = load_state(project, client.team_id())?;
+    let team_id = resolve_local_team_id(project)?;
+    let mut provisioning = ProvisioningClient::authenticate(&project.app, team_id.clone())?;
+    let mut state = load_state(project, &team_id)?;
     let certificate_type = installer_certificate_type(profile)?;
     let certificate = signing_progress_step(
         "Ensuring installer signing certificate",
@@ -828,17 +663,32 @@ pub fn prepare_package_signing(
                 certificate.serial_number
             )
         },
-        || ensure_certificate(&mut client, project, &mut state, certificate_type),
+        || {
+            ensure_certificate_with_developer_services(
+                &mut provisioning,
+                project,
+                &mut state,
+                certificate_type,
+                developer_services_installer_certificate_type(profile),
+            )?
+            .with_context(|| {
+                format!(
+                    "Developer Services does not support installer certificate type `{certificate_type}`"
+                )
+            })
+        },
     )?;
     let signing_identity = signing_progress_step(
         "Importing installer signing certificate into Orbit keychain",
-        |identity: &String| format!("Installer signing identity ready: {identity}."),
-        || import_certificate_into_keychain(project, &certificate),
+        |identity: &SigningIdentity| {
+            format!("Installer signing identity ready: {}.", identity.hash)
+        },
+        || resolve_signing_identity(project, &certificate),
     )?;
-    save_state(project, client.team_id(), &state)?;
+    save_state(project, &team_id, &state)?;
     Ok(PackageSigningMaterial {
-        signing_identity,
-        keychain_path: project.app.global_paths.keychain_path.clone(),
+        signing_identity: signing_identity.hash,
+        keychain_path: signing_identity.keychain_path,
     })
 }
 
@@ -849,7 +699,6 @@ fn prepare_signing_with_api_key(
     profile: &ProfileManifest,
     device_udids: Option<Vec<String>>,
 ) -> Result<SigningMaterial> {
-    validate_push_setup_with_api_key(project, target)?;
     let client = AscClient::new(
         resolve_api_key_auth(&project.app)?
             .context("App Store Connect API key auth is not configured")?,
@@ -913,7 +762,18 @@ fn prepare_signing_with_api_key(
         profile.distribution,
         DistributionKind::Development | DistributionKind::AdHoc
     ) {
-        let selected_udids = device_udids.unwrap_or_default();
+        let selected_udids = resolve_requested_device_udids(
+            project,
+            profile.distribution,
+            platform,
+            DeviceSelectionContext {
+                state: &state,
+                bundle_identifier: &bundle_id.attributes.identifier,
+                profile_type,
+                certificate_id: &certificate.id,
+            },
+            device_udids,
+        )?;
         signing_progress_step(
             format!(
                 "Resolving Apple devices for provisioning profile for target `{}`",
@@ -957,13 +817,13 @@ fn prepare_signing_with_api_key(
             "Importing signing certificate into Orbit keychain for target `{}`",
             target.name
         ),
-        |identity: &String| {
+        |identity: &SigningIdentity| {
             format!(
                 "Signing identity ready for target `{}`: {}.",
-                target.name, identity
+                target.name, identity.hash
             )
         },
-        || import_certificate_into_keychain(project, &certificate),
+        || resolve_signing_identity(project, &certificate),
     )?;
     let entitlements_path = signing_progress_step(
         format!("Preparing entitlements for target `{}`", target.name),
@@ -983,11 +843,10 @@ fn prepare_signing_with_api_key(
     save_state(project, &team_id, &state)?;
 
     Ok(SigningMaterial {
-        signing_identity,
-        keychain_path: project.app.global_paths.keychain_path.clone(),
+        signing_identity: signing_identity.hash,
+        keychain_path: signing_identity.keychain_path,
         provisioning_profile_path: provisioning_profile.path,
         entitlements_path,
-        push_credential: None,
     })
 }
 
@@ -1014,14 +873,419 @@ fn prepare_package_signing_with_api_key(
     )?;
     let signing_identity = signing_progress_step(
         "Importing installer signing certificate into Orbit keychain",
-        |identity: &String| format!("Installer signing identity ready: {identity}."),
-        || import_certificate_into_keychain(project, &certificate),
+        |identity: &SigningIdentity| {
+            format!("Installer signing identity ready: {}.", identity.hash)
+        },
+        || resolve_signing_identity(project, &certificate),
     )?;
     save_state(project, &team_id, &state)?;
     Ok(PackageSigningMaterial {
-        signing_identity,
-        keychain_path: project.app.global_paths.keychain_path.clone(),
+        signing_identity: signing_identity.hash,
+        keychain_path: signing_identity.keychain_path,
     })
+}
+
+fn developer_services_certificate_type(
+    platform: ApplePlatform,
+    profile: &ProfileManifest,
+) -> Result<Option<&'static str>> {
+    match (platform, profile.distribution) {
+        (
+            ApplePlatform::Ios
+            | ApplePlatform::Tvos
+            | ApplePlatform::Visionos
+            | ApplePlatform::Watchos
+            | ApplePlatform::Macos,
+            DistributionKind::Development,
+        ) => Ok(Some("DEVELOPMENT")),
+        (
+            ApplePlatform::Ios
+            | ApplePlatform::Tvos
+            | ApplePlatform::Visionos
+            | ApplePlatform::Watchos
+            | ApplePlatform::Macos,
+            DistributionKind::AdHoc | DistributionKind::AppStore | DistributionKind::MacAppStore,
+        ) => Ok(Some("DISTRIBUTION")),
+        (ApplePlatform::Macos, DistributionKind::DeveloperId) => {
+            Ok(Some("DEVELOPER_ID_APPLICATION"))
+        }
+        _ => bail!(
+            "signing is not implemented for {platform} with {:?}",
+            profile.distribution
+        ),
+    }
+}
+
+fn ensure_certificate_for_apple_id(
+    provisioning: &mut ProvisioningClient,
+    project: &ProjectContext,
+    state: &mut SigningState,
+    platform: ApplePlatform,
+    profile: &ProfileManifest,
+) -> Result<ManagedCertificate> {
+    let certificate_type = certificate_type(platform, profile)?;
+    ensure_certificate_with_developer_services(
+        provisioning,
+        project,
+        state,
+        certificate_type,
+        developer_services_certificate_type(platform, profile)?,
+    )?
+    .with_context(|| {
+        format!("Developer Services does not support certificate type `{certificate_type}`")
+    })
+}
+
+fn ensure_certificate_with_developer_services(
+    provisioning: &mut ProvisioningClient,
+    project: &ProjectContext,
+    state: &mut SigningState,
+    certificate_type: &str,
+    developer_services_certificate_type: Option<&str>,
+) -> Result<Option<ManagedCertificate>> {
+    let Some(developer_services_certificate_type) = developer_services_certificate_type else {
+        return Ok(None);
+    };
+    let remote_certificates =
+        provisioning.list_certificates(developer_services_certificate_type)?;
+    for remote in &remote_certificates {
+        if let Some(local) = state.certificates.iter_mut().find(|certificate| {
+            if certificate.certificate_type != certificate_type
+                || certificate.system_signing_identity.is_some()
+                || !certificate.p12_path.exists()
+            {
+                return false;
+            }
+            if certificate.id == remote.id {
+                return true;
+            }
+            remote
+                .serial_number
+                .as_deref()
+                .is_some_and(|serial| certificate.serial_number.eq_ignore_ascii_case(serial))
+        }) {
+            if local.id != remote.id {
+                local.id = remote.id.clone();
+            }
+            if local.display_name.is_none() {
+                local.display_name = remote.display_name.clone();
+            }
+            return Ok(Some(local.clone()));
+        }
+    }
+
+    let paths = team_signing_paths(project, &resolve_local_team_id(project)?);
+    ensure_dir(&paths.certificates_dir)?;
+    for remote in &remote_certificates {
+        let Some(serial_number) = remote.serial_number.as_deref() else {
+            continue;
+        };
+        if let Some(certificate) = recover_orphaned_certificate(
+            &paths,
+            state,
+            certificate_type,
+            &remote.id,
+            serial_number,
+            remote.display_name.as_deref(),
+        )? {
+            return Ok(Some(certificate));
+        }
+    }
+
+    for remote in &remote_certificates {
+        if let Some(local) = state.certificates.iter_mut().find(|certificate| {
+            if certificate.certificate_type != certificate_type
+                || certificate.system_signing_identity.is_none()
+                || !certificate_has_local_signing_material(certificate)
+            {
+                return false;
+            }
+            if certificate.id == remote.id {
+                return true;
+            }
+            remote
+                .serial_number
+                .as_deref()
+                .is_some_and(|serial| certificate.serial_number.eq_ignore_ascii_case(serial))
+        }) {
+            if local.id != remote.id {
+                local.id = remote.id.clone();
+            }
+            if local.display_name.is_none() {
+                local.display_name = remote.display_name.clone();
+            }
+            return Ok(Some(local.clone()));
+        }
+    }
+
+    for remote in &remote_certificates {
+        let Some(serial_number) = remote.serial_number.as_deref() else {
+            continue;
+        };
+        if let Some(identity) =
+            recover_system_keychain_identity(serial_number, remote.display_name.as_deref())?
+        {
+            let certificate = ManagedCertificate {
+                id: remote.id.clone(),
+                certificate_type: certificate_type.to_owned(),
+                serial_number: serial_number.to_owned(),
+                origin: CertificateOrigin::Generated,
+                display_name: remote.display_name.clone(),
+                system_keychain_path: Some(identity.keychain_path),
+                system_signing_identity: Some(identity.hash),
+                private_key_path: paths
+                    .certificates_dir
+                    .join(format!("{serial_number}.managed.key")),
+                certificate_der_path: paths
+                    .certificates_dir
+                    .join(format!("{serial_number}.managed.cer")),
+                p12_path: paths
+                    .certificates_dir
+                    .join(format!("{serial_number}.managed.p12")),
+                p12_password_account: String::new(),
+            };
+            state.certificates.retain(|candidate| {
+                !candidate.serial_number.eq_ignore_ascii_case(serial_number)
+                    && candidate.id != remote.id
+            });
+            state.certificates.push(certificate.clone());
+            return Ok(Some(certificate));
+        }
+    }
+
+    let slug = crate::util::timestamp_slug();
+    let private_key_path = paths.certificates_dir.join(format!("{slug}.key.pem"));
+    let csr_path = paths.certificates_dir.join(format!("{slug}.csr.pem"));
+    let certificate_der_path = paths.certificates_dir.join(format!("{slug}.cer"));
+    let p12_path = paths.certificates_dir.join(format!("{slug}.p12"));
+
+    let mut openssl_req = Command::new("openssl");
+    openssl_req.args([
+        "req",
+        "-new",
+        "-newkey",
+        "rsa:2048",
+        "-nodes",
+        "-keyout",
+        private_key_path
+            .to_str()
+            .context("private key path contains invalid UTF-8")?,
+        "-subj",
+        &format!("/CN=Orbit {slug}"),
+        "-out",
+        csr_path
+            .to_str()
+            .context("CSR path contains invalid UTF-8")?,
+    ]);
+    crate::util::run_command(&mut openssl_req)?;
+
+    let csr_pem = fs::read_to_string(&csr_path)
+        .with_context(|| format!("failed to read {}", csr_path.display()))?;
+    let (machine_id, machine_name) =
+        developer_services_machine_attributes(developer_services_certificate_type);
+    let remote = provisioning.create_certificate(
+        developer_services_certificate_type,
+        &csr_pem,
+        machine_id.as_deref(),
+        machine_name.as_deref(),
+    )?;
+    let certificate_content = remote
+        .certificate_content
+        .as_deref()
+        .context("Developer Services did not return the created certificate content")?;
+    let certificate_bytes = base64::engine::general_purpose::STANDARD
+        .decode(certificate_content)
+        .context("failed to decode Developer Services certificate content")?;
+    fs::write(&certificate_der_path, &certificate_bytes)
+        .with_context(|| format!("failed to write {}", certificate_der_path.display()))?;
+
+    let p12_password = uuid::Uuid::new_v4().to_string();
+    export_p12_from_der_certificate(
+        &private_key_path,
+        &certificate_der_path,
+        &p12_path,
+        &p12_password,
+    )?;
+
+    let serial_number = match remote.serial_number.clone() {
+        Some(serial_number) => serial_number,
+        None => read_certificate_serial(&certificate_der_path)?,
+    };
+    let password_account = format!("{}-{serial_number}", remote.id);
+    store_p12_password(&password_account, &p12_password)?;
+
+    let certificate = ManagedCertificate {
+        id: remote.id,
+        certificate_type: certificate_type.to_owned(),
+        serial_number,
+        origin: CertificateOrigin::Generated,
+        display_name: remote.display_name,
+        system_keychain_path: None,
+        system_signing_identity: None,
+        private_key_path,
+        certificate_der_path,
+        p12_path,
+        p12_password_account: password_account,
+    };
+    state.certificates.push(certificate.clone());
+    Ok(Some(certificate))
+}
+
+fn ensure_profile_with_developer_services(
+    provisioning: &mut ProvisioningClient,
+    project: &ProjectContext,
+    state: &mut SigningState,
+    bundle_id: &ManagedBundleId,
+    profile_type: &str,
+    certificate: &ManagedCertificate,
+    device_ids: &[String],
+) -> Result<ManagedProfile> {
+    if let Some(local) = state.profiles.iter().find(|profile| {
+        profile.profile_type == profile_type
+            && profile.bundle_id == bundle_id.identifier
+            && profile.path.exists()
+            && profile.certificate_ids == vec![certificate.id.clone()]
+            && canonical_ids(&profile.device_ids) == canonical_ids(device_ids)
+    }) {
+        return Ok(local.clone());
+    }
+
+    let remote_profiles = provisioning.list_profiles(Some(profile_type))?;
+    let mut remote_profile_ids = HashSet::new();
+    let mut stale_orbit_profiles = Vec::new();
+    for remote in remote_profiles {
+        remote_profile_ids.insert(remote.id.clone());
+        if remote.bundle_id_identifier.as_deref() != Some(bundle_id.identifier.as_str()) {
+            continue;
+        }
+
+        let matches_certificate = remote.certificate_ids.contains(&certificate.id);
+        let matches_devices = canonical_ids(&remote.device_ids) == canonical_ids(device_ids);
+        if matches_certificate && matches_devices {
+            let managed = persist_developer_services_profile(
+                project,
+                state,
+                profile_type,
+                &bundle_id.identifier,
+                certificate,
+                device_ids,
+                remote,
+            )?;
+            cleanup_stale_profile_state(
+                state,
+                &bundle_id.identifier,
+                profile_type,
+                &remote_profile_ids,
+            );
+            return Ok(managed);
+        }
+
+        if is_orbit_managed_profile(state, &remote.id, &bundle_id.identifier, profile_type) {
+            stale_orbit_profiles.push(remote.id);
+        }
+    }
+
+    for profile_id in stale_orbit_profiles {
+        provisioning
+            .delete_profile(&profile_id)
+            .with_context(|| format!("failed to repair provisioning profile `{profile_id}`"))?;
+        state.profiles.retain(|profile| profile.id != profile_id);
+    }
+    cleanup_stale_profile_state(
+        state,
+        &bundle_id.identifier,
+        profile_type,
+        &remote_profile_ids,
+    );
+
+    let remote = provisioning.create_profile(profile_type, &bundle_id.id)?;
+    persist_developer_services_profile(
+        project,
+        state,
+        profile_type,
+        &bundle_id.identifier,
+        certificate,
+        device_ids,
+        remote,
+    )
+}
+
+fn persist_developer_services_profile(
+    project: &ProjectContext,
+    state: &mut SigningState,
+    profile_type: &str,
+    bundle_identifier: &str,
+    certificate: &ManagedCertificate,
+    device_ids: &[String],
+    remote: ProvisioningProfile,
+) -> Result<ManagedProfile> {
+    let paths = team_signing_paths(project, &resolve_local_team_id(project)?);
+    ensure_dir(&paths.profiles_dir)?;
+    let profile_content = remote
+        .profile_content
+        .as_deref()
+        .context("Developer Services did not return the provisioning profile content")?;
+    let profile_bytes = base64::engine::general_purpose::STANDARD
+        .decode(profile_content)
+        .context("failed to decode Developer Services provisioning profile content")?;
+    let profile_path = paths
+        .profiles_dir
+        .join(format!("{}-{}.mobileprovision", remote.id, profile_type));
+    fs::write(&profile_path, profile_bytes)
+        .with_context(|| format!("failed to write {}", profile_path.display()))?;
+
+    state.profiles.retain(|profile| profile.id != remote.id);
+    let profile = ManagedProfile {
+        id: remote.id,
+        profile_type: profile_type.to_owned(),
+        bundle_id: bundle_identifier.to_owned(),
+        path: profile_path,
+        uuid: remote.uuid,
+        certificate_ids: vec![certificate.id.clone()],
+        device_ids: device_ids.to_vec(),
+    };
+    state.profiles.push(profile.clone());
+    Ok(profile)
+}
+
+fn resolve_device_ids_with_developer_services(
+    _project: &ProjectContext,
+    provisioning: &mut ProvisioningClient,
+    platform: ApplePlatform,
+    udids: &[String],
+) -> Result<Vec<String>> {
+    let devices = provisioning.list_devices()?;
+    if udids.is_empty() {
+        return Ok(devices
+            .into_iter()
+            .filter(|device| provisioning_device_matches_platform(device, platform))
+            .map(|device| device.id)
+            .collect());
+    }
+
+    let mut device_ids = Vec::new();
+    for udid in udids {
+        let device = devices
+            .iter()
+            .find(|device| {
+                device.udid.eq_ignore_ascii_case(udid)
+                    && provisioning_device_matches_platform(device, platform)
+            })
+            .with_context(|| {
+                format!(
+                    "device `{udid}` is not registered with Apple; register it first with `orbit apple device register`"
+                )
+            })?;
+        device_ids.push(device.id.clone());
+    }
+    Ok(device_ids)
+}
+
+fn provisioning_device_matches_platform(
+    device: &ProvisioningDevice,
+    platform: ApplePlatform,
+) -> bool {
+    asc_device_matches_platform(&device.platform, platform)
 }
 
 fn resolve_api_key_team_id(project: &ProjectContext) -> Result<String> {
@@ -1032,78 +1296,62 @@ fn resolve_api_key_team_id(project: &ProjectContext) -> Result<String> {
 
 #[derive(Debug, Clone, Copy)]
 struct PushConfiguration {
-    credential: PushCredentialKind,
-    environment: PushEnvironment,
     broadcast: bool,
 }
 
-fn push_configuration(
-    project: &ProjectContext,
-    target: &TargetManifest,
-) -> Result<Option<PushConfiguration>> {
-    let Some(entitlements_path) = &target.entitlements else {
-        if target.push.is_some() {
-            bail!(
-                "target `{}` defines a `push` block but does not declare an entitlements file",
-                target.name
-            );
-        }
-        return Ok(None);
-    };
-
-    let entitlements = load_plist_dictionary(&project.root.join(entitlements_path))?;
-    let push_entitlement = entitlements.get("aps-environment");
-    if push_entitlement.is_none() {
-        if target.push.is_some() {
-            bail!(
-                "target `{}` defines a `push` block but does not enable `aps-environment` in its entitlements",
-                target.name
-            );
-        }
-        return Ok(None);
-    }
-
-    let environment = match push_entitlement.and_then(Value::as_string) {
-        Some("development") => PushEnvironment::Development,
-        Some("production") => PushEnvironment::Production,
-        Some(other) => {
-            bail!("`aps-environment` must be `development` or `production`, got `{other}`")
-        }
-        None => bail!("`aps-environment` must be a string"),
-    };
-    let push = target.push.clone().unwrap_or_default();
-    Ok(Some(PushConfiguration {
-        credential: push.credential,
-        environment,
-        broadcast: push.broadcast,
-    }))
-}
-
-fn capability_sync_options_for_target(
-    project: &ProjectContext,
-    target: &TargetManifest,
-) -> Result<CapabilitySyncOptions> {
-    let push = push_configuration(project, target)?;
-    Ok(CapabilitySyncOptions {
-        uses_broadcast_push_notifications: push.is_some_and(|push| push.broadcast),
+fn push_configuration(target: &TargetManifest) -> Option<PushConfiguration> {
+    target.push.as_ref().map(|push| PushConfiguration {
+        broadcast: push.broadcast_for_live_activities,
     })
 }
 
-fn validate_push_setup_with_api_key(
+fn entitlement_dictionary_for_capability_sync(
     project: &ProjectContext,
     target: &TargetManifest,
-) -> Result<()> {
-    let Some(push) = push_configuration(project, target)? else {
-        return Ok(());
+) -> Result<Dictionary> {
+    match &target.entitlements {
+        Some(entitlements_path) => load_plist_dictionary(&project.root.join(entitlements_path)),
+        None => Ok(Dictionary::new()),
+    }
+}
+
+fn capability_sync_plan_for_target(
+    project: &ProjectContext,
+    target: &TargetManifest,
+    remote_capabilities: &[RemoteCapability],
+    options: &CapabilitySyncOptions,
+) -> Result<crate::apple::capabilities::CapabilitySyncPlan> {
+    let entitlements = entitlement_dictionary_for_capability_sync(project, target)?;
+    capability_sync_plan_from_dictionary_with_options(&entitlements, remote_capabilities, options)
+}
+
+fn capability_sync_options_for_target(target: &TargetManifest) -> CapabilitySyncOptions {
+    let push = push_configuration(target);
+    CapabilitySyncOptions {
+        uses_push_notifications: push.is_some(),
+        uses_broadcast_push_notifications: push.is_some_and(|push| push.broadcast),
+    }
+}
+
+fn validate_push_setup_with_api_key(target: &TargetManifest) -> CapabilitySyncOptions {
+    let Some(push) = push_configuration(target) else {
+        return CapabilitySyncOptions::default();
     };
-    if target.push.is_none() && !push.broadcast {
-        return Ok(());
+    if !push.broadcast {
+        return CapabilitySyncOptions {
+            uses_push_notifications: true,
+            uses_broadcast_push_notifications: false,
+        };
     }
 
-    bail!(
-        "App Store Connect API key auth cannot manage push setup for target `{}`; log in with Apple ID so Orbit can configure broadcast push or APNs credentials through the Developer Portal",
+    eprintln!(
+        "warning: App Store Connect API key auth cannot configure broadcast push settings for target `{}`; continuing without broadcast support. Enable Broadcast Push Notifications manually in the Apple developer console if needed.",
         target.name
-    )
+    );
+    CapabilitySyncOptions {
+        uses_push_notifications: true,
+        uses_broadcast_push_notifications: false,
+    }
 }
 
 fn ensure_bundle_id_with_api_key(
@@ -1132,9 +1380,10 @@ fn sync_capabilities_with_api_key(
     target: &TargetManifest,
     bundle_id: &Resource<BundleIdAttributes>,
 ) -> Result<CapabilitySyncOutcome> {
-    let Some(entitlements_path) = &target.entitlements else {
+    let capability_sync_options = validate_push_setup_with_api_key(target);
+    if target.entitlements.is_none() && !capability_sync_options.uses_push_notifications {
         return Ok(CapabilitySyncOutcome::Skipped);
-    };
+    }
     let remote_bundle = client
         .find_bundle_id(&bundle_id.attributes.identifier)?
         .with_context(|| {
@@ -1144,10 +1393,11 @@ fn sync_capabilities_with_api_key(
             )
         })?;
     let remote_capabilities = remote_capabilities_from_included(&remote_bundle.included)?;
-    let plan = capability_sync_plan_from_entitlements_with_options(
-        &project.root.join(entitlements_path),
+    let plan = capability_sync_plan_for_target(
+        project,
+        target,
         &remote_capabilities,
-        &capability_sync_options_for_target(project, target)?,
+        &capability_sync_options,
     )?;
     if plan.updates.is_empty() {
         return Ok(CapabilitySyncOutcome::NoUpdates);
@@ -1303,7 +1553,9 @@ fn ensure_certificate_with_api_key(
     let remote_certificates = client.list_certificates(certificate_type)?;
     for remote in &remote_certificates {
         if let Some(local) = state.certificates.iter_mut().find(|certificate| {
-            if certificate.certificate_type != certificate_type || !certificate.p12_path.exists() {
+            if certificate.certificate_type != certificate_type
+                || !certificate_has_local_signing_material(certificate)
+            {
                 return false;
             }
             if certificate.id == remote.id {
@@ -1404,6 +1656,8 @@ fn ensure_certificate_with_api_key(
         serial_number,
         origin: CertificateOrigin::Generated,
         display_name: remote.attributes.display_name.clone(),
+        system_keychain_path: None,
+        system_signing_identity: None,
         private_key_path,
         certificate_der_path,
         p12_path,
@@ -1943,6 +2197,7 @@ fn string_array_value(key: &str, value: &Value) -> Result<Vec<String>> {
 
 pub fn sign_bundle(
     platform: ApplePlatform,
+    distribution: DistributionKind,
     bundle_path: &Path,
     material: &SigningMaterial,
 ) -> Result<()> {
@@ -1966,6 +2221,10 @@ pub fn sign_bundle(
     command.arg(&material.signing_identity);
     command.args(["--keychain"]);
     command.arg(&material.keychain_path);
+    if platform == ApplePlatform::Macos && distribution == DistributionKind::DeveloperId {
+        // Developer ID notarization requires the app binary to opt into hardened runtime.
+        command.args(["--options", "runtime"]);
+    }
     if let Some(entitlements) = &material.entitlements_path {
         command.args(["--entitlements"]);
         command.arg(entitlements);
@@ -1974,77 +2233,63 @@ pub fn sign_bundle(
     crate::util::run_command(&mut command)
 }
 
-fn ensure_bundle_id(
-    client: &mut PortalClient,
+fn ensure_bundle_id_with_developer_services(
+    provisioning: &mut ProvisioningClient,
     project: &ProjectContext,
     target: &TargetManifest,
-    platform: ApplePlatform,
-) -> Result<PortalAppId> {
-    if let Some(bundle_id) =
-        client.find_app_by_bundle_id(&target.bundle_id, matches!(platform, ApplePlatform::Macos))?
-    {
-        return Ok(bundle_id);
-    }
-
-    client.create_app(
+) -> Result<ProvisioningBundleId> {
+    provisioning.ensure_bundle_id(
         &orbit_managed_app_name(&project.resolved_manifest.name),
         &target.bundle_id,
-        matches!(platform, ApplePlatform::Macos),
     )
 }
 
 fn sync_capabilities(
-    client: &mut PortalClient,
-    provisioning: &ProvisioningClient,
+    provisioning: &mut ProvisioningClient,
     project: &ProjectContext,
     target: &TargetManifest,
-    platform: ApplePlatform,
-    bundle_id: &PortalAppId,
+    bundle_id: &ProvisioningBundleId,
 ) -> Result<CapabilitySyncOutcome> {
-    let Some(entitlements_path) = &target.entitlements else {
+    let capability_sync_options = capability_sync_options_for_target(target);
+    if target.entitlements.is_none() && !capability_sync_options.uses_push_notifications {
         return Ok(CapabilitySyncOutcome::Skipped);
-    };
-    let provisioning_bundle = provisioning
-        .find_bundle_id(&bundle_id.identifier)?
-        .with_context(|| {
-            format!(
-                "bundle identifier `{}` exists in the Developer Portal but could not be loaded from Apple's provisioning API",
-                bundle_id.identifier
-            )
-        })?;
-    let plan = capability_sync_plan_from_entitlements_with_options(
-        &project.root.join(entitlements_path),
-        &provisioning_bundle.capabilities,
-        &capability_sync_options_for_target(project, target)?,
+    }
+    let plan = capability_sync_plan_for_target(
+        project,
+        target,
+        &bundle_id.capabilities,
+        &capability_sync_options,
     )?;
     if plan.updates.is_empty() {
         return Ok(CapabilitySyncOutcome::NoUpdates);
     }
 
     let app_group_ids = resolve_app_group_ids(
-        client,
+        provisioning,
         collect_identifier_values(&plan.updates, |relationships| {
             relationships.app_groups.as_ref()
         }),
     )?;
-    let merchant_ids = resolve_merchant_ids(
-        client,
-        platform,
-        collect_identifier_values(&plan.updates, |relationships| {
-            relationships.merchant_ids.as_ref()
-        }),
-    )?;
-    let cloud_container_ids = resolve_cloud_container_ids(
-        client,
-        collect_identifier_values(&plan.updates, |relationships| {
-            relationships.cloud_containers.as_ref()
-        }),
-    )?;
+    let merchant_identifiers = collect_identifier_values(&plan.updates, |relationships| {
+        relationships.merchant_ids.as_ref()
+    });
+    let cloud_container_identifiers = collect_identifier_values(&plan.updates, |relationships| {
+        relationships.cloud_containers.as_ref()
+    });
+    let merchant_ids = resolve_merchant_ids(provisioning, merchant_identifiers)?;
+    let cloud_container_ids =
+        resolve_cloud_container_ids(provisioning, cloud_container_identifiers)?;
     let updates = plan
         .updates
         .iter()
         .map(|update| {
+            let remote_id = bundle_id
+                .capabilities
+                .iter()
+                .find(|candidate| candidate.capability_type == update.capability_type)
+                .map(|candidate| candidate.id.clone());
             Ok(ProvisioningCapabilityUpdate {
+                remote_id,
                 capability_type: update.capability_type.clone(),
                 option: update.option.clone(),
                 relationships: ProvisioningCapabilityRelationships {
@@ -2064,282 +2309,24 @@ fn sync_capabilities(
             })
         })
         .collect::<Result<Vec<_>>>()?;
-    provisioning.update_bundle_capabilities(&provisioning_bundle, &updates)?;
-    Ok(CapabilitySyncOutcome::Updated(plan.updates.len()))
-}
-
-fn ensure_push_setup(
-    client: &mut PortalClient,
-    project: &ProjectContext,
-    state: &mut SigningState,
-    target: &TargetManifest,
-    platform: ApplePlatform,
-    bundle_id: &PortalAppId,
-) -> Result<Option<PushCredentialMaterial>> {
-    let Some(push) = push_configuration(project, target)? else {
-        return Ok(None);
-    };
-    match push.credential {
-        PushCredentialKind::AuthKey => ensure_push_auth_key(client, project, state).map(Some),
-        PushCredentialKind::Certificate => ensure_push_certificate(
-            client,
-            project,
-            state,
-            platform,
-            bundle_id,
-            push.environment,
-        )
-        .map(Some),
-    }
-}
-
-fn ensure_push_auth_key(
-    client: &mut PortalClient,
-    project: &ProjectContext,
-    state: &mut SigningState,
-) -> Result<PushCredentialMaterial> {
-    let paths = team_signing_paths(project, client.team_id());
-    ensure_dir(&paths.push_keys_dir)?;
-    let remote_keys = client.list_auth_keys()?;
-
-    if let Some(local) = state
-        .push_keys
-        .iter()
-        .find(|key| key.path.exists() && remote_keys.iter().any(|remote| remote.id == key.id))
-    {
-        return Ok(PushCredentialMaterial::AuthKey {
-            key_id: local.id.clone(),
-            key_path: local.path.clone(),
-        });
-    }
-
-    if let Some(remote) = remote_keys
-        .iter()
-        .find(|remote| remote.name == ORBIT_PUSH_AUTH_KEY_NAME)
-    {
-        if remote.can_download {
-            return download_push_auth_key(client, state, &paths, remote);
-        }
-        bail!(
-            "Orbit-managed APNs auth key `{}` already exists on Apple team `{}` but cannot be downloaded again; restore the local Orbit state for that team or revoke the key before retrying",
-            remote.id,
-            client.team_id()
-        );
-    }
-
-    let remote = client.create_auth_key(ORBIT_PUSH_AUTH_KEY_NAME)?;
-    download_push_auth_key(client, state, &paths, &remote)
-}
-
-fn download_push_auth_key(
-    client: &mut PortalClient,
-    state: &mut SigningState,
-    paths: &TeamSigningPaths,
-    remote: &PortalAuthKey,
-) -> Result<PushCredentialMaterial> {
-    let key_content = client.download_auth_key(&remote.id)?;
-    let key_path = paths.push_keys_dir.join(format!("{}.p8", remote.id));
-    fs::write(&key_path, key_content)
-        .with_context(|| format!("failed to write {}", key_path.display()))?;
-
-    state.push_keys.retain(|key| key.id != remote.id);
-    state.push_keys.push(ManagedPushKey {
-        id: remote.id.clone(),
-        name: remote.name.clone(),
-        path: key_path.clone(),
-    });
-    Ok(PushCredentialMaterial::AuthKey {
-        key_id: remote.id.clone(),
-        key_path,
-    })
-}
-
-fn ensure_push_certificate(
-    client: &mut PortalClient,
-    project: &ProjectContext,
-    state: &mut SigningState,
-    platform: ApplePlatform,
-    bundle_id: &PortalAppId,
-    environment: PushEnvironment,
-) -> Result<PushCredentialMaterial> {
-    let certificate_type = push_certificate_type(platform, environment)?;
-    let mac = matches!(platform, ApplePlatform::Macos);
-    let remote_certificates = client.list_certificates(&[certificate_type], mac)?;
-    let mut remote_certificate_ids = HashSet::new();
-    let mut stale_orbit_certificates = Vec::new();
-
-    for remote in remote_certificates {
-        remote_certificate_ids.insert(remote.id.clone());
-        let owned_by_bundle = remote.owner_id.as_deref() == Some(bundle_id.id.as_str())
-            || remote.owner_name.as_deref() == Some(bundle_id.identifier.as_str());
-        if !owned_by_bundle {
+    let (deletes, upserts): (Vec<_>, Vec<_>) = updates
+        .into_iter()
+        .partition(|update| update.option == ASC_OPTION_OFF);
+    for delete in deletes {
+        if delete.capability_type == "ASSOCIATED_DOMAINS" {
+            // Xcode does not emit a matching disable mutation when users remove
+            // Associated Domains in Signing & Capabilities, so keep the remote
+            // capability untouched to stay aligned with Apple tooling.
             continue;
         }
-
-        if let Some(local) = state.push_certificates.iter_mut().find(|certificate| {
-            certificate.bundle_id == bundle_id.identifier
-                && certificate.environment == environment
-                && certificate.certificate_type == certificate_type
-                && certificate.p12_path.exists()
-                && (certificate.id == remote.id
-                    || remote.serial_number.as_deref().is_some_and(|serial| {
-                        certificate.serial_number.eq_ignore_ascii_case(serial)
-                    }))
-        }) {
-            if local.id != remote.id {
-                local.id = remote.id.clone();
-            }
-            if local.display_name.is_none() {
-                local.display_name = remote.name.clone();
-            }
-            return Ok(PushCredentialMaterial::Certificate {
-                certificate_id: local.id.clone(),
-                p12_path: local.p12_path.clone(),
-                p12_password_account: local.p12_password_account.clone(),
-                environment,
-            });
-        }
-
-        if is_orbit_managed_push_certificate(state, &remote.id, &bundle_id.identifier, environment)
-        {
-            stale_orbit_certificates.push(remote.id.clone());
+        if let Some(remote_id) = delete.remote_id.as_deref() {
+            provisioning.delete_bundle_capability(remote_id)?;
         }
     }
-
-    for certificate_id in stale_orbit_certificates {
-        client
-            .revoke_certificate(&certificate_id, certificate_type, mac)
-            .with_context(|| format!("failed to repair push certificate `{certificate_id}`"))?;
-        state
-            .push_certificates
-            .retain(|certificate| certificate.id != certificate_id);
+    if !upserts.is_empty() {
+        provisioning.update_bundle_capabilities(bundle_id, &upserts)?;
     }
-    cleanup_stale_push_certificate_state(
-        state,
-        &bundle_id.identifier,
-        environment,
-        &remote_certificate_ids,
-    );
-
-    let paths = team_signing_paths(project, client.team_id());
-    ensure_dir(&paths.push_certificates_dir)?;
-    let slug = crate::util::timestamp_slug();
-    let private_key_path = paths
-        .push_certificates_dir
-        .join(format!("{slug}-{environment}.push.key.pem"));
-    let csr_path = paths
-        .push_certificates_dir
-        .join(format!("{slug}-{environment}.push.csr.pem"));
-    let certificate_der_path = paths
-        .push_certificates_dir
-        .join(format!("{slug}-{environment}.push.cer"));
-    let p12_path = paths
-        .push_certificates_dir
-        .join(format!("{slug}-{environment}.push.p12"));
-
-    let mut openssl_req = Command::new("openssl");
-    openssl_req.args([
-        "req",
-        "-new",
-        "-newkey",
-        "rsa:2048",
-        "-nodes",
-        "-keyout",
-        private_key_path
-            .to_str()
-            .context("private key path contains invalid UTF-8")?,
-        "-subj",
-        &format!("/CN=Orbit Push {slug}"),
-        "-out",
-        csr_path
-            .to_str()
-            .context("CSR path contains invalid UTF-8")?,
-    ]);
-    crate::util::run_command(&mut openssl_req)?;
-
-    let csr_pem = fs::read_to_string(&csr_path)
-        .with_context(|| format!("failed to read {}", csr_path.display()))?;
-    let remote = client.create_certificate(certificate_type, &csr_pem, Some(&bundle_id.id), mac)?;
-    let certificate_bytes = client.download_certificate(&remote.id, certificate_type, mac)?;
-    fs::write(&certificate_der_path, &certificate_bytes)
-        .with_context(|| format!("failed to write {}", certificate_der_path.display()))?;
-
-    let p12_password = uuid::Uuid::new_v4().to_string();
-    export_p12_from_der_certificate(
-        &private_key_path,
-        &certificate_der_path,
-        &p12_path,
-        &p12_password,
-    )?;
-
-    let serial_number = match remote.serial_number.clone() {
-        Some(serial_number) => serial_number,
-        None => read_certificate_serial(&certificate_der_path)?,
-    };
-    let password_account = format!("push-{}-{serial_number}", remote.id);
-    store_p12_password(&password_account, &p12_password)?;
-
-    state
-        .push_certificates
-        .retain(|certificate| certificate.id != remote.id);
-    state.push_certificates.push(ManagedPushCertificate {
-        id: remote.id.clone(),
-        certificate_type: certificate_type.to_owned(),
-        serial_number,
-        bundle_id: bundle_id.identifier.clone(),
-        environment,
-        origin: CertificateOrigin::Generated,
-        display_name: remote.name.clone(),
-        private_key_path,
-        certificate_der_path,
-        p12_path: p12_path.clone(),
-        p12_password_account: password_account.clone(),
-    });
-    Ok(PushCredentialMaterial::Certificate {
-        certificate_id: remote.id,
-        p12_path,
-        p12_password_account: password_account,
-        environment,
-    })
-}
-
-fn push_certificate_type(
-    platform: ApplePlatform,
-    environment: PushEnvironment,
-) -> Result<&'static str> {
-    match (matches!(platform, ApplePlatform::Macos), environment) {
-        (false, PushEnvironment::Development) => Ok("JKG5JZ54H7"),
-        (false, PushEnvironment::Production) => Ok("UPV3DW712I"),
-        (true, PushEnvironment::Development) => Ok("HQ4KP3I34R"),
-        (true, PushEnvironment::Production) => Ok("CDZ7EMXIZ1"),
-    }
-}
-
-fn is_orbit_managed_push_certificate(
-    state: &SigningState,
-    certificate_id: &str,
-    bundle_id: &str,
-    environment: PushEnvironment,
-) -> bool {
-    state.push_certificates.iter().any(|certificate| {
-        certificate.id == certificate_id
-            && certificate.bundle_id == bundle_id
-            && certificate.environment == environment
-    })
-}
-
-fn cleanup_stale_push_certificate_state(
-    state: &mut SigningState,
-    bundle_id: &str,
-    environment: PushEnvironment,
-    remote_certificate_ids: &HashSet<String>,
-) {
-    state.push_certificates.retain(|certificate| {
-        if certificate.bundle_id != bundle_id || certificate.environment != environment {
-            return true;
-        }
-        remote_certificate_ids.contains(&certificate.id)
-    });
+    Ok(CapabilitySyncOutcome::Updated(plan.updates.len()))
 }
 
 fn collect_identifier_values<F>(updates: &[CapabilityUpdate], select: F) -> Vec<String>
@@ -2361,15 +2348,50 @@ where
     values
 }
 
+fn developer_services_machine_attributes(
+    certificate_type: &str,
+) -> (Option<String>, Option<String>) {
+    if certificate_type != "DEVELOPMENT" {
+        return (None, None);
+    }
+
+    let output = match crate::util::command_output(
+        Command::new("system_profiler").args(["-json", "SPHardwareDataType"]),
+    ) {
+        Ok(output) => output,
+        Err(_) => return (None, None),
+    };
+    let value: serde_json::Value = match serde_json::from_str(&output) {
+        Ok(value) => value,
+        Err(_) => return (None, None),
+    };
+    let Some(entry) = value
+        .get("SPHardwareDataType")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|items| items.first())
+    else {
+        return (None, None);
+    };
+    let machine_id = entry
+        .get("provisioning_UDID")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    let machine_name = entry
+        .get("_name")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    (machine_id, machine_name)
+}
+
 fn resolve_app_group_ids(
-    client: &mut PortalClient,
+    provisioning: &mut ProvisioningClient,
     identifiers: Vec<String>,
 ) -> Result<HashMap<String, String>> {
     if identifiers.is_empty() {
         return Ok(HashMap::new());
     }
 
-    let existing = client.list_app_groups()?;
+    let existing = provisioning.list_app_groups()?;
     let mut resolved = HashMap::new();
     for identifier in identifiers {
         let id = if let Some(existing_group) = existing
@@ -2379,7 +2401,7 @@ fn resolve_app_group_ids(
             existing_group.id.clone()
         } else {
             let name = identifier_name("App Group", &identifier);
-            client.create_app_group(&name, &identifier)?.id
+            provisioning.create_app_group(&name, &identifier)?.id
         };
         resolved.insert(identifier, id);
     }
@@ -2387,15 +2409,14 @@ fn resolve_app_group_ids(
 }
 
 fn resolve_merchant_ids(
-    client: &mut PortalClient,
-    platform: ApplePlatform,
+    provisioning: &mut ProvisioningClient,
     identifiers: Vec<String>,
 ) -> Result<HashMap<String, String>> {
     if identifiers.is_empty() {
         return Ok(HashMap::new());
     }
 
-    let existing = client.list_merchants(platform == ApplePlatform::Macos)?;
+    let existing = provisioning.list_merchant_ids()?;
     let mut resolved = HashMap::new();
     for identifier in identifiers {
         let id = if let Some(existing_merchant) = existing
@@ -2405,9 +2426,7 @@ fn resolve_merchant_ids(
             existing_merchant.id.clone()
         } else {
             let name = identifier_name("Merchant ID", &identifier);
-            client
-                .create_merchant(&name, &identifier, platform == ApplePlatform::Macos)?
-                .id
+            provisioning.create_merchant_id(&name, &identifier)?.id
         };
         resolved.insert(identifier, id);
     }
@@ -2415,14 +2434,14 @@ fn resolve_merchant_ids(
 }
 
 fn resolve_cloud_container_ids(
-    client: &mut PortalClient,
+    provisioning: &mut ProvisioningClient,
     identifiers: Vec<String>,
 ) -> Result<HashMap<String, String>> {
     if identifiers.is_empty() {
         return Ok(HashMap::new());
     }
 
-    let existing = client.list_cloud_containers()?;
+    let existing = provisioning.list_cloud_containers()?;
     let mut resolved = HashMap::new();
     for identifier in identifiers {
         let id = if let Some(existing_container) = existing
@@ -2432,7 +2451,7 @@ fn resolve_cloud_container_ids(
             existing_container.id.clone()
         } else {
             let name = identifier_name("iCloud Container", &identifier);
-            client.create_cloud_container(&name, &identifier)?.id
+            provisioning.create_cloud_container(&name, &identifier)?.id
         };
         resolved.insert(identifier, id);
     }
@@ -2458,378 +2477,37 @@ fn map_relationship_ids(
         .map(Some)
 }
 
-fn ensure_certificate(
-    client: &mut PortalClient,
+fn resolve_requested_device_udids(
     project: &ProjectContext,
-    state: &mut SigningState,
-    certificate_type: &str,
-) -> Result<ManagedCertificate> {
-    let remote_certificates = client.list_certificates(
-        &[certificate_type],
-        is_macos_certificate_type(certificate_type),
-    )?;
-    for remote in &remote_certificates {
-        if let Some(local) = state.certificates.iter_mut().find(|certificate| {
-            if certificate.certificate_type != certificate_type || !certificate.p12_path.exists() {
-                return false;
-            }
-            if certificate.id == remote.id {
-                return true;
-            }
-            remote
-                .serial_number
-                .as_deref()
-                .is_some_and(|serial| certificate.serial_number.eq_ignore_ascii_case(serial))
-        }) {
-            if local.id != remote.id {
-                local.id = remote.id.clone();
-            }
-            if local.display_name.is_none() {
-                local.display_name = remote.name.clone();
-            }
-            return Ok(local.clone());
-        }
-    }
-
-    let paths = team_signing_paths(project, client.team_id());
-    ensure_dir(&paths.certificates_dir)?;
-    for remote in &remote_certificates {
-        let Some(serial_number) = remote.serial_number.as_deref() else {
-            continue;
-        };
-        if let Some(certificate) = recover_orphaned_certificate(
-            &paths,
-            state,
-            certificate_type,
-            &remote.id,
-            serial_number,
-            remote.name.as_deref(),
-        )? {
-            return Ok(certificate);
-        }
-    }
-
-    let slug = crate::util::timestamp_slug();
-    let private_key_path = paths.certificates_dir.join(format!("{slug}.key.pem"));
-    let csr_path = paths.certificates_dir.join(format!("{slug}.csr.pem"));
-    let certificate_der_path = paths.certificates_dir.join(format!("{slug}.cer"));
-    let p12_path = paths.certificates_dir.join(format!("{slug}.p12"));
-
-    let mut openssl_req = Command::new("openssl");
-    openssl_req.args([
-        "req",
-        "-new",
-        "-newkey",
-        "rsa:2048",
-        "-nodes",
-        "-keyout",
-        private_key_path
-            .to_str()
-            .context("private key path contains invalid UTF-8")?,
-        "-subj",
-        &format!("/CN=Orbit {slug}"),
-        "-out",
-        csr_path
-            .to_str()
-            .context("CSR path contains invalid UTF-8")?,
-    ]);
-    crate::util::run_command(&mut openssl_req)?;
-
-    let csr_pem = fs::read_to_string(&csr_path)
-        .with_context(|| format!("failed to read {}", csr_path.display()))?;
-    let remote = client.create_certificate(
-        certificate_type,
-        &csr_pem,
-        None,
-        is_macos_certificate_type(certificate_type),
-    )?;
-    let certificate_bytes = client.download_certificate(
-        &remote.id,
-        certificate_type,
-        is_macos_certificate_type(certificate_type),
-    )?;
-    fs::write(&certificate_der_path, &certificate_bytes)
-        .with_context(|| format!("failed to write {}", certificate_der_path.display()))?;
-
-    let p12_password = uuid::Uuid::new_v4().to_string();
-    export_p12_from_der_certificate(
-        &private_key_path,
-        &certificate_der_path,
-        &p12_path,
-        &p12_password,
-    )?;
-
-    let serial_number = match remote.serial_number.clone() {
-        Some(serial_number) => serial_number,
-        None => read_certificate_serial(&certificate_der_path)?,
-    };
-    let password_account = format!("{}-{serial_number}", remote.id);
-    store_p12_password(&password_account, &p12_password)?;
-
-    let certificate = ManagedCertificate {
-        id: remote.id,
-        certificate_type: certificate_type.to_owned(),
-        serial_number,
-        origin: CertificateOrigin::Generated,
-        display_name: remote.name.clone(),
-        private_key_path,
-        certificate_der_path,
-        p12_path,
-        p12_password_account: password_account,
-    };
-    state.certificates.push(certificate.clone());
-    Ok(certificate)
-}
-
-struct PortalProfileRequest<'a> {
-    platform: PortalProfilePlatform,
-    profile_type: &'a str,
-    bundle_id: &'a PortalAppId,
-    certificate: &'a ManagedCertificate,
-    device_ids: &'a [String],
-}
-
-fn ensure_profile(
-    client: &mut PortalClient,
-    project: &ProjectContext,
-    state: &mut SigningState,
-    request: &PortalProfileRequest<'_>,
-) -> Result<ManagedProfile> {
-    let profiles = client.list_profiles(request.platform)?;
-    let bundle_identifier = &request.bundle_id.identifier;
-    let mut remote_profile_ids = HashSet::new();
-    let mut stale_orbit_profiles = Vec::new();
-
-    for profile in profiles {
-        remote_profile_ids.insert(profile.id.clone());
-        let Some(app) = &profile.app else {
-            continue;
-        };
-        if app.id != request.bundle_id.id {
-            continue;
-        }
-
-        let certificate_links = profile
-            .certificates
-            .iter()
-            .map(|certificate| certificate.id.clone())
-            .collect::<Vec<_>>();
-        let device_links = profile
-            .devices
-            .iter()
-            .map(|device| device.id.clone())
-            .collect::<Vec<_>>();
-
-        let matches_certificate = certificate_links.contains(&request.certificate.id);
-        let matches_devices = canonical_ids(&device_links) == canonical_ids(request.device_ids);
-
-        if matches_certificate && matches_devices {
-            let managed = persist_profile(client, project, state, request, &device_links, profile)?;
-            cleanup_stale_profile_state(
-                state,
-                bundle_identifier,
-                request.profile_type,
-                &remote_profile_ids,
-            );
-            return Ok(managed);
-        }
-
-        if is_orbit_managed_profile(state, &profile.id, bundle_identifier, request.profile_type) {
-            stale_orbit_profiles.push(profile.id.clone());
-        }
-    }
-
-    for profile_id in stale_orbit_profiles {
-        client
-            .delete_profile(request.platform, &profile_id)
-            .with_context(|| format!("failed to repair provisioning profile `{profile_id}`"))?;
-        state.profiles.retain(|profile| profile.id != profile_id);
-    }
-    cleanup_stale_profile_state(
-        state,
-        bundle_identifier,
-        request.profile_type,
-        &remote_profile_ids,
-    );
-
-    let remote = client.create_profile(
-        request.platform,
-        &format!(
-            "*[orbit] {} {} {}",
-            bundle_identifier,
-            request.profile_type,
-            crate::util::timestamp_slug()
-        ),
-        request.profile_type,
-        &request.bundle_id.id,
-        std::slice::from_ref(&request.certificate.id),
-        request.device_ids,
-    )?;
-    persist_profile(client, project, state, request, request.device_ids, remote)
-}
-
-fn persist_profile(
-    client: &mut PortalClient,
-    project: &ProjectContext,
-    state: &mut SigningState,
-    request: &PortalProfileRequest<'_>,
-    device_ids: &[String],
-    remote: PortalProvisioningProfile,
-) -> Result<ManagedProfile> {
-    let paths = team_signing_paths(project, client.team_id());
-    ensure_dir(&paths.profiles_dir)?;
-    let profile_bytes = client.download_profile(request.platform, &remote.id)?;
-    let profile_path = paths.profiles_dir.join(format!(
-        "{}-{}.mobileprovision",
-        remote.id, request.profile_type
-    ));
-    fs::write(&profile_path, profile_bytes)
-        .with_context(|| format!("failed to write {}", profile_path.display()))?;
-
-    state.profiles.retain(|profile| profile.id != remote.id);
-    let profile = ManagedProfile {
-        id: remote.id,
-        profile_type: request.profile_type.to_owned(),
-        bundle_id: request.bundle_id.identifier.clone(),
-        path: profile_path,
-        uuid: remote.uuid.clone(),
-        certificate_ids: vec![request.certificate.id.clone()],
-        device_ids: device_ids.to_vec(),
-    };
-    state.profiles.push(profile.clone());
-    Ok(profile)
-}
-
-fn resolve_device_ids(
-    project: &ProjectContext,
-    client: &mut PortalClient,
+    distribution: DistributionKind,
     platform: ApplePlatform,
-    udids: &[String],
+    context: DeviceSelectionContext<'_>,
+    explicit_udids: Option<Vec<String>>,
 ) -> Result<Vec<String>> {
-    let class = device_class_for_platform(platform);
-    if udids.is_empty() {
-        return Ok(client
-            .list_devices(class, false)?
-            .into_iter()
-            .map(|device| device.id)
-            .collect());
+    if let Some(explicit_udids) = explicit_udids.filter(|udids| !udids.is_empty()) {
+        return Ok(explicit_udids);
     }
 
-    let mut device_ids = Vec::new();
-    for udid in udids {
-        let device = match client.find_device_by_udid(udid, class)? {
-            Some(device) => device,
-            None => {
-                if !project.app.interactive {
-                    bail!(
-                        "device `{udid}` is not registered with Apple; rerun interactively to register it or use `orbit apple device register` first"
-                    );
-                }
-
-                let device_name = connected_device_name_for_udid(udid, platform)?
-                    .unwrap_or_else(|| format!("Orbit {udid}"));
-                if !prompt_confirm(
-                    &format!(
-                        "Device `{device_name}` ({udid}) is not registered with Apple. Register it now?"
-                    ),
-                    true,
-                )? {
-                    bail!("device `{udid}` is not registered with Apple");
-                }
-                client
-                    .create_device(&device_name, udid, class)
-                    .with_context(|| format!("failed to register device `{udid}` with Apple"))?
-            }
-        };
-        device_ids.push(device.id);
-    }
-    Ok(device_ids)
-}
-
-#[derive(Debug, Deserialize)]
-struct ConnectedDeviceList {
-    result: ConnectedDeviceResult,
-}
-
-#[derive(Debug, Deserialize)]
-struct ConnectedDeviceResult {
-    devices: Vec<ConnectedDevice>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ConnectedDevice {
-    #[serde(rename = "deviceProperties")]
-    device_properties: ConnectedDeviceProperties,
-    #[serde(rename = "hardwareProperties")]
-    hardware_properties: ConnectedDeviceHardwareProperties,
-}
-
-#[derive(Debug, Deserialize)]
-struct ConnectedDeviceProperties {
-    name: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct ConnectedDeviceHardwareProperties {
-    platform: String,
-    udid: String,
-}
-
-fn connected_device_name_for_udid(udid: &str, platform: ApplePlatform) -> Result<Option<String>> {
-    let output_path = NamedTempFile::new()?;
-    let mut list = Command::new("xcrun");
-    list.args([
-        "devicectl",
-        "list",
-        "devices",
-        "--json-output",
-        output_path
-            .path()
-            .to_str()
-            .context("temporary path contains invalid UTF-8")?,
-    ]);
-    crate::util::run_command(&mut list)?;
-
-    let contents = fs::read_to_string(output_path.path())
-        .with_context(|| format!("failed to read {}", output_path.path().display()))?;
-    let devices: ConnectedDeviceList = serde_json::from_str(&contents)
-        .context("failed to parse `devicectl list devices` output")?;
-    Ok(devices
-        .result
-        .devices
-        .into_iter()
-        .find(|device| {
-            device.hardware_properties.udid.eq_ignore_ascii_case(udid)
-                && connected_device_matches_platform(device, platform)
-        })
-        .map(|device| device.device_properties.name))
-}
-
-fn connected_device_matches_platform(device: &ConnectedDevice, platform: ApplePlatform) -> bool {
-    let platform_name = device.hardware_properties.platform.as_str();
-    match platform {
-        ApplePlatform::Ios => platform_name.eq_ignore_ascii_case("iOS"),
-        ApplePlatform::Tvos => platform_name.eq_ignore_ascii_case("tvOS"),
-        ApplePlatform::Visionos => {
-            platform_name.eq_ignore_ascii_case("visionOS")
-                || platform_name.eq_ignore_ascii_case("xrOS")
-        }
-        ApplePlatform::Watchos => platform_name.eq_ignore_ascii_case("watchOS"),
-        ApplePlatform::Macos => platform_name.eq_ignore_ascii_case("macOS"),
-    }
+    select_device_udids(
+        project,
+        distribution,
+        platform,
+        current_profile_for_target(
+            context.state,
+            context.bundle_identifier,
+            context.profile_type,
+            context.certificate_id,
+        ),
+    )
 }
 
 fn select_device_udids(
     project: &ProjectContext,
     distribution: DistributionKind,
     platform: ApplePlatform,
+    current_profile: Option<&ManagedProfile>,
 ) -> Result<Vec<String>> {
-    let cache = crate::apple::device::refresh_cache(&project.app)?;
-    let devices = cache
-        .devices
-        .into_iter()
-        .filter(|device| device_matches_platform(&device.platform, platform))
-        .collect::<Vec<_>>();
+    let devices = ensure_registered_devices(project, platform)?;
     if devices.is_empty() {
         bail!(
             "no registered Apple devices found for {platform}; run `orbit apple device register` first"
@@ -2840,36 +2518,229 @@ fn select_device_udids(
         return Ok(devices.into_iter().map(|device| device.udid).collect());
     }
 
-    let labels = devices
-        .iter()
-        .map(|device| format!("{} ({})", device.name, device.udid))
-        .collect::<Vec<_>>();
     if matches!(distribution, DistributionKind::AdHoc) {
-        let defaults = vec![true; labels.len()];
-        let selections = prompt_multi_select(
-            "Select devices to include in the ad-hoc provisioning profile",
-            &labels,
-            Some(&defaults),
-        )?;
-        if selections.is_empty() {
-            bail!("select at least one device for an ad-hoc provisioning profile");
+        if let Some(current_profile) = current_profile {
+            let provisioned_udids = profile_udids(current_profile, &devices);
+            if !provisioned_udids.is_empty() {
+                let registered_udids = devices
+                    .iter()
+                    .map(|device| device.udid.clone())
+                    .collect::<Vec<_>>();
+                if same_udid_set(&registered_udids, &provisioned_udids) {
+                    match prompt_ad_hoc_profile_reuse(&provisioned_udids, &devices)? {
+                        AdHocProfileReuse::ReuseCurrent => return Ok(provisioned_udids),
+                        AdHocProfileReuse::ChooseAgain => {}
+                    }
+                } else {
+                    let missing = missing_registered_devices(&devices, &provisioned_udids);
+                    if !missing.is_empty() {
+                        println!(
+                            "warning: the current ad-hoc provisioning profile is missing the following devices:"
+                        );
+                        for device in &missing {
+                            println!("- {}", format_cached_device_label(device));
+                        }
+                        if !prompt_confirm(
+                            "Would you like to choose the devices to provision again?",
+                            true,
+                        )? {
+                            return Ok(provisioned_udids);
+                        }
+                    }
+                }
+            }
         }
-        return Ok(selections
-            .into_iter()
-            .map(|index| devices[index].udid.clone())
-            .collect());
+        return prompt_ad_hoc_device_selection(&devices, current_profile);
     }
 
+    let labels = devices
+        .iter()
+        .map(format_cached_device_label)
+        .collect::<Vec<_>>();
     let index = prompt_select("Select a device to provision", &labels)?;
     Ok(vec![devices[index].udid.clone()])
 }
 
-fn device_class_for_platform(platform: ApplePlatform) -> PortalDeviceClass {
-    match platform {
-        ApplePlatform::Ios | ApplePlatform::Visionos => PortalDeviceClass::Iphone,
-        ApplePlatform::Tvos => PortalDeviceClass::Tvos,
-        ApplePlatform::Watchos => PortalDeviceClass::Watch,
-        ApplePlatform::Macos => PortalDeviceClass::Mac,
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum AdHocProfileReuse {
+    ReuseCurrent,
+    ChooseAgain,
+}
+
+fn prompt_ad_hoc_profile_reuse(
+    provisioned_udids: &[String],
+    devices: &[crate::apple::device::CachedDevice],
+) -> Result<AdHocProfileReuse> {
+    loop {
+        let options = [
+            "Yes",
+            "Show devices and ask me again",
+            "No, let me choose devices again",
+        ];
+        match prompt_select(
+            "All your registered devices are present in the provisioning profile. Would you like to reuse it?",
+            &options,
+        )? {
+            0 => return Ok(AdHocProfileReuse::ReuseCurrent),
+            1 => {
+                println!("Devices registered in the provisioning profile:");
+                for device in devices {
+                    if provisioned_udids.iter().any(|udid| udid == &device.udid) {
+                        println!("- {}", format_cached_device_label(device));
+                    }
+                }
+            }
+            2 => return Ok(AdHocProfileReuse::ChooseAgain),
+            _ => unreachable!("prompt_select returned an out-of-range index"),
+        }
+    }
+}
+
+fn prompt_ad_hoc_device_selection(
+    devices: &[crate::apple::device::CachedDevice],
+    current_profile: Option<&ManagedProfile>,
+) -> Result<Vec<String>> {
+    let preselected_udids = current_profile
+        .map(|profile| profile_udids(profile, devices))
+        .unwrap_or_default();
+    let defaults = if preselected_udids.is_empty() {
+        vec![true; devices.len()]
+    } else {
+        devices
+            .iter()
+            .map(|device| preselected_udids.iter().any(|udid| udid == &device.udid))
+            .collect::<Vec<_>>()
+    };
+    let labels = devices
+        .iter()
+        .map(format_cached_device_label)
+        .collect::<Vec<_>>();
+    let selections = prompt_multi_select(
+        "Select devices for the ad-hoc build",
+        &labels,
+        Some(&defaults),
+    )?;
+    if selections.is_empty() {
+        bail!("select at least one device for an ad-hoc provisioning profile");
+    }
+    Ok(selections
+        .into_iter()
+        .map(|index| devices[index].udid.clone())
+        .collect())
+}
+
+fn ensure_registered_devices(
+    project: &ProjectContext,
+    platform: ApplePlatform,
+) -> Result<Vec<crate::apple::device::CachedDevice>> {
+    loop {
+        let cache = crate::apple::device::refresh_cache(&project.app)?;
+        let devices = cache
+            .devices
+            .into_iter()
+            .filter(|device| device_matches_platform(&device.platform, platform))
+            .collect::<Vec<_>>();
+        if !devices.is_empty() {
+            return Ok(devices);
+        }
+        if !project.app.interactive {
+            return Ok(devices);
+        }
+        if !prompt_confirm(
+            &format!(
+                "You don't have any registered Apple devices for {platform}. Would you like to register one now?"
+            ),
+            true,
+        )? {
+            return Ok(devices);
+        }
+        crate::apple::device::register_device(
+            &project.app,
+            &crate::cli::RegisterDeviceArgs {
+                name: None,
+                udid: None,
+                platform: match platform {
+                    ApplePlatform::Macos => crate::cli::DevicePlatform::MacOs,
+                    _ => crate::cli::DevicePlatform::Ios,
+                },
+                current_machine: matches!(platform, ApplePlatform::Macos),
+            },
+        )?;
+    }
+}
+
+fn current_profile_for_target<'a>(
+    state: &'a SigningState,
+    bundle_identifier: &str,
+    profile_type: &str,
+    certificate_id: &str,
+) -> Option<&'a ManagedProfile> {
+    state.profiles.iter().rev().find(|profile| {
+        profile.bundle_id == bundle_identifier
+            && profile.profile_type == profile_type
+            && profile.path.exists()
+            && profile
+                .certificate_ids
+                .iter()
+                .any(|candidate| candidate == certificate_id)
+    })
+}
+
+fn profile_udids(
+    profile: &ManagedProfile,
+    devices: &[crate::apple::device::CachedDevice],
+) -> Vec<String> {
+    devices
+        .iter()
+        .filter(|device| profile.device_ids.iter().any(|id| id == &device.id))
+        .map(|device| device.udid.clone())
+        .collect()
+}
+
+fn same_udid_set(left: &[String], right: &[String]) -> bool {
+    canonical_ids(left) == canonical_ids(right)
+}
+
+fn missing_registered_devices<'a>(
+    devices: &'a [crate::apple::device::CachedDevice],
+    provisioned_udids: &[String],
+) -> Vec<&'a crate::apple::device::CachedDevice> {
+    devices
+        .iter()
+        .filter(|device| !provisioned_udids.iter().any(|udid| udid == &device.udid))
+        .collect()
+}
+
+fn format_cached_device_label(device: &crate::apple::device::CachedDevice) -> String {
+    let details = format_cached_device_details(device);
+    let mut label = device.udid.clone();
+    if !details.is_empty() {
+        label.push(' ');
+        label.push_str(&details);
+    }
+    if !device.name.is_empty() {
+        label.push_str(&format!(" ({})", device.name));
+    }
+    if let Some(created_at) = device.created_at.as_deref() {
+        label.push_str(&format!(" (created at: {created_at})"));
+    }
+    label
+}
+
+fn format_cached_device_details(device: &crate::apple::device::CachedDevice) -> String {
+    let mut details = Vec::new();
+    if let Some(device_class) = device.device_class.as_deref() {
+        details.push(device_class.replace('_', " "));
+    }
+    if let Some(model) = device.model.as_deref()
+        && details.iter().all(|detail| detail != model)
+    {
+        details.push(model.to_owned());
+    }
+    if details.is_empty() {
+        String::new()
+    } else {
+        format!("({})", details.join(" "))
     }
 }
 
@@ -2879,16 +2750,6 @@ fn device_matches_platform(device_platform: &str, platform: ApplePlatform) -> bo
         ApplePlatform::Tvos => device_platform == "TVOS",
         ApplePlatform::Watchos => device_platform == "WATCH" || device_platform == "WATCHOS",
         ApplePlatform::Macos => device_platform == "MAC_OS" || device_platform == "UNIVERSAL",
-    }
-}
-
-fn portal_profile_platform(platform: ApplePlatform) -> PortalProfilePlatform {
-    match platform {
-        ApplePlatform::Ios => PortalProfilePlatform::Ios,
-        ApplePlatform::Tvos => PortalProfilePlatform::Tvos,
-        ApplePlatform::Watchos => PortalProfilePlatform::Watchos,
-        ApplePlatform::Visionos => PortalProfilePlatform::Visionos,
-        ApplePlatform::Macos => PortalProfilePlatform::Macos,
     }
 }
 
@@ -3046,12 +2907,22 @@ fn asc_installer_certificate_type(profile: &ProfileManifest) -> Result<&'static 
     match profile.distribution {
         DistributionKind::MacAppStore => Ok("MAC_INSTALLER_DISTRIBUTION"),
         DistributionKind::DeveloperId => bail!(
-            "App Store Connect API key auth does not expose a Developer ID installer certificate type; log in with Apple ID so Orbit can use the Developer Portal flow"
+            "App Store Connect API key auth does not expose a Developer ID installer certificate type yet; use Apple ID so Orbit can use Developer Services cloud-managed certificates"
         ),
         _ => bail!(
             "installer signing is not implemented for {:?}",
             profile.distribution
         ),
+    }
+}
+
+fn developer_services_installer_certificate_type(
+    profile: &ProfileManifest,
+) -> Option<&'static str> {
+    match profile.distribution {
+        DistributionKind::MacAppStore => Some("MAC_INSTALLER_DISTRIBUTION"),
+        DistributionKind::DeveloperId => Some("DEVELOPER_ID_INSTALLER"),
+        _ => None,
     }
 }
 
@@ -3077,19 +2948,21 @@ fn orbit_managed_app_name(name: &str) -> String {
     }
 }
 
-fn is_macos_certificate_type(certificate_type: &str) -> bool {
-    matches!(
-        certificate_type,
-        "749Y1QAGU7" | "HXZEUKP0FP" | "2PQI8IDXNH" | "OYVN2GW35E" | "W0EURJRMC5"
-    )
+fn read_certificate_serial(path: &Path) -> Result<String> {
+    read_certificate_serial_with_format(path, Some("DER"))
 }
 
-fn read_certificate_serial(path: &Path) -> Result<String> {
+fn read_certificate_serial_pem(path: &Path) -> Result<String> {
+    read_certificate_serial_with_format(path, None)
+}
+
+fn read_certificate_serial_with_format(path: &Path, inform: Option<&str>) -> Result<String> {
     let mut command = Command::new("openssl");
+    command.arg("x509");
+    if let Some(inform) = inform {
+        command.args(["-inform", inform]);
+    }
     command.args([
-        "x509",
-        "-inform",
-        "DER",
         "-in",
         path.to_str()
             .context("certificate path contains invalid UTF-8")?,
@@ -3115,8 +2988,6 @@ fn team_signing_paths(project: &ProjectContext, team_id: &str) -> TeamSigningPat
         state_path: team_dir.join("signing.json"),
         certificates_dir: team_dir.join("certificates"),
         profiles_dir: team_dir.join("profiles"),
-        push_keys_dir: team_dir.join("push-keys"),
-        push_certificates_dir: team_dir.join("push-certificates"),
     }
 }
 
@@ -3186,149 +3057,144 @@ pub fn clean_local_signing_state(project: &ProjectContext) -> Result<LocalSignin
         false
     });
 
-    let mut removed_push_certificates = 0usize;
-    state.push_certificates.retain(|certificate| {
-        if !bundle_ids.contains(&certificate.bundle_id) {
-            return true;
-        }
-        let _ = delete_push_certificate_files(certificate);
-        let _ = delete_p12_password(&certificate.p12_password_account);
-        removed_push_certificates += 1;
-        false
-    });
-
     save_state(project, &team_id, &state)?;
     Ok(LocalSigningCleanSummary {
         removed_profiles,
         removed_certificates,
-        removed_push_certificates,
     })
 }
 
 pub fn clean_remote_signing_state(project: &ProjectContext) -> Result<RemoteSigningCleanSummary> {
-    let auth = ensure_portal_authenticated(
-        &project.app,
-        EnsureUserAuthRequest {
-            team_id: project.resolved_manifest.team_id.clone(),
-            provider_id: project.resolved_manifest.provider_id.clone(),
-            prompt_for_missing: project.app.interactive,
-            ..Default::default()
-        },
-    )?;
-    let team_id = auth.user.team_id.clone().context(
-        "remote cleanup requires an Apple Developer team selection; log in again and choose a team if prompted",
-    )?;
-    let mut client = PortalClient::from_session(&auth.session, team_id.clone())?;
+    let team_id = resolve_local_team_id(project)?;
+    let mut provisioning = ProvisioningClient::authenticate(&project.app, team_id.clone())?;
     let state = load_state(project, &team_id)?;
     let bundle_ids = project_bundle_ids(project);
     let orbit_app_name = orbit_managed_app_name(&project.resolved_manifest.name);
     let mut summary = RemoteSigningCleanSummary::default();
 
-    for platform in project.resolved_manifest.platforms.keys().copied() {
-        for profile in client.list_profiles(portal_profile_platform(platform))? {
-            let Some(app) = &profile.app else {
-                continue;
-            };
-            if bundle_ids.contains(&app.identifier) && profile.name.starts_with("*[orbit] ") {
-                client.delete_profile(portal_profile_platform(platform), &profile.id)?;
-                summary.removed_profiles += 1;
-            }
-        }
-    }
-
-    for target in &project.resolved_manifest.targets {
-        let platform = project
-            .resolved_manifest
-            .resolve_platform_for_target(target, None)?;
-        let mac = matches!(platform, ApplePlatform::Macos);
-        if let Some(app) = client.find_app_by_bundle_id(&target.bundle_id, mac)?
-            && app.name == orbit_app_name
-        {
-            client.delete_app(&app.id, mac)?;
-            summary.removed_apps += 1;
-        }
-    }
+    let stored_project_profile_ids = state
+        .profiles
+        .iter()
+        .filter(|profile| bundle_ids.contains(&profile.bundle_id))
+        .map(|profile| profile.id.clone())
+        .collect::<HashSet<_>>();
+    remove_orbit_managed_profiles(
+        &mut provisioning,
+        &bundle_ids,
+        &stored_project_profile_ids,
+        &mut summary,
+    )?;
+    remove_orbit_managed_bundle_ids(&mut provisioning, project, &orbit_app_name, &mut summary)?;
 
     let ProjectEntitlementIdentifiers {
         app_groups: entitlement_app_groups,
-        merchant_ids_by_mac,
+        merchant_ids,
         cloud_containers,
     } = project_entitlement_identifiers(project)?;
-    let app_groups = client.list_app_groups()?;
-    for identifier in entitlement_app_groups {
+    remove_orbit_managed_app_groups(&mut provisioning, entitlement_app_groups, &mut summary)?;
+    remove_orbit_managed_merchants(&mut provisioning, merchant_ids, &mut summary)?;
+    remove_orbit_managed_cloud_containers(&mut provisioning, cloud_containers, &mut summary)?;
+
+    Ok(summary)
+}
+
+fn remove_orbit_managed_profiles(
+    provisioning: &mut ProvisioningClient,
+    bundle_ids: &HashSet<String>,
+    stored_project_profile_ids: &HashSet<String>,
+    summary: &mut RemoteSigningCleanSummary,
+) -> Result<()> {
+    for profile in provisioning.list_profiles(None)? {
+        let Some(bundle_identifier) = profile.bundle_id_identifier.as_deref() else {
+            continue;
+        };
+        if !bundle_ids.contains(bundle_identifier) {
+            continue;
+        }
+        if stored_project_profile_ids.contains(&profile.id) || profile.name.starts_with("*[orbit] ")
+        {
+            provisioning.delete_profile(&profile.id)?;
+            summary.removed_profiles += 1;
+        }
+    }
+    Ok(())
+}
+
+fn remove_orbit_managed_bundle_ids(
+    provisioning: &mut ProvisioningClient,
+    project: &ProjectContext,
+    orbit_app_name: &str,
+    summary: &mut RemoteSigningCleanSummary,
+) -> Result<()> {
+    for target in &project.resolved_manifest.targets {
+        if let Some(bundle_id) = provisioning.find_bundle_id(&target.bundle_id)?
+            && bundle_id.name == orbit_app_name
+        {
+            provisioning.delete_bundle_id(&bundle_id.id)?;
+            summary.removed_apps += 1;
+        }
+    }
+    Ok(())
+}
+
+fn remove_orbit_managed_app_groups(
+    provisioning: &mut ProvisioningClient,
+    identifiers: Vec<String>,
+    summary: &mut RemoteSigningCleanSummary,
+) -> Result<()> {
+    let app_groups = provisioning.list_app_groups()?;
+    for identifier in identifiers {
         if let Some(group) = app_groups.iter().find(|group| {
             group.identifier == identifier
                 && group.name == identifier_name("App Group", &identifier)
         }) {
-            client.delete_app_group(&group.id)?;
+            provisioning.delete_app_group(&group.id)?;
             summary.removed_app_groups += 1;
         }
     }
+    Ok(())
+}
 
-    for (mac, identifiers) in merchant_ids_by_mac {
-        let merchants = client.list_merchants(mac)?;
-        for identifier in identifiers {
-            if let Some(merchant) = merchants.iter().find(|merchant| {
-                merchant.identifier == identifier
-                    && merchant.name == identifier_name("Merchant ID", &identifier)
-            }) {
-                client.delete_merchant(&merchant.id, mac)?;
-                summary.removed_merchants += 1;
-            }
+fn remove_orbit_managed_merchants(
+    provisioning: &mut ProvisioningClient,
+    identifiers: Vec<String>,
+    summary: &mut RemoteSigningCleanSummary,
+) -> Result<()> {
+    let merchants = provisioning.list_merchant_ids()?;
+    for identifier in identifiers {
+        if let Some(merchant) = merchants.iter().find(|merchant| {
+            merchant.identifier == identifier
+                && merchant.name == identifier_name("Merchant ID", &identifier)
+        }) {
+            provisioning.delete_merchant_id(&merchant.id)?;
+            summary.removed_merchants += 1;
         }
     }
+    Ok(())
+}
 
-    summary.skipped_cloud_containers = cloud_containers;
-
-    let project_certificate_ids = state
-        .profiles
-        .iter()
-        .filter(|profile| bundle_ids.contains(&profile.bundle_id))
-        .flat_map(|profile| profile.certificate_ids.iter().cloned())
-        .collect::<HashSet<_>>();
-    let certificate_ids_used_elsewhere = state
-        .profiles
-        .iter()
-        .filter(|profile| !bundle_ids.contains(&profile.bundle_id))
-        .flat_map(|profile| profile.certificate_ids.iter().cloned())
-        .collect::<HashSet<_>>();
-    for certificate in &state.certificates {
-        if !project_certificate_ids.contains(&certificate.id)
-            || certificate_ids_used_elsewhere.contains(&certificate.id)
-            || certificate.origin != CertificateOrigin::Generated
-        {
-            continue;
+fn remove_orbit_managed_cloud_containers(
+    provisioning: &mut ProvisioningClient,
+    identifiers: Vec<String>,
+    summary: &mut RemoteSigningCleanSummary,
+) -> Result<()> {
+    let containers = provisioning.list_cloud_containers()?;
+    for identifier in identifiers {
+        if let Some(container) = containers.iter().find(|container| {
+            container.identifier == identifier
+                && container.name == identifier_name("iCloud Container", &identifier)
+        }) {
+            provisioning.delete_cloud_container(&container.id)?;
+            summary.removed_cloud_containers += 1;
         }
-        client.revoke_certificate(
-            &certificate.id,
-            &certificate.certificate_type,
-            is_macos_certificate_type(&certificate.certificate_type),
-        )?;
-        summary.removed_certificates += 1;
     }
-
-    for certificate in &state.push_certificates {
-        if !bundle_ids.contains(&certificate.bundle_id)
-            || certificate.origin != CertificateOrigin::Generated
-        {
-            continue;
-        }
-        client.revoke_certificate(
-            &certificate.id,
-            &certificate.certificate_type,
-            certificate.certificate_type == "HQ4KP3I34R"
-                || certificate.certificate_type == "CDZ7EMXIZ1",
-        )?;
-        summary.removed_push_certificates += 1;
-    }
-
-    Ok(summary)
+    Ok(())
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
 struct ProjectEntitlementIdentifiers {
     app_groups: Vec<String>,
-    merchant_ids_by_mac: HashMap<bool, Vec<String>>,
+    merchant_ids: Vec<String>,
     cloud_containers: Vec<String>,
 }
 
@@ -3345,16 +3211,13 @@ fn project_entitlement_identifiers(
     project: &ProjectContext,
 ) -> Result<ProjectEntitlementIdentifiers> {
     let mut app_groups = HashSet::new();
-    let mut merchant_ids_by_mac = HashMap::<bool, HashSet<String>>::new();
+    let mut merchant_ids = HashSet::new();
     let mut cloud_containers = HashSet::new();
 
     for target in &project.resolved_manifest.targets {
         let Some(entitlements_path) = &target.entitlements else {
             continue;
         };
-        let platform = project
-            .resolved_manifest
-            .resolve_platform_for_target(target, None)?;
         let plan =
             capability_sync_plan_from_entitlements(&project.root.join(entitlements_path), &[])?;
         app_groups.extend(collect_identifier_values(&plan.updates, |relationships| {
@@ -3363,20 +3226,14 @@ fn project_entitlement_identifiers(
         cloud_containers.extend(collect_identifier_values(&plan.updates, |relationships| {
             relationships.cloud_containers.as_ref()
         }));
-        merchant_ids_by_mac
-            .entry(matches!(platform, ApplePlatform::Macos))
-            .or_default()
-            .extend(collect_identifier_values(&plan.updates, |relationships| {
-                relationships.merchant_ids.as_ref()
-            }));
+        merchant_ids.extend(collect_identifier_values(&plan.updates, |relationships| {
+            relationships.merchant_ids.as_ref()
+        }));
     }
 
     Ok(ProjectEntitlementIdentifiers {
         app_groups: sorted_strings(app_groups),
-        merchant_ids_by_mac: merchant_ids_by_mac
-            .into_iter()
-            .map(|(mac, identifiers)| (mac, sorted_strings(identifiers)))
-            .collect(),
+        merchant_ids: sorted_strings(merchant_ids),
         cloud_containers: sorted_strings(cloud_containers),
     })
 }
@@ -3604,6 +3461,8 @@ fn recover_orphaned_certificate(
             serial_number: serial_number.to_owned(),
             origin: CertificateOrigin::Generated,
             display_name: display_name.map(ToOwned::to_owned),
+            system_keychain_path: None,
+            system_signing_identity: None,
             private_key_path,
             certificate_der_path,
             p12_path,
@@ -3668,6 +3527,111 @@ fn parse_codesigning_identity_line(line: &str) -> Option<(String, String)> {
     Some((hash, name))
 }
 
+fn keychain_identities(keychain_path: &str, policy: &str) -> Result<Vec<(String, String)>> {
+    let mut find_identity = Command::new("security");
+    find_identity.args(["find-identity", "-v", "-p", policy, keychain_path]);
+    let output = crate::util::command_output(&mut find_identity)?;
+    Ok(output
+        .lines()
+        .filter_map(parse_codesigning_identity_line)
+        .collect())
+}
+
+fn user_keychain_paths() -> Result<Vec<PathBuf>> {
+    let mut command = Command::new("security");
+    command.args(["list-keychains", "-d", "user"]);
+    let output = crate::util::command_output(&mut command)?;
+    let mut keychains = output
+        .lines()
+        .map(|line| PathBuf::from(line.trim().trim_matches('"')))
+        .filter(|path| !path.as_os_str().is_empty())
+        .collect::<Vec<_>>();
+    if keychains.is_empty() {
+        keychains.push(PathBuf::from("login.keychain-db"));
+    }
+    Ok(keychains)
+}
+
+fn keychain_certificate_records(keychain_path: &str) -> Result<Vec<(String, String)>> {
+    let mut command = Command::new("security");
+    command.args(["find-certificate", "-a", "-Z", "-p", keychain_path]);
+    let output = crate::util::command_output(&mut command)?;
+    let mut records = Vec::new();
+    let mut current_sha1 = None::<String>;
+    let mut current_pem = Vec::new();
+    let mut in_pem = false;
+    for line in output.lines() {
+        if let Some(hash) = line.strip_prefix("SHA-1 hash: ") {
+            current_sha1 = Some(hash.trim().to_owned());
+            continue;
+        }
+        if line == "-----BEGIN CERTIFICATE-----" {
+            in_pem = true;
+            current_pem.clear();
+        }
+        if in_pem {
+            current_pem.push(line.to_owned());
+            if line == "-----END CERTIFICATE-----" {
+                if let Some(hash) = current_sha1.take() {
+                    records.push((hash, current_pem.join("\n")));
+                }
+                current_pem.clear();
+                in_pem = false;
+            }
+        }
+    }
+    Ok(records)
+}
+
+fn recover_system_keychain_identity(
+    serial_number: &str,
+    display_name: Option<&str>,
+) -> Result<Option<SigningIdentity>> {
+    for keychain_path in user_keychain_paths()? {
+        let keychain_str = keychain_path
+            .to_str()
+            .context("keychain path contains invalid UTF-8")?;
+        let mut identities = HashMap::new();
+        for policy in ["codesigning", "basic"] {
+            for (hash, name) in keychain_identities(keychain_str, policy)? {
+                identities.entry(hash).or_insert(name);
+            }
+        }
+        if identities.is_empty() {
+            continue;
+        }
+
+        for (hash, pem) in keychain_certificate_records(keychain_str)? {
+            let Some(identity_name) = identities.get(&hash) else {
+                continue;
+            };
+            let temp = NamedTempFile::new()?;
+            fs::write(temp.path(), pem.as_bytes())
+                .with_context(|| format!("failed to write {}", temp.path().display()))?;
+            let local_serial = read_certificate_serial_pem(temp.path())?;
+            if !local_serial.eq_ignore_ascii_case(serial_number) {
+                continue;
+            }
+            if let Some(display_name) = display_name
+                && !identity_name.contains(display_name)
+            {
+                let local_common_name = read_certificate_common_name(temp.path())?;
+                if !local_common_name
+                    .as_deref()
+                    .is_some_and(|common_name| common_name.contains(display_name))
+                {
+                    continue;
+                }
+            }
+            return Ok(Some(SigningIdentity {
+                hash,
+                keychain_path: keychain_path.clone(),
+            }));
+        }
+    }
+    Ok(None)
+}
+
 fn delete_file_if_exists(path: &Path) -> Result<()> {
     if path.exists() {
         fs::remove_file(path).with_context(|| format!("failed to remove {}", path.display()))?;
@@ -3676,12 +3640,6 @@ fn delete_file_if_exists(path: &Path) -> Result<()> {
 }
 
 fn delete_certificate_files(certificate: &ManagedCertificate) -> Result<()> {
-    delete_file_if_exists(&certificate.private_key_path)?;
-    delete_file_if_exists(&certificate.certificate_der_path)?;
-    delete_file_if_exists(&certificate.p12_path)
-}
-
-fn delete_push_certificate_files(certificate: &ManagedPushCertificate) -> Result<()> {
     delete_file_if_exists(&certificate.private_key_path)?;
     delete_file_if_exists(&certificate.certificate_der_path)?;
     delete_file_if_exists(&certificate.p12_path)
@@ -3700,6 +3658,10 @@ fn import_p12_into_keychain(p12_path: &Path, keychain_path: &str, password: &str
         password,
         "-T",
         "/usr/bin/codesign",
+        "-T",
+        "/usr/bin/productbuild",
+        "-T",
+        "/usr/bin/productsign",
         "-T",
         "/usr/bin/security",
     ]);
@@ -3728,10 +3690,20 @@ fn ensure_keychain_in_search_list(keychain_path: &str) -> Result<()> {
     crate::util::run_command(&mut update)
 }
 
-fn import_certificate_into_keychain(
+fn resolve_signing_identity(
     project: &ProjectContext,
     certificate: &ManagedCertificate,
-) -> Result<String> {
+) -> Result<SigningIdentity> {
+    if let (Some(hash), Some(keychain_path)) = (
+        certificate.system_signing_identity.as_ref(),
+        certificate.system_keychain_path.as_ref(),
+    ) {
+        return Ok(SigningIdentity {
+            hash: hash.clone(),
+            keychain_path: keychain_path.clone(),
+        });
+    }
+
     let keychain_path = &project.app.global_paths.keychain_path;
     if !keychain_path.exists() {
         let mut create = Command::new("security");
@@ -3791,25 +3763,27 @@ fn import_certificate_into_keychain(
     ]);
     let _ = crate::util::command_output_allow_failure(&mut partition);
 
-    let mut find_identity = Command::new("security");
-    find_identity.args(["find-identity", "-v", "-p", "codesigning", keychain_str]);
-    let output = crate::util::command_output(&mut find_identity)?;
-    let identities = output
-        .lines()
-        .filter_map(parse_codesigning_identity_line)
-        .collect::<Vec<_>>();
     let expected_common_name = read_der_certificate_common_name(&certificate.certificate_der_path)?
         .or_else(|| certificate.display_name.clone());
-    if let Some(expected_common_name) = expected_common_name
-        && let Some((hash, _)) = identities
-            .iter()
-            .find(|(_, name)| name == &expected_common_name)
-    {
-        return Ok(hash.clone());
-    }
+    for policy in ["codesigning", "basic"] {
+        let identities = keychain_identities(keychain_str, policy)?;
+        if let Some(expected_common_name) = expected_common_name.as_ref()
+            && let Some((hash, _)) = identities
+                .iter()
+                .find(|(_, name)| name == expected_common_name)
+        {
+            return Ok(SigningIdentity {
+                hash: hash.clone(),
+                keychain_path: keychain_path.clone(),
+            });
+        }
 
-    if let [identity] = identities.as_slice() {
-        return Ok(identity.0.clone());
+        if let [identity] = identities.as_slice() {
+            return Ok(SigningIdentity {
+                hash: identity.0.clone(),
+                keychain_path: keychain_path.clone(),
+            });
+        }
     }
 
     bail!(
@@ -3820,7 +3794,7 @@ fn import_certificate_into_keychain(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, HashMap};
+    use std::collections::BTreeMap;
 
     use plist::Value;
     use tempfile::TempDir;
@@ -3829,12 +3803,15 @@ mod tests {
         ASC_OPTION_APPLE_ID_PRIMARY_CONSENT, ASC_OPTION_DATA_PROTECTION_COMPLETE,
         ASC_OPTION_PUSH_BROADCAST, CertificateOrigin, ManagedCertificate, ManagedProfile,
         ProfileManifest, ProjectEntitlementIdentifiers, SigningState, asc_capability_settings,
-        asc_profile_type, clean_local_signing_state, load_state, materialize_signing_entitlements,
-        orbit_managed_app_name, parse_certificate_common_name, parse_codesigning_identity_line,
-        plan_asc_capability_mutations, project_entitlement_identifiers, save_state,
-        target_is_app_clip, team_signing_paths,
+        asc_profile_type, clean_local_signing_state, current_profile_for_target,
+        format_cached_device_label, load_state, materialize_signing_entitlements,
+        missing_registered_devices, orbit_managed_app_name, parse_certificate_common_name,
+        parse_codesigning_identity_line, plan_asc_capability_mutations, profile_udids,
+        project_entitlement_identifiers, same_udid_set, save_state, target_is_app_clip,
+        team_signing_paths, validate_push_setup_with_api_key,
     };
     use crate::apple::capabilities::{CapabilityRelationships, CapabilityUpdate, RemoteCapability};
+    use crate::apple::device::CachedDevice;
     use crate::context::{AppContext, GlobalPaths, ProjectContext, ProjectPaths};
     use crate::manifest::{
         ApplePlatform, BuildConfiguration, DistributionKind, ManifestSchema, PlatformManifest,
@@ -3961,6 +3938,8 @@ mod tests {
                     serial_number: "CURRENT".to_owned(),
                     origin: CertificateOrigin::Generated,
                     display_name: None,
+                    system_keychain_path: None,
+                    system_signing_identity: None,
                     private_key_path: current_key_path.clone(),
                     certificate_der_path: current_cer_path.clone(),
                     p12_path: current_p12_path.clone(),
@@ -3972,6 +3951,8 @@ mod tests {
                     serial_number: "OTHER".to_owned(),
                     origin: CertificateOrigin::Generated,
                     display_name: None,
+                    system_keychain_path: None,
+                    system_signing_identity: None,
                     private_key_path: other_key_path.clone(),
                     certificate_der_path: other_cer_path.clone(),
                     p12_path: other_p12_path.clone(),
@@ -3998,8 +3979,6 @@ mod tests {
                     device_ids: Vec::new(),
                 },
             ],
-            push_keys: Vec::new(),
-            push_certificates: Vec::new(),
         };
         save_state(&project, team_id, &state).unwrap();
 
@@ -4044,10 +4023,7 @@ mod tests {
             identifiers,
             ProjectEntitlementIdentifiers {
                 app_groups: vec!["group.dev.orbit.fixture".to_owned()],
-                merchant_ids_by_mac: HashMap::from([(
-                    false,
-                    vec!["merchant.dev.orbit.fixture".to_owned()],
-                )]),
+                merchant_ids: vec!["merchant.dev.orbit.fixture".to_owned()],
                 cloud_containers: vec!["iCloud.dev.orbit.fixture".to_owned()],
             }
         );
@@ -4372,6 +4348,31 @@ mod tests {
     }
 
     #[test]
+    fn plain_push_flag_is_allowed_with_api_key_auth() {
+        let (_temp, mut project) = test_project();
+        project.resolved_manifest.targets[0].push = Some(crate::manifest::PushManifest {
+            broadcast_for_live_activities: false,
+        });
+        let target = &project.resolved_manifest.targets[0];
+        let options = validate_push_setup_with_api_key(target);
+        assert!(options.uses_push_notifications);
+        assert!(!options.uses_broadcast_push_notifications);
+    }
+
+    #[test]
+    fn api_key_path_warns_and_skips_broadcast_push_setting() {
+        let (_temp, mut project) = test_project();
+        project.resolved_manifest.targets[0].push = Some(crate::manifest::PushManifest {
+            broadcast_for_live_activities: true,
+        });
+
+        let target = &project.resolved_manifest.targets[0];
+        let options = validate_push_setup_with_api_key(target);
+        assert!(options.uses_push_notifications);
+        assert!(!options.uses_broadcast_push_notifications);
+    }
+
+    #[test]
     fn sanitizes_orbit_managed_app_name_for_apple() {
         assert_eq!(
             orbit_managed_app_name("@orbit/Example IOS-App"),
@@ -4402,5 +4403,86 @@ mod tests {
                 "Apple Development: Ilya Ivankin (FVTTLAH6QU)".to_owned()
             ))
         );
+    }
+
+    #[test]
+    fn ad_hoc_device_helpers_match_eas_style_reuse_logic() {
+        let devices = vec![
+            CachedDevice {
+                id: "DEV-1".to_owned(),
+                name: "Alice iPhone".to_owned(),
+                udid: "UDID-1".to_owned(),
+                platform: "IOS".to_owned(),
+                status: "ENABLED".to_owned(),
+                device_class: Some("IPHONE".to_owned()),
+                model: Some("iPhone17,1".to_owned()),
+                created_at: Some("2026-03-30T00:00:00Z".to_owned()),
+            },
+            CachedDevice {
+                id: "DEV-2".to_owned(),
+                name: "Bob iPad".to_owned(),
+                udid: "UDID-2".to_owned(),
+                platform: "IOS".to_owned(),
+                status: "ENABLED".to_owned(),
+                device_class: Some("IPAD".to_owned()),
+                model: Some("iPad16,3".to_owned()),
+                created_at: None,
+            },
+        ];
+        let profile = ManagedProfile {
+            id: "PROFILE".to_owned(),
+            profile_type: "IOS_APP_ADHOC".to_owned(),
+            bundle_id: "dev.orbit.fixture".to_owned(),
+            path: std::path::PathBuf::from("/tmp/profile.mobileprovision"),
+            uuid: None,
+            certificate_ids: vec!["CERT".to_owned()],
+            device_ids: vec!["DEV-1".to_owned()],
+        };
+
+        assert_eq!(profile_udids(&profile, &devices), vec!["UDID-1".to_owned()]);
+        assert!(!same_udid_set(
+            &devices
+                .iter()
+                .map(|device| device.udid.clone())
+                .collect::<Vec<_>>(),
+            &profile_udids(&profile, &devices),
+        ));
+        let missing = missing_registered_devices(&devices, &profile_udids(&profile, &devices));
+        assert_eq!(missing.len(), 1);
+        assert!(format_cached_device_label(&devices[0]).contains("UDID-1"));
+        assert!(format_cached_device_label(&devices[0]).contains("Alice iPhone"));
+    }
+
+    #[test]
+    fn current_profile_lookup_prefers_latest_matching_profile() {
+        let first = ManagedProfile {
+            id: "PROFILE-OLD".to_owned(),
+            profile_type: "IOS_APP_ADHOC".to_owned(),
+            bundle_id: "dev.orbit.fixture".to_owned(),
+            path: std::path::PathBuf::from("/tmp/old.mobileprovision"),
+            uuid: None,
+            certificate_ids: vec!["CERT".to_owned()],
+            device_ids: vec!["DEV-1".to_owned()],
+        };
+        let second = ManagedProfile {
+            id: "PROFILE-NEW".to_owned(),
+            profile_type: "IOS_APP_ADHOC".to_owned(),
+            bundle_id: "dev.orbit.fixture".to_owned(),
+            path: std::path::PathBuf::from("/tmp/new.mobileprovision"),
+            uuid: None,
+            certificate_ids: vec!["CERT".to_owned()],
+            device_ids: vec!["DEV-2".to_owned()],
+        };
+        std::fs::write(&first.path, b"old").unwrap();
+        std::fs::write(&second.path, b"new").unwrap();
+        let state = SigningState {
+            certificates: Vec::new(),
+            profiles: vec![first, second],
+        };
+
+        let profile =
+            current_profile_for_target(&state, "dev.orbit.fixture", "IOS_APP_ADHOC", "CERT")
+                .unwrap();
+        assert_eq!(profile.id, "PROFILE-NEW");
     }
 }

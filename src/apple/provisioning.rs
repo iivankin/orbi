@@ -1,28 +1,28 @@
-use std::io::BufReader;
-use std::sync::Arc;
+use std::collections::HashMap;
 
 use anyhow::{Context, Result, bail};
-use cookie_store::serde::json::load as load_cookie_store_json;
 use reqwest::Method;
-use reqwest::blocking::{Client, ClientBuilder};
-use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue, USER_AGENT};
-use reqwest_cookie_store::CookieStoreMutex;
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::apple::apple_id::StoredAppleSession;
-use crate::apple::asc_api::{IncludedResource, JsonApiListDocument};
+use crate::apple::asc_api::{
+    CertificateAttributes, DeviceAttributes, IncludedResource, JsonApiDocument,
+    JsonApiListDocument, ProfileAttributes, RelationshipData, Resource, ResourceLink,
+};
+use crate::apple::capabilities::{
+    RemoteCapability, RemoteCapabilityOption, RemoteCapabilitySetting,
+};
+use crate::apple::developer_services::DeveloperServicesClient;
+use crate::context::AppContext;
 
-const PROVISIONING_BASE_URL: &str = "https://developer.apple.com/services-account/v1/";
-const PROVISIONING_CONTENT_TYPE: &str = "application/vnd.api+json";
 const SETTING_ICLOUD_VERSION: &str = "ICLOUD_VERSION";
 const SETTING_DATA_PROTECTION: &str = "DATA_PROTECTION_PERMISSION_LEVEL";
 const SETTING_APPLE_ID_AUTH: &str = "TIBURON_APP_CONSENT";
 const SETTING_PUSH_NOTIFICATIONS: &str = "PUSH_NOTIFICATION_FEATURES";
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct ProvisioningClient {
-    client: Client,
+    developer_services: DeveloperServicesClient,
     team_id: String,
 }
 
@@ -32,11 +32,69 @@ pub struct ProvisioningBundleId {
     pub name: String,
     pub identifier: String,
     pub seed_id: String,
+    pub bundle_type: String,
+    pub has_exclusive_managed_capabilities: bool,
     pub capabilities: Vec<crate::apple::capabilities::RemoteCapability>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProvisioningAppGroup {
+    pub id: String,
+    pub name: String,
+    pub identifier: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProvisioningMerchantId {
+    pub id: String,
+    pub name: String,
+    pub identifier: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProvisioningCloudContainer {
+    pub id: String,
+    pub name: String,
+    pub identifier: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProvisioningCertificate {
+    pub id: String,
+    pub certificate_type: String,
+    pub display_name: Option<String>,
+    pub serial_number: Option<String>,
+    pub certificate_content: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProvisioningDevice {
+    pub id: String,
+    pub name: String,
+    pub udid: String,
+    pub platform: String,
+    pub device_class: Option<String>,
+    pub status: Option<String>,
+    pub model: Option<String>,
+    pub created_at: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProvisioningProfile {
+    pub id: String,
+    pub name: String,
+    pub profile_type: String,
+    pub uuid: Option<String>,
+    pub profile_content: Option<String>,
+    pub bundle_id_id: Option<String>,
+    pub bundle_id_identifier: Option<String>,
+    pub certificate_ids: Vec<String>,
+    pub device_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ProvisioningCapabilityUpdate {
+    pub remote_id: Option<String>,
     pub capability_type: String,
     pub option: String,
     pub relationships: ProvisioningCapabilityRelationships,
@@ -55,12 +113,14 @@ struct BundleIdAttributes {
     pub identifier: String,
     #[serde(rename = "seedId")]
     pub seed_id: String,
+    #[serde(rename = "bundleType", default)]
+    pub bundle_type: Option<String>,
+    #[serde(rename = "hasExclusiveManagedCapabilities", default)]
+    pub has_exclusive_managed_capabilities: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 struct BundleIdCapabilityAttributes {
-    #[serde(rename = "capabilityType", default)]
-    pub capability_type: Option<String>,
     #[serde(default)]
     pub enabled: Option<bool>,
     #[serde(default)]
@@ -82,63 +142,460 @@ struct CapabilitySettingOption {
 }
 
 impl ProvisioningClient {
-    pub fn from_session(session: &StoredAppleSession, team_id: impl Into<String>) -> Result<Self> {
-        let reader = BufReader::new(session.cookies_json.as_bytes());
-        let cookie_store = load_cookie_store_json(reader).map_err(|error| {
-            anyhow::anyhow!("failed to parse stored Apple session cookies: {error}")
-        })?;
-        let cookie_store = Arc::new(CookieStoreMutex::new(cookie_store));
-        let client = ClientBuilder::new()
-            .cookie_provider(cookie_store)
-            .user_agent(format!("orbit/{}", env!("CARGO_PKG_VERSION")))
-            .build()
-            .context("failed to create the Apple provisioning HTTP client")?;
+    pub fn authenticate(app: &AppContext, team_id: impl Into<String>) -> Result<Self> {
         Ok(Self {
-            client,
+            developer_services: DeveloperServicesClient::authenticate(app)?,
             team_id: team_id.into(),
         })
     }
 
-    pub fn find_bundle_id(&self, identifier: &str) -> Result<Option<ProvisioningBundleId>> {
+    pub fn find_bundle_id(&mut self, identifier: &str) -> Result<Option<ProvisioningBundleId>> {
         let response: JsonApiListDocument<BundleIdAttributes> = self.request_json(
             Method::GET,
             "bundleIds",
             &[
                 ("limit", "200".to_owned()),
-                ("filter[identifier]", identifier.to_owned()),
-                ("include", "bundleIdCapabilities".to_owned()),
-                (
-                    "fields[bundleIds]",
-                    "name,identifier,seedId,bundleIdCapabilities".to_owned(),
-                ),
-                (
-                    "fields[bundleIdCapabilities]",
-                    "capabilityType,enabled,settings".to_owned(),
-                ),
+                ("filter[bundleType]", "bundle".to_owned()),
+                ("filter[identifier]", format!("{identifier},*")),
             ],
             None,
         )?;
 
-        let Some(bundle_id) = response.data.into_iter().next() else {
+        let Some(bundle_id) = response
+            .data
+            .into_iter()
+            .find(|candidate| candidate.attributes.identifier == identifier)
+        else {
             return Ok(None);
         };
-        let capabilities = response
-            .included
-            .into_iter()
-            .filter(|resource| resource.resource_type == "bundleIdCapabilities")
-            .map(parse_remote_capability)
-            .collect::<Result<Vec<_>>>()?;
+        let capabilities = self.fetch_bundle_capabilities(&bundle_id.id)?;
         Ok(Some(ProvisioningBundleId {
             id: bundle_id.id,
             name: bundle_id.attributes.name,
             identifier: bundle_id.attributes.identifier,
             seed_id: bundle_id.attributes.seed_id,
+            bundle_type: bundle_id
+                .attributes
+                .bundle_type
+                .unwrap_or_else(|| "bundle".to_owned()),
+            has_exclusive_managed_capabilities: bundle_id
+                .attributes
+                .has_exclusive_managed_capabilities
+                .unwrap_or(false),
             capabilities,
         }))
     }
 
+    pub fn ensure_bundle_id(
+        &mut self,
+        name: &str,
+        identifier: &str,
+    ) -> Result<ProvisioningBundleId> {
+        if let Some(bundle_id) = self.find_bundle_id(identifier)? {
+            return Ok(bundle_id);
+        }
+        self.create_bundle_id(name, identifier)
+    }
+
+    pub fn create_bundle_id(
+        &mut self,
+        name: &str,
+        identifier: &str,
+    ) -> Result<ProvisioningBundleId> {
+        let request = json!({
+            "data": {
+                "type": "bundleIds",
+                "attributes": {
+                    "name": name,
+                    "identifier": identifier,
+                    "seedId": &self.team_id,
+                    "bundleType": "bundle",
+                    "hasExclusiveManagedCapabilities": false,
+                }
+            }
+        });
+        let _: JsonApiDocument<BundleIdAttributes> =
+            self.request_json(Method::POST, "bundleIds", &[], Some(request))?;
+        self.find_bundle_id(identifier)?.with_context(|| {
+            format!(
+                "created Apple bundle identifier `{identifier}` but failed to reload it from Developer Services"
+            )
+        })
+    }
+
+    pub fn list_app_groups(&mut self) -> Result<Vec<ProvisioningAppGroup>> {
+        let response: JsonApiListDocument<AppGroupAttributes> = self.request_json(
+            Method::GET,
+            "appGroups",
+            &[("limit", "200".to_owned())],
+            None,
+        )?;
+        Ok(response
+            .data
+            .into_iter()
+            .map(|group| ProvisioningAppGroup {
+                id: group.id,
+                name: group.attributes.name,
+                identifier: group.attributes.identifier,
+            })
+            .collect())
+    }
+
+    pub fn create_app_group(
+        &mut self,
+        name: &str,
+        identifier: &str,
+    ) -> Result<ProvisioningAppGroup> {
+        let request = json!({
+            "data": {
+                "type": "appGroups",
+                "attributes": {
+                    "name": name,
+                    "identifier": identifier,
+                }
+            }
+        });
+        let response: JsonApiDocument<AppGroupAttributes> =
+            self.request_json(Method::POST, "appGroups", &[], Some(request))?;
+        Ok(ProvisioningAppGroup {
+            id: response.data.id,
+            name: response.data.attributes.name,
+            identifier: response.data.attributes.identifier,
+        })
+    }
+
+    pub fn list_merchant_ids(&mut self) -> Result<Vec<ProvisioningMerchantId>> {
+        let response: JsonApiListDocument<MerchantIdAttributes> = self.request_json(
+            Method::GET,
+            "merchantIds",
+            &[("limit", "200".to_owned())],
+            None,
+        )?;
+        Ok(response
+            .data
+            .into_iter()
+            .map(|merchant| ProvisioningMerchantId {
+                id: merchant.id,
+                name: merchant.attributes.name,
+                identifier: merchant.attributes.identifier,
+            })
+            .collect())
+    }
+
+    pub fn create_merchant_id(
+        &mut self,
+        name: &str,
+        identifier: &str,
+    ) -> Result<ProvisioningMerchantId> {
+        let request = json!({
+            "data": {
+                "type": "merchantIds",
+                "attributes": {
+                    "name": name,
+                    "identifier": identifier,
+                }
+            }
+        });
+        let response: JsonApiDocument<MerchantIdAttributes> =
+            self.request_json(Method::POST, "merchantIds", &[], Some(request))?;
+        Ok(ProvisioningMerchantId {
+            id: response.data.id,
+            name: response.data.attributes.name,
+            identifier: response.data.attributes.identifier,
+        })
+    }
+
+    pub fn delete_merchant_id(&mut self, merchant_id: &str) -> Result<()> {
+        self.request_empty(
+            Method::DELETE,
+            &format!("merchantIds/{merchant_id}"),
+            &[],
+            None,
+        )
+    }
+
+    pub fn list_cloud_containers(&mut self) -> Result<Vec<ProvisioningCloudContainer>> {
+        let response: JsonApiListDocument<CloudContainerAttributes> = self.request_json(
+            Method::GET,
+            "cloudContainers",
+            &[("limit", "200".to_owned())],
+            None,
+        )?;
+        Ok(response
+            .data
+            .into_iter()
+            .map(|container| ProvisioningCloudContainer {
+                id: container.id,
+                name: container.attributes.name,
+                identifier: container.attributes.identifier,
+            })
+            .collect())
+    }
+
+    pub fn create_cloud_container(
+        &mut self,
+        name: &str,
+        identifier: &str,
+    ) -> Result<ProvisioningCloudContainer> {
+        let request = json!({
+            "data": {
+                "type": "cloudContainers",
+                "attributes": {
+                    "name": name,
+                    "identifier": identifier,
+                }
+            }
+        });
+        let response: JsonApiDocument<CloudContainerAttributes> =
+            self.request_json(Method::POST, "cloudContainers", &[], Some(request))?;
+        Ok(ProvisioningCloudContainer {
+            id: response.data.id,
+            name: response.data.attributes.name,
+            identifier: response.data.attributes.identifier,
+        })
+    }
+
+    pub fn delete_cloud_container(&mut self, cloud_container_id: &str) -> Result<()> {
+        self.request_empty(
+            Method::DELETE,
+            &format!("cloudContainers/{cloud_container_id}"),
+            &[],
+            None,
+        )
+    }
+
+    pub fn list_certificates(
+        &mut self,
+        certificate_type: &str,
+    ) -> Result<Vec<ProvisioningCertificate>> {
+        let response: JsonApiListDocument<CertificateAttributes> = self.request_json(
+            Method::GET,
+            "certificates",
+            &[
+                ("limit", "200".to_owned()),
+                ("filter[certificateType]", certificate_type.to_owned()),
+            ],
+            None,
+        )?;
+        Ok(response
+            .data
+            .into_iter()
+            .map(|certificate| ProvisioningCertificate {
+                id: certificate.id,
+                certificate_type: certificate.attributes.certificate_type,
+                display_name: certificate.attributes.display_name,
+                serial_number: certificate.attributes.serial_number,
+                certificate_content: certificate.attributes.certificate_content,
+            })
+            .collect())
+    }
+
+    pub fn create_certificate(
+        &mut self,
+        certificate_type: &str,
+        csr_content: &str,
+        machine_id: Option<&str>,
+        machine_name: Option<&str>,
+    ) -> Result<ProvisioningCertificate> {
+        let mut attributes = json!({
+            "certificateType": certificate_type,
+            "csrContent": csr_content,
+        });
+        if let Some(machine_id) = machine_id {
+            attributes["machineId"] = json!(machine_id);
+        }
+        if let Some(machine_name) = machine_name {
+            attributes["machineName"] = json!(machine_name);
+        }
+        let request = json!({
+            "data": {
+                "type": "certificates",
+                "attributes": attributes
+            }
+        });
+        let response: JsonApiDocument<CertificateAttributes> =
+            self.request_json(Method::POST, "certificates", &[], Some(request))?;
+        Ok(ProvisioningCertificate {
+            id: response.data.id,
+            certificate_type: response.data.attributes.certificate_type,
+            display_name: response.data.attributes.display_name,
+            serial_number: response.data.attributes.serial_number,
+            certificate_content: response.data.attributes.certificate_content,
+        })
+    }
+
+    pub fn delete_certificate(&mut self, certificate_id: &str) -> Result<()> {
+        self.request_empty(
+            Method::DELETE,
+            &format!("certificates/{certificate_id}"),
+            &[],
+            None,
+        )
+    }
+
+    pub fn list_devices(&mut self) -> Result<Vec<ProvisioningDevice>> {
+        let response: JsonApiListDocument<DeviceAttributes> = self.request_json(
+            Method::GET,
+            "devices",
+            &[
+                ("limit", "200".to_owned()),
+                ("filter[status]", "ENABLED".to_owned()),
+            ],
+            None,
+        )?;
+        Ok(response
+            .data
+            .into_iter()
+            .map(|device| ProvisioningDevice {
+                id: device.id,
+                name: device.attributes.name,
+                udid: device.attributes.udid,
+                platform: device.attributes.platform,
+                device_class: device.attributes.device_class,
+                status: device.attributes.status,
+                model: device.attributes.model,
+                created_at: device.attributes.added_date,
+            })
+            .collect())
+    }
+
+    pub fn find_device_by_udid(&mut self, udid: &str) -> Result<Option<ProvisioningDevice>> {
+        let response: JsonApiListDocument<DeviceAttributes> = self.request_json(
+            Method::GET,
+            "devices",
+            &[
+                ("limit", "200".to_owned()),
+                ("filter[udid]", udid.to_owned()),
+                ("filter[status]", "ENABLED".to_owned()),
+            ],
+            None,
+        )?;
+        Ok(response
+            .data
+            .into_iter()
+            .next()
+            .map(|device| ProvisioningDevice {
+                id: device.id,
+                name: device.attributes.name,
+                udid: device.attributes.udid,
+                platform: device.attributes.platform,
+                device_class: device.attributes.device_class,
+                status: device.attributes.status,
+                model: device.attributes.model,
+                created_at: device.attributes.added_date,
+            }))
+    }
+
+    pub fn create_device(
+        &mut self,
+        name: &str,
+        udid: &str,
+        platform: &str,
+    ) -> Result<ProvisioningDevice> {
+        let request = json!({
+            "data": {
+                "type": "devices",
+                "attributes": {
+                    "name": name,
+                    "udid": udid,
+                    "platform": platform,
+                }
+            }
+        });
+        let response: JsonApiDocument<DeviceAttributes> =
+            self.request_json(Method::POST, "devices", &[], Some(request))?;
+        Ok(ProvisioningDevice {
+            id: response.data.id,
+            name: response.data.attributes.name,
+            udid: response.data.attributes.udid,
+            platform: response.data.attributes.platform,
+            device_class: response.data.attributes.device_class,
+            status: response.data.attributes.status,
+            model: response.data.attributes.model,
+            created_at: response.data.attributes.added_date,
+        })
+    }
+
+    pub fn delete_device(&mut self, device_id: &str) -> Result<()> {
+        self.request_empty(Method::DELETE, &format!("devices/{device_id}"), &[], None)
+    }
+
+    pub fn create_profile(
+        &mut self,
+        profile_type: &str,
+        bundle_id_id: &str,
+    ) -> Result<ProvisioningProfile> {
+        let request = json!({
+            "data": {
+                "type": "profiles",
+                "attributes": {
+                    "profileType": profile_type,
+                },
+                "relationships": {
+                    "bundleId": {
+                        "data": {
+                            "id": bundle_id_id,
+                            "type": "bundleIds",
+                        }
+                    }
+                }
+            }
+        });
+        let response: JsonApiDocument<ProfileAttributes> =
+            self.request_json(Method::POST, "profiles", &[], Some(request))?;
+        Ok(parse_provisioning_profile(response.data, &HashMap::new()))
+    }
+
+    pub fn list_profiles(
+        &mut self,
+        profile_type: Option<&str>,
+    ) -> Result<Vec<ProvisioningProfile>> {
+        let mut query = vec![
+            ("limit", "200".to_owned()),
+            ("filter[profileState]", "ACTIVE".to_owned()),
+            ("include", "bundleId,devices,certificates".to_owned()),
+        ];
+        if let Some(profile_type) = profile_type {
+            query.push(("filter[profileType]", profile_type.to_owned()));
+        }
+        let response: JsonApiListDocument<ProfileAttributes> =
+            self.request_json(Method::GET, "profiles", &query, None)?;
+        parse_provisioning_profiles(response)
+    }
+
+    pub fn delete_profile(&mut self, profile_id: &str) -> Result<()> {
+        self.request_empty(Method::DELETE, &format!("profiles/{profile_id}"), &[], None)
+    }
+
+    pub fn delete_bundle_capability(&mut self, capability_id: &str) -> Result<()> {
+        self.request_empty(
+            Method::DELETE,
+            &format!("bundleIdCapabilities/{capability_id}"),
+            &[],
+            None,
+        )
+    }
+
+    pub fn delete_bundle_id(&mut self, bundle_id_id: &str) -> Result<()> {
+        self.request_empty(
+            Method::DELETE,
+            &format!("bundleIds/{bundle_id_id}"),
+            &[],
+            None,
+        )
+    }
+
+    pub fn delete_app_group(&mut self, app_group_id: &str) -> Result<()> {
+        self.request_empty(
+            Method::DELETE,
+            &format!("appGroups/{app_group_id}"),
+            &[],
+            None,
+        )
+    }
+
     pub fn update_bundle_capabilities(
-        &self,
+        &mut self,
         bundle_id: &ProvisioningBundleId,
         updates: &[ProvisioningCapabilityUpdate],
     ) -> Result<()> {
@@ -155,9 +612,12 @@ impl ProvisioningClient {
                 "id": &bundle_id.id,
                 "type": "bundleIds",
                 "attributes": {
+                    "teamId": &self.team_id,
                     "name": &bundle_id.name,
                     "identifier": &bundle_id.identifier,
                     "seedId": &bundle_id.seed_id,
+                    "bundleType": &bundle_id.bundle_type,
+                    "hasExclusiveManagedCapabilities": bundle_id.has_exclusive_managed_capabilities,
                 },
                 "relationships": {
                     "bundleIdCapabilities": {
@@ -177,7 +637,7 @@ impl ProvisioningClient {
     }
 
     fn request_json<T>(
-        &self,
+        &mut self,
         method: Method,
         path: &str,
         query: &[(&str, String)],
@@ -186,275 +646,331 @@ impl ProvisioningClient {
     where
         T: for<'de> Deserialize<'de>,
     {
-        let response = self.send(method.clone(), path, query, body)?;
-        let status = response.status();
-        let bytes = response
-            .bytes()
-            .context("failed to read Apple provisioning response body")?;
-        if !status.is_success() {
-            bail!(
-                "Apple provisioning request `{path}` failed with {status}: {}",
-                String::from_utf8_lossy(&bytes)
-            );
-        }
-        serde_json::from_slice(&bytes)
-            .with_context(|| format!("failed to parse Apple provisioning response for `{path}`"))
+        self.developer_services
+            .request_json(method, path, query, Some(self.team_id.as_str()), body)
     }
 
-    fn send(
-        &self,
+    fn request_empty(
+        &mut self,
         method: Method,
         path: &str,
         query: &[(&str, String)],
         body: Option<serde_json::Value>,
-    ) -> Result<reqwest::blocking::Response> {
-        let url = format!("{PROVISIONING_BASE_URL}{path}");
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            CONTENT_TYPE,
-            HeaderValue::from_static(PROVISIONING_CONTENT_TYPE),
-        );
-        headers.insert(
-            "X-Requested-With",
-            HeaderValue::from_static("XMLHttpRequest"),
-        );
-        headers.insert(
-            USER_AGENT,
-            HeaderValue::from_str(&format!("orbit/{}", env!("CARGO_PKG_VERSION")))?,
-        );
+    ) -> Result<()> {
+        self.developer_services.request_empty(
+            method,
+            path,
+            query,
+            Some(self.team_id.as_str()),
+            body,
+        )
+    }
 
-        let (actual_method, payload) = if matches!(method, Method::GET | Method::DELETE) {
-            headers.insert(
-                "X-HTTP-Method-Override",
-                HeaderValue::from_str(method.as_str())?,
-            );
-            (
-                Method::POST,
-                json!({
-                    "urlEncodedQueryParams": encode_query(query)?,
-                    "teamId": self.team_id.clone(),
-                }),
-            )
-        } else {
-            let mut payload =
-                body.context("Apple provisioning write request must include a JSON body")?;
-            payload["data"]["attributes"]["teamId"] =
-                serde_json::Value::String(self.team_id.clone());
-            (method, payload)
-        };
-
-        self.client
-            .request(actual_method, url)
-            .headers(headers)
-            .json(&payload)
-            .send()
-            .with_context(|| format!("failed to call Apple provisioning endpoint `{path}`"))
+    fn fetch_bundle_capabilities(&mut self, bundle_id_id: &str) -> Result<Vec<RemoteCapability>> {
+        let response: JsonApiDocument<BundleIdAttributes> = self.request_json(
+            Method::GET,
+            &format!("bundleIds/{bundle_id_id}"),
+            &[(
+                "include",
+                "bundleIdCapabilities.capability,bundleIdCapabilities.appGroups,bundleIdCapabilities.cloudContainers,bundleIdCapabilities.merchantIds,bundleIdCapabilities.associatedBundleIds".to_owned(),
+            )],
+            None,
+        )?;
+        response
+            .included
+            .into_iter()
+            .filter(|resource| resource.resource_type == "bundleIdCapabilities")
+            .map(parse_remote_capability)
+            .collect()
     }
 }
 
-fn parse_remote_capability(
-    resource: IncludedResource,
-) -> Result<crate::apple::capabilities::RemoteCapability> {
+#[derive(Debug, Clone, Deserialize)]
+struct AppGroupAttributes {
+    pub name: String,
+    pub identifier: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct MerchantIdAttributes {
+    pub name: String,
+    pub identifier: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct CloudContainerAttributes {
+    pub name: String,
+    pub identifier: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ProfileBundleIdAttributes {
+    pub identifier: String,
+}
+
+fn parse_provisioning_profile(
+    resource: Resource<ProfileAttributes>,
+    bundle_ids_by_id: &HashMap<String, String>,
+) -> ProvisioningProfile {
+    let bundle_id_id = relationship_one_id_from_relationships(&resource.relationships, "bundleId");
+    ProvisioningProfile {
+        id: resource.id,
+        name: resource.attributes.name,
+        profile_type: resource.attributes.profile_type,
+        uuid: resource.attributes.uuid,
+        profile_content: resource.attributes.profile_content,
+        bundle_id_identifier: bundle_id_id
+            .as_ref()
+            .and_then(|id| bundle_ids_by_id.get(id).cloned()),
+        bundle_id_id,
+        certificate_ids: relationship_many_ids(&resource.relationships, "certificates"),
+        device_ids: relationship_many_ids(&resource.relationships, "devices"),
+    }
+}
+
+fn parse_provisioning_profiles(
+    response: JsonApiListDocument<ProfileAttributes>,
+) -> Result<Vec<ProvisioningProfile>> {
+    let bundle_ids_by_id = response
+        .included
+        .into_iter()
+        .filter(|resource| resource.resource_type == "bundleIds")
+        .map(|resource| {
+            let attributes: ProfileBundleIdAttributes = serde_json::from_value(resource.attributes)
+                .context("failed to parse Developer Services profile bundle identifier")?;
+            Ok((resource.id, attributes.identifier))
+        })
+        .collect::<Result<HashMap<_, _>>>()?;
+
+    Ok(response
+        .data
+        .into_iter()
+        .map(|resource| parse_provisioning_profile(resource, &bundle_ids_by_id))
+        .collect())
+}
+
+fn parse_remote_capability(resource: IncludedResource) -> Result<RemoteCapability> {
+    let capability_type = relationship_one_id(&resource, "capability").unwrap_or_default();
     let attributes: BundleIdCapabilityAttributes = serde_json::from_value(resource.attributes)
-        .context("failed to parse bundle capability attributes")?;
-    Ok(crate::apple::capabilities::RemoteCapability {
-        id: resource.id.clone(),
-        capability_type: attributes.capability_type.unwrap_or_else(|| {
-            resource
-                .id
-                .split_once('_')
-                .map(|(_, suffix)| suffix.to_owned())
-                .unwrap_or_default()
-        }),
+        .context("failed to parse Developer Services bundle capability attributes")?;
+    Ok(RemoteCapability {
+        id: resource.id,
+        capability_type,
         enabled: attributes.enabled,
         settings: attributes
             .settings
             .unwrap_or_default()
             .into_iter()
-            .map(
-                |setting| crate::apple::capabilities::RemoteCapabilitySetting {
-                    key: setting.key,
-                    options: setting
-                        .options
-                        .into_iter()
-                        .map(
-                            |option| crate::apple::capabilities::RemoteCapabilityOption {
-                                key: option.key,
-                                enabled: option.enabled.unwrap_or(false),
-                            },
-                        )
-                        .collect(),
-                },
-            )
+            .map(|setting| RemoteCapabilitySetting {
+                key: setting.key,
+                options: setting
+                    .options
+                    .into_iter()
+                    .map(|option| RemoteCapabilityOption {
+                        key: option.key,
+                        enabled: option.enabled.unwrap_or(false),
+                    })
+                    .collect(),
+            })
             .collect(),
     })
+}
+
+fn relationship_one_id(resource: &IncludedResource, key: &str) -> Option<String> {
+    let relationship = resource.relationships.get(key)?;
+    match relationship.data.as_ref()? {
+        RelationshipData::One(ResourceLink { id, .. }) => Some(id.clone()),
+        RelationshipData::Many(_) => None,
+    }
+}
+
+fn relationship_one_id_from_relationships(
+    relationships: &std::collections::HashMap<String, crate::apple::asc_api::Relationship>,
+    key: &str,
+) -> Option<String> {
+    let relationship = relationships.get(key)?;
+    match relationship.data.as_ref()? {
+        RelationshipData::One(ResourceLink { id, .. }) => Some(id.clone()),
+        RelationshipData::Many(_) => None,
+    }
+}
+
+fn relationship_many_ids(
+    relationships: &std::collections::HashMap<String, crate::apple::asc_api::Relationship>,
+    key: &str,
+) -> Vec<String> {
+    let Some(relationship) = relationships.get(key) else {
+        return Vec::new();
+    };
+    match relationship.data.as_ref() {
+        Some(RelationshipData::Many(links)) => links.iter().map(|link| link.id.clone()).collect(),
+        Some(RelationshipData::One(link)) => vec![link.id.clone()],
+        None => Vec::new(),
+    }
 }
 
 fn build_capability_relationship(
     update: &ProvisioningCapabilityUpdate,
 ) -> Result<serde_json::Value> {
-    let enabled = update.option != "OFF";
-    let mut relationships = json!({
-        "capability": {
+    let mut relationships = capability_relationships(&update.relationships);
+    relationships.insert(
+        "capability".to_owned(),
+        json!({
             "data": {
                 "id": update.capability_type,
                 "type": "capabilities",
             }
-        }
-    });
-
-    if let Some(ids) = &update.relationships.app_groups {
-        relationships["appGroups"] = json_relationship("appGroups", ids);
-    }
-    if let Some(ids) = &update.relationships.merchant_ids {
-        relationships["merchantIds"] = json_relationship("merchantIds", ids);
-    }
-    if let Some(ids) = &update.relationships.cloud_containers {
-        relationships["cloudContainers"] = json_relationship("cloudContainers", ids);
-    }
-
-    let mut settings = Vec::new();
-    if enabled && let Some((key, option)) = capability_setting(update)? {
-        settings.push(json!({
-            "key": key,
-            "options": [
-                {
-                    "key": option,
-                    "enabled": true,
-                }
-            ]
-        }));
-    }
-
-    Ok(json!({
-        "type": "bundleIdCapabilities",
+        }),
+    );
+    let mut value = json!({
         "attributes": {
-            "enabled": enabled,
-            "settings": settings,
+            "enabled": update.option != "OFF",
+            "settings": capability_settings(update)?,
         },
         "relationships": relationships,
-    }))
-}
-
-fn capability_setting(
-    update: &ProvisioningCapabilityUpdate,
-) -> Result<Option<(&'static str, &str)>> {
-    match update.capability_type.as_str() {
-        "ICLOUD" => match update.option.as_str() {
-            "XCODE_5" | "XCODE_6" => Ok(Some((SETTING_ICLOUD_VERSION, update.option.as_str()))),
-            "ON" => Ok(Some((SETTING_ICLOUD_VERSION, "XCODE_6"))),
-            "OFF" => Ok(None),
-            other => bail!(
-                "invalid iCloud capability option `{other}`; expected ON, OFF, XCODE_5, or XCODE_6"
-            ),
-        },
-        "DATA_PROTECTION" => match update.option.as_str() {
-            "COMPLETE_PROTECTION" | "PROTECTED_UNLESS_OPEN" | "PROTECTED_UNTIL_FIRST_USER_AUTH" => {
-                Ok(Some((SETTING_DATA_PROTECTION, update.option.as_str())))
-            }
-            "ON" => Ok(Some((SETTING_DATA_PROTECTION, "COMPLETE_PROTECTION"))),
-            "OFF" => Ok(None),
-            other => bail!(
-                "invalid data protection capability option `{other}`; expected ON, OFF, COMPLETE_PROTECTION, PROTECTED_UNLESS_OPEN, or PROTECTED_UNTIL_FIRST_USER_AUTH"
-            ),
-        },
-        "APPLE_ID_AUTH" => match update.option.as_str() {
-            "PRIMARY_APP_CONSENT" => Ok(Some((SETTING_APPLE_ID_AUTH, update.option.as_str()))),
-            "ON" => Ok(Some((SETTING_APPLE_ID_AUTH, "PRIMARY_APP_CONSENT"))),
-            "OFF" => Ok(None),
-            other => bail!(
-                "invalid Sign In with Apple capability option `{other}`; expected ON, OFF, or PRIMARY_APP_CONSENT"
-            ),
-        },
-        "PUSH_NOTIFICATIONS" => match update.option.as_str() {
-            "PUSH_NOTIFICATION_FEATURE_BROADCAST" => {
-                Ok(Some((SETTING_PUSH_NOTIFICATIONS, update.option.as_str())))
-            }
-            "ON" | "OFF" => Ok(None),
-            other => bail!(
-                "invalid push capability option `{other}`; expected ON, OFF, or PUSH_NOTIFICATION_FEATURE_BROADCAST"
-            ),
-        },
-        _ => match update.option.as_str() {
-            "ON" | "OFF" => Ok(None),
-            other => bail!(
-                "invalid capability option `{other}` for `{}`; Orbit only supports ON/OFF for this capability",
-                update.capability_type
-            ),
-        },
+        "type": "bundleIdCapabilities",
+    });
+    if let Some(remote_id) = &update.remote_id {
+        value["id"] = json!(remote_id);
     }
+    Ok(value)
 }
 
-fn json_relationship(resource_type: &str, ids: &[String]) -> serde_json::Value {
-    json!({
-        "data": ids
-            .iter()
-            .map(|id| {
-                json!({
-                    "type": resource_type,
-                    "id": id,
-                })
-            })
-            .collect::<Vec<_>>()
-    })
+fn capability_settings(update: &ProvisioningCapabilityUpdate) -> Result<Vec<serde_json::Value>> {
+    if update.option.is_empty() || update.option == "OFF" {
+        return Ok(Vec::new());
+    }
+
+    let key = match update.capability_type.as_str() {
+        "ICLOUD" => SETTING_ICLOUD_VERSION,
+        "DATA_PROTECTION" => SETTING_DATA_PROTECTION,
+        "APPLE_ID_AUTH" => SETTING_APPLE_ID_AUTH,
+        "PUSH_NOTIFICATIONS" => {
+            if update.option == "ON" {
+                return Ok(Vec::new());
+            }
+            SETTING_PUSH_NOTIFICATIONS
+        }
+        _ => {
+            if update.option == "ON" {
+                return Ok(Vec::new());
+            }
+            bail!(
+                "unsupported capability option `{}` for {}",
+                update.option,
+                update.capability_type
+            )
+        }
+    };
+
+    Ok(vec![json!({
+        "key": key,
+        "options": [
+            {
+                "key": update.option,
+                "enabled": true,
+            }
+        ]
+    })])
 }
 
-fn encode_query(query: &[(&str, String)]) -> Result<String> {
-    let url = reqwest::Url::parse_with_params(
-        "https://orbit.invalid",
-        query.iter().map(|(key, value)| (*key, value.as_str())),
-    )
-    .context("failed to encode provisioning query parameters")?;
-    Ok(url.query().unwrap_or_default().to_owned())
+fn capability_relationships(
+    relationships: &ProvisioningCapabilityRelationships,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut map = serde_json::Map::new();
+
+    if let Some(app_groups) = &relationships.app_groups {
+        map.insert(
+            "appGroups".to_owned(),
+            json!({
+                "data": app_groups
+                    .iter()
+                    .map(|id| json!({ "id": id, "type": "appGroups" }))
+                    .collect::<Vec<_>>(),
+            }),
+        );
+    }
+
+    if let Some(merchant_ids) = &relationships.merchant_ids {
+        map.insert(
+            "merchantIds".to_owned(),
+            json!({
+                "data": merchant_ids
+                    .iter()
+                    .map(|id| json!({ "id": id, "type": "merchantIds" }))
+                    .collect::<Vec<_>>(),
+            }),
+        );
+    }
+
+    if let Some(cloud_containers) = &relationships.cloud_containers {
+        map.insert(
+            "cloudContainers".to_owned(),
+            json!({
+                "data": cloud_containers
+                    .iter()
+                    .map(|id| json!({ "id": id, "type": "cloudContainers" }))
+                    .collect::<Vec<_>>(),
+            }),
+        );
+    }
+
+    map
 }
 
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
-
-    use super::{
-        ProvisioningCapabilityRelationships, ProvisioningCapabilityUpdate,
-        build_capability_relationship,
-    };
-
-    const OPTION_DATA_PROTECTION_COMPLETE: &str = "COMPLETE_PROTECTION";
+    use super::parse_provisioning_profiles;
+    use crate::apple::asc_api::JsonApiListDocument;
 
     #[test]
-    fn builds_data_protection_relationship() {
-        let value = build_capability_relationship(&ProvisioningCapabilityUpdate {
-            capability_type: "DATA_PROTECTION".to_owned(),
-            option: OPTION_DATA_PROTECTION_COMPLETE.to_owned(),
-            relationships: ProvisioningCapabilityRelationships::default(),
-        })
-        .unwrap();
+    fn parses_profile_bundle_identifier_from_included_bundle_id() {
+        let response: JsonApiListDocument<crate::apple::asc_api::ProfileAttributes> =
+            serde_json::from_value(serde_json::json!({
+                "data": [
+                    {
+                        "id": "PROFILE123",
+                        "type": "profiles",
+                        "attributes": {
+                            "name": "Orbit Development",
+                            "profileType": "IOS_APP_DEVELOPMENT",
+                            "profileState": "ACTIVE",
+                            "profileContent": "c29tZS1wcm9maWxl",
+                            "uuid": "UUID-123"
+                        },
+                        "relationships": {
+                            "bundleId": {
+                                "data": { "id": "BUNDLE123", "type": "bundleIds" }
+                            },
+                            "certificates": {
+                                "data": [{ "id": "CERT123", "type": "certificates" }]
+                            },
+                            "devices": {
+                                "data": [{ "id": "DEVICE123", "type": "devices" }]
+                            }
+                        }
+                    }
+                ],
+                "included": [
+                    {
+                        "id": "BUNDLE123",
+                        "type": "bundleIds",
+                        "attributes": {
+                            "identifier": "dev.orbit.example"
+                        }
+                    }
+                ]
+            }))
+            .unwrap();
 
-        assert_eq!(value["attributes"]["enabled"], json!(true));
+        let profiles = parse_provisioning_profiles(response).unwrap();
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(profiles[0].bundle_id_id.as_deref(), Some("BUNDLE123"));
         assert_eq!(
-            value["attributes"]["settings"][0]["key"],
-            json!("DATA_PROTECTION_PERMISSION_LEVEL")
+            profiles[0].bundle_id_identifier.as_deref(),
+            Some("dev.orbit.example")
         );
-        assert_eq!(
-            value["attributes"]["settings"][0]["options"][0]["key"],
-            json!(OPTION_DATA_PROTECTION_COMPLETE)
-        );
-    }
-
-    #[test]
-    fn builds_identifier_relationships_with_empty_arrays() {
-        let value = build_capability_relationship(&ProvisioningCapabilityUpdate {
-            capability_type: "APP_GROUPS".to_owned(),
-            option: "ON".to_owned(),
-            relationships: ProvisioningCapabilityRelationships {
-                app_groups: Some(Vec::new()),
-                merchant_ids: None,
-                cloud_containers: None,
-            },
-        })
-        .unwrap();
-
-        assert_eq!(
-            value["relationships"]["appGroups"]["data"],
-            serde_json::Value::Array(Vec::new())
-        );
+        assert_eq!(profiles[0].certificate_ids, vec!["CERT123"]);
+        assert_eq!(profiles[0].device_ids, vec!["DEVICE123"]);
     }
 }

@@ -67,6 +67,7 @@ pub struct CapabilitySyncPlan {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CapabilitySyncOptions {
+    pub uses_push_notifications: bool,
     pub uses_broadcast_push_notifications: bool,
 }
 
@@ -690,10 +691,10 @@ pub fn capability_sync_plan_from_entitlements_with_options(
     let dictionary = value
         .into_dictionary()
         .context("entitlements file must contain a top-level dictionary")?;
-    capability_sync_plan_from_dictionary(&dictionary, remote, options)
+    capability_sync_plan_from_dictionary_with_options(&dictionary, remote, options)
 }
 
-fn capability_sync_plan_from_dictionary(
+pub fn capability_sync_plan_from_dictionary_with_options(
     dictionary: &Dictionary,
     remote: &[RemoteCapability],
     options: &CapabilitySyncOptions,
@@ -755,6 +756,8 @@ fn capability_sync_plan_from_dictionary(
         }
     }
 
+    apply_synthetic_push_update(&mut updates, &mut remaining_remote, options);
+
     for existing in remaining_remote {
         let Some(capability_type) = effective_capability_type(&existing) else {
             continue;
@@ -789,6 +792,38 @@ fn capability_sync_plan_from_dictionary(
     let mut updates = updates.into_values().collect::<Vec<_>>();
     updates.sort_by(|left, right| left.capability_type.cmp(&right.capability_type));
     Ok(CapabilitySyncPlan { updates })
+}
+
+fn apply_synthetic_push_update(
+    updates: &mut BTreeMap<String, CapabilityUpdate>,
+    remaining_remote: &mut Vec<RemoteCapability>,
+    options: &CapabilitySyncOptions,
+) {
+    if !options.uses_push_notifications || updates.contains_key("PUSH_NOTIFICATIONS") {
+        return;
+    }
+
+    let desired_option = if options.uses_broadcast_push_notifications {
+        OPTION_PUSH_BROADCAST
+    } else {
+        OPTION_ON
+    };
+    let existing_index = remaining_remote
+        .iter()
+        .position(|candidate| effective_capability_type(candidate) == Some("PUSH_NOTIFICATIONS"));
+    let existing = existing_index.map(|index| &remaining_remote[index]);
+    let matches_remote = existing.is_some_and(|existing| {
+        existing.is_enabled()
+            && (existing.settings.is_empty() != options.uses_broadcast_push_notifications)
+    });
+    if matches_remote {
+        if let Some(index) = existing_index {
+            remaining_remote.remove(index);
+        }
+        return;
+    }
+
+    upsert_update(updates, "PUSH_NOTIFICATIONS", desired_option.to_owned());
 }
 
 fn compute_sync_operation(
@@ -1172,7 +1207,7 @@ mod tests {
         CapabilitySyncOptions, CapabilitySyncPlan, OPTION_APPLE_ID_PRIMARY_CONSENT,
         OPTION_DATA_PROTECTION_COMPLETE, OPTION_DATA_PROTECTION_PROTECTED_UNLESS_OPEN, OPTION_OFF,
         OPTION_ON, OPTION_PUSH_BROADCAST, RemoteCapability, RemoteCapabilityOption,
-        RemoteCapabilitySetting, capability_sync_plan_from_dictionary,
+        RemoteCapabilitySetting, capability_sync_plan_from_dictionary_with_options,
     };
 
     fn remote_capability(
@@ -1199,12 +1234,20 @@ mod tests {
     }
 
     fn plan(dictionary: plist::Dictionary, remote: Vec<RemoteCapability>) -> CapabilitySyncPlan {
-        capability_sync_plan_from_dictionary(
+        capability_sync_plan_from_dictionary_with_options(
             &dictionary,
             &remote,
             &CapabilitySyncOptions::default(),
         )
         .unwrap()
+    }
+
+    fn plan_with_options(
+        dictionary: plist::Dictionary,
+        remote: Vec<RemoteCapability>,
+        options: CapabilitySyncOptions,
+    ) -> CapabilitySyncPlan {
+        capability_sync_plan_from_dictionary_with_options(&dictionary, &remote, &options).unwrap()
     }
 
     #[test]
@@ -1333,17 +1376,14 @@ mod tests {
 
     #[test]
     fn uses_broadcast_push_option_when_requested() {
-        let plan = capability_sync_plan_from_dictionary(
-            &plist::Dictionary::from_iter([(
-                "aps-environment".to_owned(),
-                Value::String("development".to_owned()),
-            )]),
-            &[],
-            &CapabilitySyncOptions {
+        let plan = plan_with_options(
+            plist::Dictionary::new(),
+            vec![],
+            CapabilitySyncOptions {
+                uses_push_notifications: true,
                 uses_broadcast_push_notifications: true,
             },
-        )
-        .unwrap();
+        );
 
         assert_eq!(plan.updates.len(), 1);
         assert_eq!(plan.updates[0].capability_type, "PUSH_NOTIFICATIONS");
@@ -1351,8 +1391,24 @@ mod tests {
     }
 
     #[test]
+    fn enables_push_when_requested_without_explicit_entitlement_key() {
+        let plan = plan_with_options(
+            plist::Dictionary::new(),
+            vec![],
+            CapabilitySyncOptions {
+                uses_push_notifications: true,
+                uses_broadcast_push_notifications: false,
+            },
+        );
+
+        assert_eq!(plan.updates.len(), 1);
+        assert_eq!(plan.updates[0].capability_type, "PUSH_NOTIFICATIONS");
+        assert_eq!(plan.updates[0].option, OPTION_ON);
+    }
+
+    #[test]
     fn rejects_data_protection_none() {
-        let error = capability_sync_plan_from_dictionary(
+        let error = capability_sync_plan_from_dictionary_with_options(
             &plist::Dictionary::from_iter([(
                 "com.apple.developer.default-data-protection".to_owned(),
                 Value::String("NSFileProtectionNone".to_owned()),

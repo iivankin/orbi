@@ -31,6 +31,19 @@ pub struct Toolchain {
     pub target_triple: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct BundleBuildMetadata {
+    pub build_machine_os_build: String,
+    pub compiler: String,
+    pub platform_build: String,
+    pub platform_name: String,
+    pub platform_version: String,
+    pub sdk_build: String,
+    pub sdk_name: String,
+    pub xcode: String,
+    pub xcode_build: String,
+}
+
 impl Toolchain {
     pub fn resolve(
         platform: ApplePlatform,
@@ -164,6 +177,30 @@ impl Toolchain {
             ApplePlatform::Macos => &["mac"],
         }
     }
+
+    pub fn bundle_build_metadata(&self) -> Result<BundleBuildMetadata> {
+        let sdk_version = self.sdk_value("--show-sdk-version")?;
+        let sdk_build = self.sdk_value("--show-sdk-build-version")?;
+        let (xcode, xcode_build) = xcode_metadata()?;
+
+        Ok(BundleBuildMetadata {
+            build_machine_os_build: macos_build_version()?,
+            compiler: "com.apple.compilers.llvm.clang.1_0".to_owned(),
+            platform_build: sdk_build.clone(),
+            platform_name: self.sdk_name.clone(),
+            platform_version: sdk_version.clone(),
+            sdk_build,
+            sdk_name: format!("{}{}", self.sdk_name, sdk_version),
+            xcode,
+            xcode_build,
+        })
+    }
+
+    fn sdk_value(&self, flag: &str) -> Result<String> {
+        let value =
+            command_output(Command::new("xcrun").args(["--sdk", self.sdk_name.as_str(), flag]))?;
+        Ok(value.trim().to_owned())
+    }
 }
 
 fn host_architecture() -> Result<String> {
@@ -173,4 +210,40 @@ fn host_architecture() -> Result<String> {
         "arm64" | "x86_64" => Ok(architecture.to_owned()),
         other => bail!("unsupported host architecture `{other}`"),
     }
+}
+
+fn macos_build_version() -> Result<String> {
+    let output = command_output(Command::new("sw_vers").arg("-buildVersion"))?;
+    Ok(output.trim().to_owned())
+}
+
+fn xcode_metadata() -> Result<(String, String)> {
+    let output = command_output(Command::new("xcodebuild").arg("-version"))?;
+    let mut xcode_version = None;
+    let mut xcode_build = None;
+    for line in output.lines() {
+        if let Some(version) = line.strip_prefix("Xcode ") {
+            xcode_version = Some(normalize_xcode_version(version.trim())?);
+        } else if let Some(build) = line.strip_prefix("Build version ") {
+            xcode_build = Some(build.trim().to_owned());
+        }
+    }
+    match (xcode_version, xcode_build) {
+        (Some(version), Some(build)) => Ok((version, build)),
+        _ => bail!("failed to parse `xcodebuild -version` output"),
+    }
+}
+
+fn normalize_xcode_version(version: &str) -> Result<String> {
+    let mut components = version.split('.').map(str::trim);
+    let major = components
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("missing major Xcode version"))?
+        .parse::<u64>()?;
+    let minor = components.next().unwrap_or("0").parse::<u64>()?;
+    let patch = components.next().unwrap_or("0").parse::<u64>()?;
+    if components.next().is_some() {
+        bail!("unsupported Xcode version format `{version}`");
+    }
+    Ok((major * 100 + minor * 10 + patch).to_string())
 }
