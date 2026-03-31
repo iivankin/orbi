@@ -146,6 +146,39 @@ pub fn create_swift_package_workspace(root: &Path) -> PathBuf {
     )
 }
 
+pub fn create_testing_workspace(root: &Path) -> PathBuf {
+    create_workspace(
+        root,
+        "swift-testing-workspace",
+        &[
+            (
+                "Sources/App/App.swift",
+                "func greeting() -> String { \"Orbit\" }\n@main struct ExampleAppMain { static func main() { print(greeting()) } }\n",
+            ),
+            (
+                "Tests/Unit/AppTests.swift",
+                "import Testing\n@testable import ExampleApp\n@Test func smoke() { #expect(greeting() == \"Orbit\") }\n",
+            ),
+        ],
+        &serde_json::json!({
+            "$schema": "/tmp/.orbit/schemas/apple-app.v1.json",
+            "name": "ExampleApp",
+            "bundle_id": "dev.orbit.fixture.testing",
+            "version": "0.1.0",
+            "build": 1,
+            "platforms": {
+                "ios": "18.0"
+            },
+            "sources": ["Sources/App"],
+            "tests": {
+                "unit": {
+                    "sources": ["Tests/Unit"]
+                }
+            }
+        }),
+    )
+}
+
 pub fn create_xcframework_workspace(root: &Path) -> PathBuf {
     create_workspace(
         root,

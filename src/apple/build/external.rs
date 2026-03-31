@@ -60,6 +60,12 @@ pub(crate) struct SwiftPackageManifest {
     pub targets: Vec<SwiftPackageTarget>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct ResolvedSwiftPackageDependency {
+    pub root: PathBuf,
+    pub manifest: SwiftPackageManifest,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub(crate) struct SwiftPackageProduct {
     pub name: String,
@@ -147,6 +153,15 @@ pub(crate) fn resolve_external_link_inputs(
     dedup_vec(&mut inputs.embedded_payloads);
 
     Ok(inputs)
+}
+
+pub(crate) fn resolve_swift_package_dependency(
+    project: &ProjectContext,
+    dependency: &SwiftPackageDependency,
+) -> Result<ResolvedSwiftPackageDependency> {
+    let root = swift_package_root(project, dependency)?;
+    let (_, manifest) = load_swift_package_manifest(project, &root)?;
+    Ok(ResolvedSwiftPackageDependency { root, manifest })
 }
 
 pub(crate) fn target_dependency_watch_roots(

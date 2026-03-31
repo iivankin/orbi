@@ -65,6 +65,7 @@ pub struct ProvisioningCertificate {
     pub certificate_type: String,
     pub display_name: Option<String>,
     pub serial_number: Option<String>,
+    pub expiration_date: Option<String>,
     pub certificate_content: Option<String>,
 }
 
@@ -86,6 +87,7 @@ pub struct ProvisioningProfile {
     pub name: String,
     pub profile_type: String,
     pub uuid: Option<String>,
+    pub expiration_date: Option<String>,
     pub profile_content: Option<String>,
     pub bundle_id_id: Option<String>,
     pub bundle_id_identifier: Option<String>,
@@ -377,6 +379,7 @@ impl ProvisioningClient {
                 certificate_type: certificate.attributes.certificate_type,
                 display_name: certificate.attributes.display_name,
                 serial_number: certificate.attributes.serial_number,
+                expiration_date: certificate.attributes.expiration_date,
                 certificate_content: certificate.attributes.certificate_content,
             })
             .collect())
@@ -412,6 +415,7 @@ impl ProvisioningClient {
             certificate_type: response.data.attributes.certificate_type,
             display_name: response.data.attributes.display_name,
             serial_number: response.data.attributes.serial_number,
+            expiration_date: response.data.attributes.expiration_date,
             certificate_content: response.data.attributes.certificate_content,
         })
     }
@@ -710,6 +714,7 @@ fn parse_provisioning_profile(
         name: resource.attributes.name,
         profile_type: resource.attributes.profile_type,
         uuid: resource.attributes.uuid,
+        expiration_date: resource.attributes.expiration_date,
         profile_content: resource.attributes.profile_content,
         bundle_id_identifier: bundle_id_id
             .as_ref()

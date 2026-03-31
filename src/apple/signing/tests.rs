@@ -22,7 +22,7 @@ use crate::apple::device::CachedDevice;
 use crate::context::{AppContext, GlobalPaths, ProjectContext, ProjectPaths};
 use crate::manifest::{
     ApplePlatform, BuildConfiguration, DistributionKind, HooksManifest, ManifestSchema,
-    PlatformManifest, QualityManifest, ResolvedManifest, TargetKind, TargetManifest,
+    PlatformManifest, QualityManifest, ResolvedManifest, TargetKind, TargetManifest, TestsManifest,
 };
 
 fn test_project() -> (TempDir, ProjectContext) {
@@ -46,6 +46,7 @@ fn test_project() -> (TempDir, ProjectContext) {
         team_id: Some("TEAM123456".to_owned()),
         provider_id: None,
         hooks: HooksManifest::default(),
+        tests: TestsManifest::default(),
         quality: QualityManifest::default(),
         platforms: BTreeMap::from([(
             ApplePlatform::Ios,

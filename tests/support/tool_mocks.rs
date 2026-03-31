@@ -158,6 +158,32 @@ esac
     );
 }
 
+pub fn create_testing_swift_mock(mock_bin: &Path) {
+    write_executable(
+        &mock_bin.join("swift"),
+        r#"#!/bin/sh
+set -eu
+echo "swift $@" >> "$MOCK_LOG"
+if [ "$#" -lt 1 ] || [ "$1" != "test" ]; then
+  echo "unexpected swift command: $@" >&2
+  exit 1
+fi
+package_path=""
+prev=""
+for arg in "$@"; do
+  if [ "$prev" = "--package-path" ]; then
+    package_path="$arg"
+  fi
+  prev="$arg"
+done
+if [ -z "$package_path" ] || [ ! -f "$package_path/Package.swift" ]; then
+  echo "missing generated Package.swift" >&2
+  exit 1
+fi
+"#,
+    );
+}
+
 pub fn create_ditto_mock(mock_bin: &Path) {
     write_executable(
         &mock_bin.join("ditto"),

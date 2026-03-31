@@ -31,7 +31,7 @@ sha1 = "0.10.6"
 sha2 = "0.10.9"
 tempfile = "3.27.0"
 thiserror = "2.0.18"
-time = { version = "0.3.44", features = ["formatting"] }
+time = { version = "0.3.44", features = ["formatting", "parsing"] }
 uuid = { version = "1.22.0", features = ["v4"] }
 walkdir = "2.5.0"
 aes-gcm = "=0.10.3"

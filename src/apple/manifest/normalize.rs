@@ -57,6 +57,7 @@ fn normalize_manifest(
         team_id: app.team_id.clone(),
         provider_id: app.provider_id.clone(),
         hooks: app.hooks.clone().unwrap_or_default(),
+        tests: app.tests.clone().unwrap_or_default(),
         quality: app.quality.clone(),
         platforms: app
             .platforms
@@ -178,6 +179,26 @@ fn validate_root_manifest(app: &AppManifest) -> Result<()> {
         .count();
     if non_watch_platforms == 0 {
         bail!("the root app must declare at least one non-watch platform");
+    }
+    validate_test_target_sources(
+        "tests.unit",
+        app.tests.as_ref().and_then(|tests| tests.unit.as_ref()),
+    )?;
+    validate_test_target_sources(
+        "tests.ui",
+        app.tests.as_ref().and_then(|tests| tests.ui.as_ref()),
+    )?;
+    Ok(())
+}
+
+fn validate_test_target_sources(
+    field_name: &str,
+    target: Option<&super::authoring::TestTargetManifest>,
+) -> Result<()> {
+    if let Some(target) = target
+        && target.sources.is_empty()
+    {
+        bail!("`{field_name}` must declare at least one source root");
     }
     Ok(())
 }

@@ -18,7 +18,13 @@ const DEFAULT_RESOURCES_DIR: &str = "Resources";
 const DEFAULT_WATCH_APP_SOURCE_DIR: &str = "Sources/WatchApp";
 const DEFAULT_WATCH_EXTENSION_SOURCE_DIR: &str = "Sources/WatchExtension";
 
-const TEMPLATE_CHOICES: [TemplateChoice; 6] = [
+const ECOSYSTEM_CHOICES: [EcosystemChoice; 1] = [EcosystemChoice {
+    kind: InitEcosystem::Apple,
+    label: "Apple",
+    description: "iOS, macOS, tvOS, watchOS, and visionOS apps",
+}];
+
+const APPLE_TEMPLATE_CHOICES: [TemplateChoice; 6] = [
     TemplateChoice {
         kind: InitTemplate::IosApp,
         label: "iOS app",
@@ -52,6 +58,11 @@ const TEMPLATE_CHOICES: [TemplateChoice; 6] = [
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InitEcosystem {
+    Apple,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InitTemplate {
     IosApp,
     MacosApp,
@@ -59,6 +70,27 @@ enum InitTemplate {
     IosWatchCompanionApp,
     TvosApp,
     VisionosApp,
+}
+
+impl InitEcosystem {
+    fn manifest_schema(self) -> ManifestSchema {
+        match self {
+            Self::Apple => ManifestSchema::AppleAppV1,
+        }
+    }
+
+    fn template_choices(self) -> &'static [TemplateChoice] {
+        match self {
+            Self::Apple => &APPLE_TEMPLATE_CHOICES,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct EcosystemChoice {
+    kind: InitEcosystem,
+    label: &'static str,
+    description: &'static str,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -70,6 +102,7 @@ struct TemplateChoice {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct InitAnswers {
+    ecosystem: InitEcosystem,
     name: String,
     bundle_id: String,
     template: InitTemplate,
@@ -103,7 +136,7 @@ pub fn execute(app: &AppContext, requested_manifest: Option<&Path>) -> Result<()
         .parent()
         .context("manifest path did not contain a parent directory")?;
     let answers = collect_init_answers(project_root)?;
-    let schema_reference = installed_schema_reference(app);
+    let schema_reference = installed_schema_reference(app, answers.ecosystem);
     let plan = scaffold_plan(&answers, &schema_reference);
 
     create_scaffold(project_root, &manifest_path, &plan)?;
@@ -124,6 +157,7 @@ fn init_manifest_path(app: &AppContext, requested_manifest: Option<&Path>) -> Pa
 }
 
 fn collect_init_answers(project_root: &Path) -> Result<InitAnswers> {
+    let ecosystem = prompt_ecosystem()?;
     let default_name = suggested_product_name(project_root);
     let name = prompt_non_empty("Product name", Some(default_name.as_str()))?;
     let default_bundle_id = format!("dev.orbit.{}", bundle_id_suffix(&name));
@@ -133,26 +167,37 @@ fn collect_init_answers(project_root: &Path) -> Result<InitAnswers> {
         looks_like_bundle_id,
         "Enter a reverse-DNS bundle ID like `dev.orbit.exampleapp`.",
     )?;
-    let template = prompt_template()?;
+    let template = prompt_template(ecosystem)?;
 
     Ok(InitAnswers {
+        ecosystem,
         name,
         bundle_id,
         template,
     })
 }
 
-fn prompt_template() -> Result<InitTemplate> {
-    let labels = TEMPLATE_CHOICES
+fn prompt_ecosystem() -> Result<InitEcosystem> {
+    let labels = ECOSYSTEM_CHOICES
+        .iter()
+        .map(|choice| format!("{}: {}", choice.label, choice.description))
+        .collect::<Vec<_>>();
+    let index = prompt_select("Ecosystem", &labels)?;
+    Ok(ECOSYSTEM_CHOICES[index].kind)
+}
+
+fn prompt_template(ecosystem: InitEcosystem) -> Result<InitTemplate> {
+    let labels = ecosystem
+        .template_choices()
         .iter()
         .map(|choice| format!("{}: {}", choice.label, choice.description))
         .collect::<Vec<_>>();
     let index = prompt_select("Template", &labels)?;
-    Ok(TEMPLATE_CHOICES[index].kind)
+    Ok(ecosystem.template_choices()[index].kind)
 }
 
-fn installed_schema_reference(app: &AppContext) -> String {
-    installed_schema_path(&app.global_paths.schema_dir, ManifestSchema::AppleAppV1)
+fn installed_schema_reference(app: &AppContext, ecosystem: InitEcosystem) -> String {
+    installed_schema_path(&app.global_paths.schema_dir, ecosystem.manifest_schema())
         .display()
         .to_string()
 }
@@ -630,10 +675,19 @@ mod tests {
     }
 
     #[test]
+    fn apple_ecosystem_maps_to_apple_manifest_schema() {
+        assert_eq!(
+            InitEcosystem::Apple.manifest_schema(),
+            ManifestSchema::AppleAppV1
+        );
+    }
+
+    #[test]
     fn ios_template_uses_default_manifest_shape_and_files() {
         let schema_path = "/tmp/.orbit/schemas/apple-app.v1.json";
         let plan = scaffold_plan(
             &InitAnswers {
+                ecosystem: InitEcosystem::Apple,
                 name: "Example App".to_owned(),
                 bundle_id: "dev.orbit.exampleapp".to_owned(),
                 template: InitTemplate::IosApp,
@@ -677,6 +731,7 @@ mod tests {
         let schema_path = "/tmp/.orbit/schemas/apple-app.v1.json";
         let plan = scaffold_plan(
             &InitAnswers {
+                ecosystem: InitEcosystem::Apple,
                 name: "Example App".to_owned(),
                 bundle_id: "dev.orbit.exampleapp".to_owned(),
                 template: InitTemplate::IosWatchCompanionApp,
@@ -720,6 +775,7 @@ mod tests {
         let manifest_path = temp.path().join("nested/orbit.json");
         let plan = scaffold_plan(
             &InitAnswers {
+                ecosystem: InitEcosystem::Apple,
                 name: "Example App".to_owned(),
                 bundle_id: "dev.orbit.exampleapp".to_owned(),
                 template: InitTemplate::AppleMultiplatformApp,

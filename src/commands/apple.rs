@@ -11,6 +11,10 @@ pub fn execute(app: &AppContext, cli: &Cli) -> Result<()> {
         Command::Init(_) => unreachable!("`init` is handled before Apple dispatch"),
         Command::Lint(args) => apple::quality::lint_project(app, args, cli.manifest.as_deref()),
         Command::Format(args) => apple::quality::format_project(app, args, cli.manifest.as_deref()),
+        Command::Test(args) => {
+            let project = app.load_project(cli.manifest.as_deref())?;
+            apple::testing::run_tests(&project, args)
+        }
         Command::Deps(deps_args) => match &deps_args.command {
             DepsCommand::Update(args) => {
                 apple::deps::update_dependencies(app, args, cli.manifest.as_deref())

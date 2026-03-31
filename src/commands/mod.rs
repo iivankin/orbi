@@ -10,7 +10,7 @@ use crate::manifest::{ManifestBackend, detect_schema};
 pub fn execute(app: &AppContext, cli: &Cli) -> Result<()> {
     match &cli.command {
         Command::Init(_) => init::execute(app, cli.manifest.as_deref()),
-        Command::Lint(_) | Command::Format(_) | Command::Bsp(_) => {
+        Command::Lint(_) | Command::Format(_) | Command::Test(_) | Command::Bsp(_) => {
             dispatch_project_command(app, cli)
         }
         Command::Deps(deps_args) => match &deps_args.command {

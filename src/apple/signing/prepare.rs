@@ -1,4 +1,5 @@
 use super::*;
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 struct GeneratedCertificatePaths {
     private_key_path: PathBuf,
@@ -506,8 +507,14 @@ fn ensure_certificate_with_developer_services(
     let Some(developer_services_certificate_type) = developer_services_certificate_type else {
         return Ok(None);
     };
-    let remote_certificates =
-        provisioning.list_certificates(developer_services_certificate_type)?;
+    let remote_certificates = filter_unexpired_certificates(
+        state,
+        certificate_type,
+        provisioning.list_certificates(developer_services_certificate_type)?,
+        |remote| remote.id.as_str(),
+        |remote| remote.serial_number.as_deref(),
+        |remote| remote.expiration_date.as_deref(),
+    )?;
     for remote in &remote_certificates {
         if let Some(local) = state.certificates.iter_mut().find(|certificate| {
             if certificate.certificate_type != certificate_type
@@ -648,16 +655,6 @@ fn ensure_profile_with_developer_services(
     certificate: &ManagedCertificate,
     device_ids: &[String],
 ) -> Result<ManagedProfile> {
-    if let Some(local) = state.profiles.iter().find(|profile| {
-        profile.profile_type == profile_type
-            && profile.bundle_id == bundle_id.identifier
-            && profile.path.exists()
-            && profile.certificate_ids == vec![certificate.id.clone()]
-            && canonical_ids(&profile.device_ids) == canonical_ids(device_ids)
-    }) {
-        return Ok(local.clone());
-    }
-
     let remote_profiles = provisioning.list_profiles(Some(profile_type))?;
     let mut remote_profile_ids = HashSet::new();
     let mut stale_orbit_profiles = Vec::new();
@@ -801,7 +798,14 @@ fn ensure_certificate_with_api_key(
     state: &mut SigningState,
     certificate_type: &str,
 ) -> Result<ManagedCertificate> {
-    let remote_certificates = client.list_certificates(certificate_type)?;
+    let remote_certificates = filter_unexpired_certificates(
+        state,
+        certificate_type,
+        client.list_certificates(certificate_type)?,
+        |remote| remote.id.as_str(),
+        |remote| remote.attributes.serial_number.as_deref(),
+        |remote| remote.attributes.expiration_date.as_deref(),
+    )?;
     for remote in &remote_certificates {
         if let Some(local) = state.certificates.iter_mut().find(|certificate| {
             if certificate.certificate_type != certificate_type
@@ -1105,6 +1109,174 @@ fn cleanup_stale_profile_state(
         if profile.bundle_id != bundle_identifier || profile.profile_type != profile_type {
             return true;
         }
-        remote_profile_ids.contains(&profile.id)
+        if remote_profile_ids.contains(&profile.id) {
+            return true;
+        }
+        let _ = delete_file_if_exists(&profile.path);
+        false
     });
+}
+
+fn filter_unexpired_certificates<T, FId, FSerial, FExpiration>(
+    state: &mut SigningState,
+    certificate_type: &str,
+    remote_certificates: Vec<T>,
+    id_for: FId,
+    serial_for: FSerial,
+    expiration_for: FExpiration,
+) -> Result<Vec<T>>
+where
+    FId: Fn(&T) -> &str,
+    FSerial: Fn(&T) -> Option<&str>,
+    FExpiration: Fn(&T) -> Option<&str>,
+{
+    let mut active = Vec::new();
+    let mut expired_ids = HashSet::new();
+    let mut expired_serials = HashSet::new();
+
+    for remote in remote_certificates {
+        if expiration_date_has_passed(expiration_for(&remote))? {
+            expired_ids.insert(id_for(&remote).to_owned());
+            if let Some(serial) = serial_for(&remote) {
+                expired_serials.insert(normalized_serial_number(serial));
+            }
+            continue;
+        }
+        active.push(remote);
+    }
+
+    cleanup_expired_certificate_state(state, certificate_type, &expired_ids, &expired_serials);
+    Ok(active)
+}
+
+fn cleanup_expired_certificate_state(
+    state: &mut SigningState,
+    certificate_type: &str,
+    expired_ids: &HashSet<String>,
+    expired_serials: &HashSet<String>,
+) {
+    state.certificates.retain(|certificate| {
+        let is_expired = certificate.certificate_type == certificate_type
+            && (expired_ids.contains(&certificate.id)
+                || expired_serials.contains(&normalized_serial_number(&certificate.serial_number)));
+        if !is_expired {
+            return true;
+        }
+        let _ = delete_certificate_files(certificate);
+        if !certificate.p12_password_account.is_empty() {
+            let _ = delete_p12_password(&certificate.p12_password_account);
+        }
+        false
+    });
+}
+
+fn expiration_date_has_passed(expiration_date: Option<&str>) -> Result<bool> {
+    expiration_date_has_passed_at(expiration_date, OffsetDateTime::now_utc())
+}
+
+fn expiration_date_has_passed_at(
+    expiration_date: Option<&str>,
+    now: OffsetDateTime,
+) -> Result<bool> {
+    let Some(expiration_date) = expiration_date else {
+        return Ok(false);
+    };
+    let expires_at = OffsetDateTime::parse(expiration_date, &Rfc3339)
+        .with_context(|| format!("failed to parse expiration date `{expiration_date}`"))?;
+    Ok(expires_at <= now)
+}
+
+fn normalized_serial_number(serial_number: &str) -> String {
+    serial_number.to_ascii_lowercase()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+
+    use tempfile::tempdir;
+
+    use super::{
+        ManagedCertificate, ManagedProfile, SigningState, cleanup_expired_certificate_state,
+        cleanup_stale_profile_state, expiration_date_has_passed_at,
+    };
+    use crate::apple::signing::CertificateOrigin;
+
+    #[test]
+    fn expiration_date_detection_treats_past_dates_as_expired() {
+        let now = time::OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
+        assert!(expiration_date_has_passed_at(Some("2026-01-01T00:00:00Z"), now).unwrap());
+        assert!(!expiration_date_has_passed_at(Some("2028-01-01T00:00:00Z"), now).unwrap());
+        assert!(!expiration_date_has_passed_at(None, now).unwrap());
+    }
+
+    #[test]
+    fn cleanup_stale_profile_state_removes_files_for_missing_remote_profiles() {
+        let temp = tempdir().unwrap();
+        let stale_path = temp.path().join("stale.mobileprovision");
+        std::fs::write(&stale_path, b"profile").unwrap();
+
+        let mut state = SigningState {
+            certificates: Vec::new(),
+            profiles: vec![ManagedProfile {
+                id: "PROFILE123".to_owned(),
+                profile_type: "IOS_APP_DEVELOPMENT".to_owned(),
+                bundle_id: "dev.orbit.example".to_owned(),
+                path: stale_path.clone(),
+                uuid: None,
+                certificate_ids: vec!["CERT123".to_owned()],
+                device_ids: Vec::new(),
+            }],
+        };
+
+        cleanup_stale_profile_state(
+            &mut state,
+            "dev.orbit.example",
+            "IOS_APP_DEVELOPMENT",
+            &HashSet::new(),
+        );
+
+        assert!(state.profiles.is_empty());
+        assert!(!stale_path.exists());
+    }
+
+    #[test]
+    fn cleanup_expired_certificate_state_removes_local_files() {
+        let temp = tempdir().unwrap();
+        let private_key_path = temp.path().join("cert.key");
+        let certificate_der_path = temp.path().join("cert.cer");
+        let p12_path = temp.path().join("cert.p12");
+        std::fs::write(&private_key_path, b"key").unwrap();
+        std::fs::write(&certificate_der_path, b"cert").unwrap();
+        std::fs::write(&p12_path, b"p12").unwrap();
+
+        let mut state = SigningState {
+            certificates: vec![ManagedCertificate {
+                id: "CERT123".to_owned(),
+                certificate_type: "IOS_DEVELOPMENT".to_owned(),
+                serial_number: "ABC123".to_owned(),
+                origin: CertificateOrigin::Generated,
+                display_name: None,
+                system_keychain_path: None,
+                system_signing_identity: None,
+                private_key_path: private_key_path.clone(),
+                certificate_der_path: certificate_der_path.clone(),
+                p12_path: p12_path.clone(),
+                p12_password_account: String::new(),
+            }],
+            profiles: Vec::new(),
+        };
+
+        cleanup_expired_certificate_state(
+            &mut state,
+            "IOS_DEVELOPMENT",
+            &HashSet::from(["CERT123".to_owned()]),
+            &HashSet::new(),
+        );
+
+        assert!(state.certificates.is_empty());
+        assert!(!private_key_path.exists());
+        assert!(!certificate_der_path.exists());
+        assert!(!p12_path.exists());
+    }
 }

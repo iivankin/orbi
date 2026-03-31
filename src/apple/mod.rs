@@ -23,3 +23,4 @@ pub mod runtime;
 pub mod signing;
 pub mod srp;
 pub mod submit;
+pub mod testing;

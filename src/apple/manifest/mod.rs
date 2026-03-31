@@ -14,6 +14,7 @@ pub const SCHEMA_FILENAME: &str = "apple-app.v1.json";
 
 pub use authoring::{
     AppManifest, FormatQualityManifest, HooksManifest, LintQualityManifest, QualityManifest,
+    TestTargetManifest, TestsManifest,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -23,6 +24,7 @@ pub struct ResolvedManifest {
     pub team_id: Option<String>,
     pub provider_id: Option<String>,
     pub hooks: HooksManifest,
+    pub tests: TestsManifest,
     pub quality: QualityManifest,
     pub platforms: BTreeMap<ApplePlatform, PlatformManifest>,
     pub targets: Vec<TargetManifest>,

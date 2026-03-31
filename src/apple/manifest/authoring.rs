@@ -371,7 +371,7 @@ pub struct HooksManifest {
     pub after_sign: Vec<String>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct TestsManifest {
     #[serde(default)]
@@ -380,7 +380,7 @@ pub struct TestsManifest {
     pub ui: Option<TestTargetManifest>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct TestTargetManifest {
     #[serde(default)]

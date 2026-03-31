@@ -357,7 +357,8 @@ Avoid recreating Xcode build phases. Only add hooks for clearly justified projec
 
 ### Tests
 
-Tests can live next to the app manifest when Orbit gains first-class test support.
+Orbit runs `tests.unit` through Swift Testing by synthesizing a temporary SwiftPM
+package and invoking `swift test`.
 
 ```json
 "tests": {
@@ -370,9 +371,26 @@ Tests can live next to the app manifest when Orbit gains first-class test suppor
 }
 ```
 
+Run unit tests with:
+
+```sh
+orbit test
+```
+
+`tests.ui` is reserved for future support. The current runner targets Swift-only
+unit test suites that use `Swift Testing`.
+
 ## CLI
 
 Build intent comes from CLI flags.
+
+### Test
+
+Run the manifest's `tests.unit` suite with Swift Testing:
+
+```sh
+orbit test
+```
 
 ### Run
 
