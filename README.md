@@ -178,21 +178,16 @@ This keeps the public schema cleaner than separate arrays for `swift_packages`, 
 For git-backed Swift packages:
 
 - omit `version` to pin directly to an exact `revision`
-- set `version` to request an exact release tag, then resolve it into `orbit.lock`
+- set `version` to request an exact release tag, which Orbit resolves into `.orbit/orbit.lock`
 
-Versioned git dependencies require `orbit.lock`. Generate or refresh it with:
+Any command that resolves dependencies will materialize `.orbit/orbit.lock` automatically when needed.
 
-```bash
-orbit deps lock
-```
-
-`orbit deps update` refreshes git dependency intent and then rewrites `orbit.lock`:
+`orbit deps update` refreshes git dependency intent and then rewrites `.orbit/orbit.lock`:
 
 - to remote `HEAD` when there is no `version`
-- to the latest remote semver tag in the same major when `version` is present, rewriting `version` in `orbit.json` and the resolved `revision` in `orbit.lock`
+- to the latest remote semver tag in the same major when `version` is present, rewriting `version` in `orbit.json` and the resolved `revision` in `.orbit/orbit.lock`
 
 ```bash
-orbit deps lock
 orbit deps update
 orbit deps update PinnedGreeting
 ```

@@ -455,7 +455,7 @@ fn swift_package_root(
         } => match (version.as_deref(), revision.as_deref()) {
             (_, Some(revision)) => materialize_git_dependency(&project.app, url, revision),
             (Some(_), None) => unreachable!(
-                "versioned git dependencies must be resolved through orbit.lock before build resolution"
+                "versioned git dependencies must be resolved through .orbit/orbit.lock before build resolution"
             ),
             (None, None) => unreachable!("git dependencies are validated before build resolution"),
         },

@@ -421,7 +421,7 @@ fn normalize_external_dependencies(
                 }
                 (Some(_), Some(_)) => {
                     bail!(
-                        "dependency `{name}` cannot declare both `version` and `revision`; use `version` with orbit.lock or `revision` directly"
+                        "dependency `{name}` cannot declare both `version` and `revision`; use `version` with .orbit/orbit.lock or `revision` directly"
                     );
                 }
                 _ => {}

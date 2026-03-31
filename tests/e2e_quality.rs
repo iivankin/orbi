@@ -267,6 +267,7 @@ fn lint_accepts_semver_pinned_git_swift_package_dependencies() {
     create_quality_swift_mock(&mock_bin);
 
     let manifest_path = workspace.join("orbit.json");
+    assert!(!workspace.join(".orbit/orbit.lock").exists());
 
     let mut command = base_command(&workspace, &home, &mock_bin, &log_path);
     command.args([
@@ -300,12 +301,18 @@ fn lint_accepts_semver_pinned_git_swift_package_dependencies() {
         String::from_utf8(cached_head.stdout).unwrap().trim(),
         fixture.initial_revision
     );
+    let lockfile: serde_json::Value =
+        serde_json::from_slice(&fs::read(workspace.join(".orbit/orbit.lock")).unwrap()).unwrap();
+    assert_eq!(
+        lockfile["dependencies"]["OrbitPkg"]["revision"].as_str(),
+        Some(fixture.initial_revision.as_str())
+    );
 }
 
 #[test]
-fn lint_requires_orbit_lock_for_versioned_git_swift_package_dependencies() {
+fn lint_recreates_internal_lockfile_for_versioned_git_swift_package_dependencies() {
     let temp = tempfile::tempdir().unwrap();
-    let (workspace, _) = create_semver_git_swift_package_workspace(temp.path());
+    let (workspace, fixture) = create_semver_git_swift_package_workspace(temp.path());
     let home = create_home(temp.path());
     let mock_bin = temp.path().join("mock-bin");
     let log_path = temp.path().join("commands.log");
@@ -313,7 +320,8 @@ fn lint_requires_orbit_lock_for_versioned_git_swift_package_dependencies() {
     fs::create_dir_all(&mock_bin).unwrap();
 
     let manifest_path = workspace.join("orbit.json");
-    fs::remove_file(workspace.join("orbit.lock")).unwrap();
+    fs::create_dir_all(workspace.join(".orbit")).unwrap();
+    fs::write(workspace.join(".orbit/orbit.lock"), b"stale").unwrap();
 
     create_build_xcrun_mock(&mock_bin, &sdk_root);
     create_quality_swift_mock(&mock_bin);
@@ -326,11 +334,16 @@ fn lint_requires_orbit_lock_for_versioned_git_swift_package_dependencies() {
         "lint",
     ]);
     let output = run_and_capture(&mut command);
-    assert!(!output.status.success());
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("run `orbit deps lock`"),
+        output.status.success(),
         "{}",
         String::from_utf8_lossy(&output.stderr)
+    );
+    let lockfile: serde_json::Value =
+        serde_json::from_slice(&fs::read(workspace.join(".orbit/orbit.lock")).unwrap()).unwrap();
+    assert_eq!(
+        lockfile["dependencies"]["OrbitPkg"]["revision"].as_str(),
+        Some(fixture.initial_revision.as_str())
     );
 }
 

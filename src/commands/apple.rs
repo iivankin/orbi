@@ -12,7 +12,6 @@ pub fn execute(app: &AppContext, cli: &Cli) -> Result<()> {
         Command::Lint(args) => apple::quality::lint_project(app, args, cli.manifest.as_deref()),
         Command::Format(args) => apple::quality::format_project(app, args, cli.manifest.as_deref()),
         Command::Deps(deps_args) => match &deps_args.command {
-            DepsCommand::Lock(_) => apple::deps::lock_dependencies(app, cli.manifest.as_deref()),
             DepsCommand::Update(args) => {
                 apple::deps::update_dependencies(app, args, cli.manifest.as_deref())
             }

@@ -25,51 +25,6 @@ struct DependencyUpdateSummary {
     updates: Vec<DependencyRevisionUpdate>,
 }
 
-pub fn lock_dependencies(app: &AppContext, requested_manifest: Option<&Path>) -> Result<()> {
-    let manifest_path = app.resolve_manifest_path_for_dispatch(requested_manifest)?;
-    let summary = sync_lockfile(&manifest_path)?;
-    let workspace_root = manifest_path
-        .parent()
-        .context("manifest path did not contain a parent directory")?;
-
-    if summary.versioned_dependency_count == 0 {
-        if summary.removed_file {
-            print_success(format!(
-                "Removed stale orbit.lock from {} because the manifest has no versioned git dependencies.",
-                workspace_root.display()
-            ));
-        } else {
-            print_success("Manifest does not contain any versioned git dependencies.");
-        }
-        return Ok(());
-    }
-
-    if summary.wrote_file {
-        print_success(format!(
-            "Wrote orbit.lock for {} versioned git dependenc{} in {}.",
-            summary.versioned_dependency_count,
-            if summary.versioned_dependency_count == 1 {
-                "y"
-            } else {
-                "ies"
-            },
-            workspace_root.display()
-        ));
-    } else {
-        print_success(format!(
-            "orbit.lock is already up to date for {} versioned git dependenc{}.",
-            summary.versioned_dependency_count,
-            if summary.versioned_dependency_count == 1 {
-                "y"
-            } else {
-                "ies"
-            }
-        ));
-    }
-
-    Ok(())
-}
-
 pub fn update_dependencies(
     app: &AppContext,
     args: &DepsUpdateArgs,
@@ -151,7 +106,7 @@ pub fn update_dependencies(
 
     if lock_summary.wrote_file {
         print_success(format!(
-            "Wrote orbit.lock for {} versioned git dependenc{}.",
+            "Wrote .orbit/orbit.lock for {} versioned git dependenc{}.",
             lock_summary.versioned_dependency_count,
             if lock_summary.versioned_dependency_count == 1 {
                 "y"
@@ -161,7 +116,7 @@ pub fn update_dependencies(
         ));
     } else if lock_summary.removed_file {
         print_success(
-            "Removed stale orbit.lock because the manifest no longer contains versioned git dependencies.",
+            "Removed stale .orbit/orbit.lock because the manifest no longer contains versioned git dependencies.",
         );
     }
     Ok(())

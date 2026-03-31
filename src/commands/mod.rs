@@ -14,7 +14,6 @@ pub fn execute(app: &AppContext, cli: &Cli) -> Result<()> {
             dispatch_project_command(app, cli)
         }
         Command::Deps(deps_args) => match &deps_args.command {
-            DepsCommand::Lock(_) => dispatch_project_command(app, cli),
             DepsCommand::Update(_) => dispatch_project_command(app, cli),
         },
         Command::Ide(ide_args) => match &ide_args.command {

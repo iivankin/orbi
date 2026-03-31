@@ -298,7 +298,7 @@ pub struct ExtensionManifest {
 impl ResolvedManifest {
     pub fn load(path: &Path, orbit_dir: &Path) -> Result<Self> {
         let mut manifest = normalize::load_manifest(path, orbit_dir)?;
-        crate::apple::lockfile::apply_lockfile(path, &mut manifest)?;
+        crate::apple::lockfile::ensure_lockfile(path, &mut manifest)?;
         Ok(manifest)
     }
 

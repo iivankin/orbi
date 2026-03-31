@@ -340,20 +340,6 @@ pub fn create_semver_git_swift_package_workspace(
             }
         }),
     );
-    fs::write(
-        workspace.join("orbit.lock"),
-        serde_json::to_vec_pretty(&serde_json::json!({
-            "dependencies": {
-                "OrbitPkg": {
-                    "git": package_repo.to_string_lossy(),
-                    "version": "1.0.0",
-                    "revision": initial_revision
-                }
-            }
-        }))
-        .unwrap(),
-    )
-    .unwrap();
 
     (
         workspace,

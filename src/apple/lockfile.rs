@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -8,7 +8,7 @@ use serde_json::Value;
 
 use crate::apple::git_dependencies::exact_remote_version_revision;
 use crate::manifest::{ResolvedManifest, SwiftPackageSource};
-use crate::util::{read_json_file_if_exists, write_json_file};
+use crate::util::{read_json_file, write_json_file};
 
 pub(crate) const LOCKFILE_NAME: &str = "orbit.lock";
 
@@ -44,33 +44,23 @@ struct RequestedVersionedGitDependency {
     version: String,
 }
 
-pub(crate) fn apply_lockfile(
+pub(crate) fn ensure_lockfile(
     manifest_path: &Path,
     resolved_manifest: &mut ResolvedManifest,
 ) -> Result<()> {
-    let mut required_dependencies = BTreeSet::new();
-    for target in &resolved_manifest.targets {
-        for dependency in &target.swift_packages {
-            if let SwiftPackageSource::Git {
-                version: Some(_), ..
-            } = &dependency.source
-            {
-                required_dependencies.insert(dependency.product.clone());
-            }
-        }
-    }
-    if required_dependencies.is_empty() {
+    let requested_dependencies = collect_versioned_git_dependencies(manifest_path)?;
+    if requested_dependencies.is_empty() {
         return Ok(());
     }
 
     let lockfile_path = lockfile_path(manifest_path)?;
-    let lockfile = read_json_file_if_exists::<OrbitLockfile>(&lockfile_path)?
-        .with_context(|| {
-            format!(
-                "manifest contains versioned git dependencies, but {} is missing; run `orbit deps lock`",
-                lockfile_path.display()
-            )
-        })?;
+    let lockfile_matches = read_existing_lockfile(&lockfile_path)?
+        .as_ref()
+        .is_some_and(|lockfile| lockfile_matches_requested(lockfile, &requested_dependencies));
+    if !lockfile_matches {
+        sync_lockfile(manifest_path)?;
+    }
+    let lockfile = read_json_file::<OrbitLockfile>(&lockfile_path)?;
 
     for target in &mut resolved_manifest.targets {
         for dependency in &mut target.swift_packages {
@@ -88,13 +78,13 @@ pub(crate) fn apply_lockfile(
             };
             let locked = lockfile.dependencies.get(&product).with_context(|| {
                 format!(
-                    "dependency `{product}` is versioned in orbit.json but missing from {}; run `orbit deps lock`",
+                    "dependency `{product}` is versioned in orbit.json but missing from {}",
                     lockfile_path.display()
                 )
             })?;
             if locked.git != *url || locked.version != version {
                 bail!(
-                    "dependency `{product}` in {} no longer matches orbit.json; run `orbit deps lock`",
+                    "dependency `{product}` in {} no longer matches orbit.json",
                     lockfile_path.display()
                 );
             }
@@ -121,7 +111,7 @@ pub(crate) fn sync_lockfile(manifest_path: &Path) -> Result<LockfileSyncSummary>
         }
         return Ok(LockfileSyncSummary::default());
     }
-    let previous = read_json_file_if_exists::<OrbitLockfile>(&lockfile_path)?;
+    let previous = read_existing_lockfile(&lockfile_path)?;
 
     let mut dependencies = BTreeMap::new();
     for (name, requested) in &requested_dependencies {
@@ -162,7 +152,7 @@ pub(crate) fn lockfile_path(manifest_path: &Path) -> Result<PathBuf> {
     let root = manifest_path
         .parent()
         .context("manifest path did not contain a parent directory")?;
-    Ok(root.join(LOCKFILE_NAME))
+    Ok(root.join(".orbit").join(LOCKFILE_NAME))
 }
 
 fn collect_versioned_git_dependencies(
@@ -234,4 +224,28 @@ fn collect_versioned_git_dependencies_from_map(
         }
     }
     Ok(())
+}
+
+fn lockfile_matches_requested(
+    lockfile: &OrbitLockfile,
+    requested_dependencies: &BTreeMap<String, RequestedVersionedGitDependency>,
+) -> bool {
+    if lockfile.dependencies.len() != requested_dependencies.len() {
+        return false;
+    }
+    requested_dependencies.iter().all(|(name, requested)| {
+        lockfile.dependencies.get(name).is_some_and(|locked| {
+            locked.git == requested.git && locked.version == requested.version
+        })
+    })
+}
+
+fn read_existing_lockfile(path: &Path) -> Result<Option<OrbitLockfile>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    match read_json_file(path) {
+        Ok(lockfile) => Ok(Some(lockfile)),
+        Err(_) => Ok(None),
+    }
 }
