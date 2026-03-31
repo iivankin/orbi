@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::Path;
+use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -21,10 +22,15 @@ use sha2::{Digest, Sha256};
 
 use crate::apple::authkit::{AuthKitIdentity, bootstrap_authkit, build_cookie_client, header_map};
 use crate::apple::build::receipt::BuildReceipt;
-use crate::apple::build::verify::{should_verify_developer_id_artifact, verify_post_notarization};
+use crate::apple::build::verify::{
+    should_verify_developer_id_artifact, verify_post_build, verify_post_notarization,
+};
 use crate::apple::grand_slam::XcodeNotaryAuth;
 use crate::context::ProjectContext;
-use crate::util::{CliSpinner, format_elapsed, run_command};
+use crate::util::{
+    CliSpinner, command_output, command_output_allow_failure, ensure_dir, format_elapsed,
+    run_command,
+};
 
 use super::endpoints;
 
@@ -59,25 +65,38 @@ pub(crate) fn submit_with_xcode_notary(
         },
     )?;
 
-    let digests = notary_progress_step(
+    let archive = notary_progress_step(
         format!(
-            "Notary: Preparing archive digests for {}",
+            "Notary: Preparing upload archive for {}",
             receipt.artifact_path.display()
         ),
-        |_| "Notary: Prepared archive digests.".to_owned(),
-        || ArchiveDigests::read(&receipt.artifact_path),
+        |archive: &PreparedNotaryArchive| format!("Notary: Prepared {}.", archive.path.display()),
+        || prepare_submission_archive(project, receipt),
     )?;
-    let submission_name = receipt
-        .artifact_path
+    notary_progress_step(
+        format!("Notary: Preflighting {}", archive.path.display()),
+        |summary: &String| summary.clone(),
+        || preflight_submission_archive(receipt, &archive),
+    )?;
+    let submission_name = archive
+        .path
         .file_name()
         .and_then(|value| value.to_str())
         .map(ToOwned::to_owned)
         .with_context(|| {
             format!(
-                "submit artifact path `{}` does not have a valid file name",
-                receipt.artifact_path.display()
+                "submit archive path `{}` does not have a valid file name",
+                archive.path.display()
             )
         })?;
+    let digests = notary_progress_step(
+        format!(
+            "Notary: Preparing archive digests for {}",
+            archive.path.display()
+        ),
+        |_| "Notary: Prepared archive digests.".to_owned(),
+        || Ok(archive.digests.clone()),
+    )?;
     let created = notary_progress_step(
         format!("Notary: Creating submission for {submission_name}"),
         |created: &NotarySubmissionDocument| {
@@ -86,9 +105,9 @@ pub(crate) fn submit_with_xcode_notary(
         || client.create_submission(&submission_name, &digests),
     )?;
     notary_progress_step(
-        format!("Notary: Uploading {}", receipt.artifact_path.display()),
+        format!("Notary: Uploading {}", archive.path.display()),
         |_| "Notary: Uploaded archive to Apple.".to_owned(),
-        || client.upload_submission_archive(&created, &digests),
+        || client.upload_submission_archive(&created, &archive.digests),
     )?;
 
     if wait {
@@ -135,6 +154,171 @@ pub(crate) fn submit_with_xcode_notary(
     }
 
     Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct PreparedNotaryArchive {
+    path: std::path::PathBuf,
+    digests: ArchiveDigests,
+}
+
+fn prepare_submission_archive(
+    project: &ProjectContext,
+    receipt: &BuildReceipt,
+) -> Result<PreparedNotaryArchive> {
+    let file_name = receipt
+        .artifact_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .context("notarization artifact is missing a valid file name")?;
+    let archive_dir = project
+        .project_paths
+        .orbit_dir
+        .join("submit")
+        .join(&receipt.id)
+        .join("notary");
+    ensure_dir(&archive_dir)?;
+
+    let archive_path = archive_dir.join(format!("{file_name}.zip"));
+    if archive_path.exists() {
+        fs::remove_file(&archive_path).with_context(|| {
+            format!(
+                "failed to remove existing notarization archive {}",
+                archive_path.display()
+            )
+        })?;
+    }
+
+    create_submission_archive(&receipt.artifact_path, &archive_path)?;
+    Ok(PreparedNotaryArchive {
+        digests: ArchiveDigests::read(&archive_path)?,
+        path: archive_path,
+    })
+}
+
+fn preflight_submission_archive(
+    receipt: &BuildReceipt,
+    archive: &PreparedNotaryArchive,
+) -> Result<String> {
+    if should_verify_developer_id_artifact(receipt) {
+        // Fail before upload if the source package or app signing is already invalid.
+        let _ = verify_post_build(receipt)?;
+    }
+
+    let archive_name = archive
+        .path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .context("notarization archive is missing a valid file name")?;
+    if archive.path.extension().and_then(|value| value.to_str()) != Some("zip") {
+        bail!(
+            "notarization archive `{}` must be a .zip file",
+            archive.path.display()
+        );
+    }
+    let expected_archive_name = format!(
+        "{}.zip",
+        receipt
+            .artifact_path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .context("notarization artifact is missing a valid file name")?
+    );
+    if archive_name != expected_archive_name {
+        bail!(
+            "notarization archive `{}` should be named `{expected_archive_name}`",
+            archive.path.display()
+        );
+    }
+
+    let metadata = fs::metadata(&archive.path)
+        .with_context(|| format!("failed to read {}", archive.path.display()))?;
+    if !metadata.is_file() {
+        bail!(
+            "notarization archive `{}` is not a regular file",
+            archive.path.display()
+        );
+    }
+    if metadata.len() == 0 {
+        bail!("notarization archive `{}` is empty", archive.path.display());
+    }
+
+    validate_zip_archive(&archive.path, &receipt.artifact_path)?;
+    Ok(format!(
+        "Notary: Preflight validated {}.",
+        archive.path.display()
+    ))
+}
+
+fn create_submission_archive(source_path: &Path, archive_path: &Path) -> Result<()> {
+    let mut command = Command::new("ditto");
+    command.arg("-c");
+    command.arg("-k");
+    command.arg("--keepParent");
+    command.arg(source_path);
+    command.arg(archive_path);
+    run_command(&mut command)
+}
+
+fn validate_zip_archive(archive_path: &Path, expected_payload_path: &Path) -> Result<()> {
+    let mut test_command = Command::new("unzip");
+    test_command.arg("-tqq");
+    test_command.arg(archive_path);
+    let (success, stdout, stderr) = command_output_allow_failure(&mut test_command)?;
+    if !success {
+        let output = command_output_summary(&stdout, &stderr);
+        bail!(
+            "notarization archive `{}` failed zip integrity validation\n{}",
+            archive_path.display(),
+            output
+        );
+    }
+
+    let mut list_command = Command::new("unzip");
+    list_command.arg("-Z1");
+    list_command.arg(archive_path);
+    let listing = command_output(&mut list_command)?;
+    let entries = listing
+        .lines()
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .collect::<Vec<_>>();
+    if entries.is_empty() {
+        bail!(
+            "notarization archive `{}` does not contain any entries",
+            archive_path.display()
+        );
+    }
+
+    let expected_name = expected_payload_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .context("notarization payload is missing a valid file name")?;
+    if !entries.iter().any(|entry| {
+        *entry == expected_name
+            || entry
+                .strip_suffix('/')
+                .is_some_and(|entry| entry == expected_name)
+            || entry.starts_with(&format!("{expected_name}/"))
+    }) {
+        bail!(
+            "notarization archive `{}` does not contain expected payload `{expected_name}`",
+            archive_path.display()
+        );
+    }
+
+    Ok(())
+}
+
+fn command_output_summary(stdout: &str, stderr: &str) -> String {
+    let stdout = stdout.trim();
+    let stderr = stderr.trim();
+    match (stdout.is_empty(), stderr.is_empty()) {
+        (true, true) => String::new(),
+        (false, true) => stdout.to_owned(),
+        (true, false) => stderr.to_owned(),
+        (false, false) => format!("{stdout}\n{stderr}"),
+    }
 }
 
 fn notary_progress_step<T, F, G>(

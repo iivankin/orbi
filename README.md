@@ -343,9 +343,15 @@ Hooks should stay small and explicit.
 ```json
 "hooks": {
   "before_build": ["./scripts/generate-assets.sh"],
+  "before_run": ["./scripts/prepare-local-fixture.sh"],
   "after_sign": ["./scripts/verify-bundle.sh"]
 }
 ```
+
+Hook commands run from the project root. Orbit exports context such as `ORBIT_HOOK`,
+`ORBIT_TARGET_NAME`, `ORBIT_PLATFORM`, `ORBIT_DISTRIBUTION`, `ORBIT_CONFIGURATION`,
+`ORBIT_DESTINATION`, `ORBIT_BUNDLE_PATH`, `ORBIT_ARTIFACT_PATH`, and `ORBIT_RECEIPT_PATH`
+when they are available for the current lifecycle step.
 
 Avoid recreating Xcode build phases. Only add hooks for clearly justified project steps.
 

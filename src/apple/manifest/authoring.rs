@@ -360,11 +360,13 @@ pub struct DependencySpec {
     pub embed: Option<bool>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct HooksManifest {
     #[serde(default)]
     pub before_build: Vec<String>,
+    #[serde(default)]
+    pub before_run: Vec<String>,
     #[serde(default)]
     pub after_sign: Vec<String>,
 }

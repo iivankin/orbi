@@ -13,6 +13,7 @@ pub mod developer_services;
 pub mod device;
 pub mod git_dependencies;
 pub mod grand_slam;
+pub mod hooks;
 pub mod ide;
 pub mod lockfile;
 pub mod manifest;

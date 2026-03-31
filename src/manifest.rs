@@ -6,10 +6,10 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
 pub use crate::apple::manifest::{
-    ApplePlatform, BuildConfiguration, DistributionKind, ExtensionManifest, IosDeviceFamily,
-    IosInterfaceOrientation, IosSupportedOrientationsManifest, IosTargetManifest, PlatformManifest,
-    ProfileManifest, PushManifest, QualityManifest, ResolvedManifest, SwiftPackageDependency,
-    SwiftPackageSource, TargetKind, TargetManifest, XcframeworkDependency,
+    ApplePlatform, BuildConfiguration, DistributionKind, ExtensionManifest, HooksManifest,
+    IosDeviceFamily, IosInterfaceOrientation, IosSupportedOrientationsManifest, IosTargetManifest,
+    PlatformManifest, ProfileManifest, PushManifest, QualityManifest, ResolvedManifest,
+    SwiftPackageDependency, SwiftPackageSource, TargetKind, TargetManifest, XcframeworkDependency,
 };
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]

@@ -23,6 +23,7 @@ use super::default_icon;
 use crate::apple::build::receipt::{BuildReceipt, BuildReceiptInput, write_receipt};
 use crate::apple::build::toolchain::{DestinationKind, Toolchain};
 use crate::apple::build::verify::{should_verify_developer_id_artifact, verify_post_build};
+use crate::apple::hooks::{HookContext, HookKind, run_project_hooks};
 use crate::apple::runtime::{
     apple_platform_from_cli, build_target_for_platform, distribution_from_cli, profile_for_build,
     profile_for_run, resolve_build_distribution, resolve_platform,
@@ -268,6 +269,20 @@ pub fn run_on_destination(project: &ProjectContext, args: &RunArgs) -> Result<()
         outcome.receipt.target,
         profile_description(&request.profile)
     ));
+    run_project_hooks(
+        project,
+        HookKind::BeforeRun,
+        &HookContext {
+            target_name: Some(outcome.receipt.target.as_str()),
+            platform: Some(outcome.receipt.platform),
+            distribution: Some(outcome.receipt.distribution),
+            configuration: Some(outcome.receipt.configuration),
+            destination: Some(outcome.receipt.destination.as_str()),
+            bundle_path: Some(&outcome.receipt.bundle_path),
+            artifact_path: Some(&outcome.receipt.artifact_path),
+            receipt_path: Some(&outcome.receipt_path),
+        },
+    )?;
     match (
         outcome.receipt.platform,
         outcome.receipt.destination.as_str(),
@@ -333,6 +348,18 @@ fn build_project(project: &ProjectContext, request: &BuildRequest) -> Result<Bui
     let root_target = project
         .resolved_manifest
         .resolve_target(Some(&request.target_name))?;
+    run_project_hooks(
+        project,
+        HookKind::BeforeBuild,
+        &HookContext {
+            target_name: Some(root_target.name.as_str()),
+            platform: Some(request.platform),
+            distribution: Some(request.profile.distribution),
+            configuration: Some(request.profile.configuration),
+            destination: Some(request.destination.as_str()),
+            ..HookContext::default()
+        },
+    )?;
     let platform = request.platform;
     let platform_manifest = project
         .resolved_manifest
@@ -433,6 +460,22 @@ fn build_project(project: &ProjectContext, request: &BuildRequest) -> Result<Bui
         receipt.submit_eligible = false;
     }
     let receipt_path = write_receipt(&project.project_paths.receipts_dir, &receipt)?;
+    if signing_required {
+        run_project_hooks(
+            project,
+            HookKind::AfterSign,
+            &HookContext {
+                target_name: Some(receipt.target.as_str()),
+                platform: Some(receipt.platform),
+                distribution: Some(receipt.distribution),
+                configuration: Some(receipt.configuration),
+                destination: Some(receipt.destination.as_str()),
+                bundle_path: Some(&receipt.bundle_path),
+                artifact_path: Some(&receipt.artifact_path),
+                receipt_path: Some(&receipt_path),
+            },
+        )?;
+    }
 
     Ok(BuildOutcome {
         receipt,

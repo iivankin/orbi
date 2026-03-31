@@ -56,6 +56,7 @@ fn normalize_manifest(
         version: app.version.clone(),
         team_id: app.team_id.clone(),
         provider_id: app.provider_id.clone(),
+        hooks: app.hooks.clone().unwrap_or_default(),
         quality: app.quality.clone(),
         platforms: app
             .platforms

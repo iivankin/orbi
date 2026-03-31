@@ -1304,6 +1304,9 @@
         "before_build": {
           "$ref": "#/$defs/stringArray"
         },
+        "before_run": {
+          "$ref": "#/$defs/stringArray"
+        },
         "after_sign": {
           "$ref": "#/$defs/stringArray"
         }

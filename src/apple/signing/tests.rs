@@ -21,8 +21,8 @@ use crate::apple::capabilities::{CapabilityRelationships, CapabilityUpdate, Remo
 use crate::apple::device::CachedDevice;
 use crate::context::{AppContext, GlobalPaths, ProjectContext, ProjectPaths};
 use crate::manifest::{
-    ApplePlatform, BuildConfiguration, DistributionKind, ManifestSchema, PlatformManifest,
-    QualityManifest, ResolvedManifest, TargetKind, TargetManifest,
+    ApplePlatform, BuildConfiguration, DistributionKind, HooksManifest, ManifestSchema,
+    PlatformManifest, QualityManifest, ResolvedManifest, TargetKind, TargetManifest,
 };
 
 fn test_project() -> (TempDir, ProjectContext) {
@@ -45,6 +45,7 @@ fn test_project() -> (TempDir, ProjectContext) {
         version: "0.1.0".to_owned(),
         team_id: Some("TEAM123456".to_owned()),
         provider_id: None,
+        hooks: HooksManifest::default(),
         quality: QualityManifest::default(),
         platforms: BTreeMap::from([(
             ApplePlatform::Ios,

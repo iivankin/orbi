@@ -164,12 +164,26 @@ pub fn create_ditto_mock(mock_bin: &Path) {
         r#"#!/bin/sh
 set -eu
 echo "ditto $@" >> "$MOCK_LOG"
+if [ "$#" -lt 2 ]; then
+  echo "ditto mock expects at least source and destination" >&2
+  exit 1
+fi
+src=""
 out=""
+prev=""
 for arg in "$@"; do
+  src="$prev"
   out="$arg"
+  prev="$arg"
 done
 mkdir -p "$(dirname "$out")"
-printf 'artifact' > "$out"
+rm -f "$out"
+src_parent="$(dirname "$src")"
+src_name="$(basename "$src")"
+(
+  cd "$src_parent"
+  /usr/bin/zip -qry "$out" "$src_name"
+)
 "#,
     );
 }

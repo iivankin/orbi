@@ -12,7 +12,9 @@ use serde_json::Value as JsonValue;
 pub const SCHEMA_URL: &str = "https://orbit.dev/schemas/apple-app.v1.json";
 pub const SCHEMA_FILENAME: &str = "apple-app.v1.json";
 
-pub use authoring::{AppManifest, FormatQualityManifest, LintQualityManifest, QualityManifest};
+pub use authoring::{
+    AppManifest, FormatQualityManifest, HooksManifest, LintQualityManifest, QualityManifest,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResolvedManifest {
@@ -20,6 +22,7 @@ pub struct ResolvedManifest {
     pub version: String,
     pub team_id: Option<String>,
     pub provider_id: Option<String>,
+    pub hooks: HooksManifest,
     pub quality: QualityManifest,
     pub platforms: BTreeMap<ApplePlatform, PlatformManifest>,
     pub targets: Vec<TargetManifest>,

@@ -8,8 +8,9 @@ use support::submit_mock::spawn_submit_mock;
 #[cfg(target_os = "macos")]
 use support::write_executable;
 use support::{
-    base_command, create_api_key, create_build_xcrun_mock, create_home, create_signing_workspace,
-    create_submit_swinfo_mock, latest_receipt_path, read_log, run_and_capture, spawn_asc_mock,
+    base_command, create_api_key, create_build_xcrun_mock, create_ditto_mock, create_home,
+    create_signing_workspace, create_submit_swinfo_mock, latest_receipt_path, read_log,
+    run_and_capture, spawn_asc_mock,
 };
 
 #[test]
@@ -173,6 +174,7 @@ fn developer_id_submit_uses_xcode_like_notary_flow() {
     let mock_bin = temp.path().join("mock-bin");
     let log_path = temp.path().join("commands.log");
     fs::create_dir_all(&mock_bin).unwrap();
+    create_ditto_mock(&mock_bin);
     write_executable(
         &mock_bin.join("xcrun"),
         r#"#!/bin/sh
@@ -272,6 +274,7 @@ printf 'flags=0x10000(runtime)\n' >&2
     );
     let log = read_log(&log_path);
     assert!(!log.contains("notarytool"));
+    assert!(log.contains("ditto -c -k --keepParent"));
     assert!(log.contains("xcrun stapler staple"));
     assert!(log.contains("xcrun stapler validate"));
     assert!(log.contains("pkgutil --check-signature"));
@@ -290,7 +293,7 @@ printf 'flags=0x10000(runtime)\n' >&2
     assert!(
         requests
             .iter()
-            .any(|request| request.starts_with("PUT /uploads/submission-1.pkg"))
+            .any(|request| request.starts_with("PUT /uploads/submission-1.zip"))
     );
     assert!(
         requests

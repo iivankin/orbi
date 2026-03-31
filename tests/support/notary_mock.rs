@@ -129,7 +129,7 @@ fn notary_response(
                     "awsSecretAccessKey": "secret",
                     "awsSessionToken": "session",
                     "bucket": "ignored-bucket",
-                    "object": "uploads/submission-1.pkg"
+                    "object": "uploads/submission-1.zip"
                 }
             },
             "meta": {}
@@ -137,7 +137,7 @@ fn notary_response(
         .to_string();
     }
 
-    if first_line.starts_with("PUT /uploads/submission-1.pkg") {
+    if first_line.starts_with("PUT /uploads/submission-1.zip") {
         return String::new();
     }
 
@@ -179,7 +179,7 @@ fn notary_response(
                 "type": "submissions",
                 "attributes": {
                     "status": status,
-                    "name": "ExampleApp-DeveloperId.pkg",
+                    "name": "ExampleApp-DeveloperId.pkg.zip",
                     "createdDate": "2026-03-29T20:02:16.337Z"
                 }
             },
