@@ -1,11 +1,14 @@
 use std::collections::HashMap;
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
+use crate::apple::build::swiftc::{
+    SwiftPackageTargetCompilePlan, package_target_swiftc_invocation,
+};
 use crate::apple::build::toolchain::{DestinationKind, Toolchain};
 use crate::context::ProjectContext;
 use crate::manifest::{
@@ -257,11 +260,23 @@ pub(crate) fn apply_external_link_inputs(command: &mut Command, inputs: &Externa
     }
 }
 
+pub(crate) fn apply_external_compile_inputs(args: &mut Vec<OsString>, inputs: &ExternalLinkInputs) {
+    for path in &inputs.module_search_paths {
+        args.push("-I".into());
+        args.push(path.as_os_str().to_os_string());
+    }
+    for path in &inputs.framework_search_paths {
+        args.push("-F".into());
+        args.push(path.as_os_str().to_os_string());
+    }
+}
+
 pub(crate) fn compile_swift_package(
     project: &ProjectContext,
     toolchain: &Toolchain,
     profile: &ProfileManifest,
     intermediates_dir: &Path,
+    index_store_path: Option<&Path>,
     dependency: &SwiftPackageDependency,
 ) -> Result<PackageBuildOutput> {
     let package_root = resolve_path(&project.root, &dependency.path);
@@ -330,32 +345,32 @@ pub(crate) fn compile_swift_package(
         let library_name = swift_package_library_name(&package.name, target_name);
         let module_path = module_dir.join(format!("{target_name}.swiftmodule"));
         let library_path = library_dir.join(format!("lib{library_name}.a"));
-        let mut command = toolchain.swiftc();
-        command.arg("-parse-as-library");
-        command.arg("-target").arg(&toolchain.target_triple);
-        command.arg("-emit-library");
-        command.arg("-static");
-        command.arg("-emit-module");
-        command.arg("-module-name").arg(target_name);
-        command.arg("-o").arg(&library_path);
-        command.arg("-emit-module-path").arg(&module_path);
-        if profile.is_debug() {
-            command.args(["-Onone", "-g"]);
-        } else {
-            command.arg("-O");
-        }
-        command.arg("-I").arg(&module_dir);
-        command.arg("-L").arg(&library_dir);
-        for dependency_name in package_target_local_dependencies(package_target, &targets_by_name)?
-        {
-            command
-                .arg("-l")
-                .arg(swift_package_library_name(&package.name, &dependency_name));
-        }
-        for source in swift_sources {
-            command.arg(source);
-        }
-        run_command(&mut command)?;
+        let dependency_libraries =
+            package_target_local_dependencies(package_target, &targets_by_name)?
+                .into_iter()
+                .map(|dependency_name| swift_package_library_name(&package.name, &dependency_name))
+                .collect::<Vec<_>>();
+        let invocation = package_target_swiftc_invocation(
+            toolchain,
+            profile,
+            SwiftPackageTargetCompilePlan {
+                module_name: target_name,
+                product_path: &library_path,
+                module_output_path: &module_path,
+                swift_sources: &swift_sources,
+                module_search_paths: std::slice::from_ref(&module_dir),
+                library_search_paths: std::slice::from_ref(&library_dir),
+                link_libraries: &dependency_libraries,
+                index_store_path,
+            },
+        )?;
+        let source_count = invocation.source_files.len();
+        let mut command = invocation.command(toolchain);
+        run_command(&mut command).with_context(|| {
+            format!(
+                "failed to compile Swift package target `{target_name}` from {source_count} source file(s)"
+            )
+        })?;
         built_libraries.push(library_name);
     }
 

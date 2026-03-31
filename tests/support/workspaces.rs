@@ -20,7 +20,7 @@ pub fn create_watch_workspace(root: &Path) -> PathBuf {
             ),
         ],
         &serde_json::json!({
-            "$schema": "https://orbit.dev/schemas/apple-app.v1.json",
+            "$schema": "/tmp/.orbit/schemas/apple-app.v1.json",
             "name": "WatchFixture",
             "bundle_id": "dev.orbit.fixture.watch",
             "version": "0.1.0",
@@ -52,12 +52,41 @@ pub fn create_signing_workspace(root: &Path) -> PathBuf {
             "import SwiftUI\n@main struct ExampleApp: App { var body: some Scene { WindowGroup { Text(\"App\") } } }\n",
         )],
         &serde_json::json!({
-            "$schema": "https://orbit.dev/schemas/apple-app.v1.json",
+            "$schema": "/tmp/.orbit/schemas/apple-app.v1.json",
             "name": "ExampleApp",
             "bundle_id": "dev.orbit.fixture",
             "version": "0.1.0",
             "build": 1,
             "team_id": "TEAM123456",
+            "platforms": {
+                "ios": "18.0"
+            },
+            "sources": ["Sources/App"]
+        }),
+    )
+}
+
+pub fn create_mixed_language_workspace(root: &Path) -> PathBuf {
+    create_workspace(
+        root,
+        "mixed-language-workspace",
+        &[
+            (
+                "Sources/App/App.swift",
+                "import SwiftUI\n@main struct ExampleApp: App { var body: some Scene { WindowGroup { Text(\"App\") } } }\n",
+            ),
+            (
+                "Sources/App/Bridge.m",
+                "#import \"Bridge.h\"\nint orbit_add(int a, int b) { return a + b; }\n",
+            ),
+            ("Sources/App/Bridge.h", "int orbit_add(int a, int b);\n"),
+        ],
+        &serde_json::json!({
+            "$schema": "/tmp/.orbit/schemas/apple-app.v1.json",
+            "name": "ExampleApp",
+            "bundle_id": "dev.orbit.fixture.mixed",
+            "version": "0.1.0",
+            "build": 1,
             "platforms": {
                 "ios": "18.0"
             },

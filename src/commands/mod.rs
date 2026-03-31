@@ -1,13 +1,23 @@
 pub mod apple;
+pub mod init;
 
 use anyhow::Result;
 
-use crate::cli::{AppleCommand, AppleDeviceCommand, Cli, Command};
+use crate::cli::{AppleCommand, AppleDeviceCommand, Cli, Command, IdeCommand};
 use crate::context::AppContext;
 use crate::manifest::{ManifestBackend, detect_schema};
 
 pub fn execute(app: &AppContext, cli: &Cli) -> Result<()> {
     match &cli.command {
+        Command::Init(_) => init::execute(app, cli.manifest.as_deref()),
+        Command::Lint(_) | Command::Format(_) | Command::Bsp(_) => {
+            dispatch_project_command(app, cli)
+        }
+        Command::Ide(ide_args) => match &ide_args.command {
+            IdeCommand::InstallBuildServer(_) | IdeCommand::DumpArgs(_) => {
+                dispatch_project_command(app, cli)
+            }
+        },
         Command::Apple(apple_args) => match &apple_args.command {
             AppleCommand::Device { command } => match command {
                 AppleDeviceCommand::List(_)

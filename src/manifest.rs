@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::Path;
+use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
@@ -7,8 +8,8 @@ use serde::Deserialize;
 pub use crate::apple::manifest::{
     ApplePlatform, BuildConfiguration, DistributionKind, ExtensionManifest, IosDeviceFamily,
     IosInterfaceOrientation, IosSupportedOrientationsManifest, IosTargetManifest, PlatformManifest,
-    ProfileManifest, PushManifest, ResolvedManifest, SwiftPackageDependency, TargetKind,
-    TargetManifest, XcframeworkDependency,
+    ProfileManifest, PushManifest, QualityManifest, ResolvedManifest, SwiftPackageDependency,
+    TargetKind, TargetManifest, XcframeworkDependency,
 };
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -32,6 +33,12 @@ impl ManifestSchema {
     pub fn as_str(self) -> &'static str {
         match self {
             ManifestSchema::AppleAppV1 => crate::apple::manifest::SCHEMA_URL,
+        }
+    }
+
+    pub fn file_name(self) -> &'static str {
+        match self {
+            ManifestSchema::AppleAppV1 => crate::apple::manifest::SCHEMA_FILENAME,
         }
     }
 
@@ -73,4 +80,8 @@ pub fn detect_schema(path: &Path) -> Result<ManifestSchema> {
 
 fn schema_file_name(schema: &str) -> &str {
     schema.rsplit(['/', '\\']).next().unwrap_or(schema)
+}
+
+pub fn installed_schema_path(schema_dir: &Path, schema: ManifestSchema) -> PathBuf {
+    schema_dir.join(schema.file_name())
 }

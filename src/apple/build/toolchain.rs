@@ -3,7 +3,7 @@ use std::process::Command;
 
 use crate::manifest::ApplePlatform;
 use crate::util::command_output;
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum DestinationKind {
@@ -121,6 +121,19 @@ impl Toolchain {
         let mut command = Command::new("xcrun");
         command.args(["--sdk", self.sdk_name.as_str(), "swiftc"]);
         command
+    }
+
+    pub fn toolchain_root(&self) -> Result<PathBuf> {
+        let swiftc_path = command_output(Command::new("xcrun").args(["--find", "swiftc"]))?;
+        let swiftc_path = PathBuf::from(swiftc_path.trim());
+        let usr_dir = swiftc_path
+            .parent()
+            .and_then(|parent| parent.parent())
+            .context("failed to resolve Swift toolchain root from `xcrun --find swiftc`")?;
+        if usr_dir.file_name().and_then(|name| name.to_str()) == Some("usr") {
+            return Ok(usr_dir.parent().unwrap_or(usr_dir).to_path_buf());
+        }
+        Ok(usr_dir.to_path_buf())
     }
 
     pub fn clang(&self, cpp: bool) -> Command {

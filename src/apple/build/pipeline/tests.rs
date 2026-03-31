@@ -52,6 +52,7 @@ fn project_for_fixture(path: &str) -> (TempDir, ProjectContext) {
             global_paths: GlobalPaths {
                 data_dir: data_dir.clone(),
                 cache_dir,
+                schema_dir: data_dir.join("schemas"),
                 auth_state_path: data_dir.join("auth.json"),
                 device_cache_path: data_dir.join("devices.json"),
                 keychain_path: data_dir.join("orbit.keychain-db"),

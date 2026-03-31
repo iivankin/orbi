@@ -14,13 +14,12 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use self::artifacts::export_artifact;
-use self::compile::{compile_target, embed_dependencies};
+use self::compile::{CompileOutputMode, compile_target, embed_dependencies};
 use self::runtime::{
     debug_on_device, debug_on_macos, debug_on_simulator, run_on_device, run_on_macos,
     run_on_simulator, select_physical_device, validate_run_platform,
 };
 use super::default_icon;
-use super::external::{ExternalLinkInputs, PackageBuildOutput};
 use crate::apple::build::receipt::{BuildReceipt, BuildReceiptInput, write_receipt};
 use crate::apple::build::toolchain::{DestinationKind, Toolchain};
 use crate::apple::build::verify::{should_verify_developer_id_artifact, verify_post_build};
@@ -31,8 +30,8 @@ use crate::apple::runtime::{
 use crate::cli::{BuildArgs, RunArgs};
 use crate::context::ProjectContext;
 use crate::manifest::{
-    ApplePlatform, DistributionKind, ExtensionManifest, IosDeviceFamily, IosInterfaceOrientation,
-    IosTargetManifest, ProfileManifest, TargetKind, TargetManifest,
+    ApplePlatform, BuildConfiguration, DistributionKind, ExtensionManifest, IosDeviceFamily,
+    IosInterfaceOrientation, IosTargetManifest, ProfileManifest, TargetKind, TargetManifest,
 };
 use crate::util::{
     CliSpinner, copy_dir_recursive, copy_file, ensure_dir, ensure_parent_dir, prompt_select,
@@ -49,17 +48,6 @@ struct BuildRequest {
     destination: DestinationKind,
     output: Option<PathBuf>,
     provisioning_udids: Option<Vec<String>>,
-}
-
-struct SwiftCompilePlan<'a> {
-    target_kind: TargetKind,
-    swift_sources: &'a [PathBuf],
-    package_outputs: &'a [PackageBuildOutput],
-    external_link_inputs: &'a ExternalLinkInputs,
-    object_files: &'a [PathBuf],
-    module_name: &'a str,
-    product_path: &'a Path,
-    module_output_path: Option<&'a Path>,
 }
 
 #[derive(Debug, Clone)]
@@ -178,6 +166,47 @@ pub fn build_artifact(project: &ProjectContext, args: &BuildArgs) -> Result<()> 
     Ok(())
 }
 
+pub fn prepare_for_ide(
+    project: &ProjectContext,
+    platform: ApplePlatform,
+    target_names: &[String],
+    destination: DestinationKind,
+    index_store_path: &Path,
+) -> Result<()> {
+    let platform_manifest = project
+        .resolved_manifest
+        .platforms
+        .get(&platform)
+        .context("platform configuration missing from manifest")?;
+    let profile = ProfileManifest::new(BuildConfiguration::Debug, DistributionKind::Development);
+    let toolchain = Toolchain::resolve(
+        platform,
+        platform_manifest.deployment_target.as_str(),
+        destination,
+    )?;
+    let build_root = project
+        .project_paths
+        .build_dir
+        .join(platform.to_string())
+        .join("ide")
+        .join(toolchain.destination.as_str());
+    ensure_dir(&build_root)?;
+
+    let ordered_targets = ide_prepare_targets(project, platform, target_names)?;
+    for target in &ordered_targets {
+        compile_target(
+            project,
+            &toolchain,
+            target,
+            &build_root,
+            &profile,
+            Some(index_store_path),
+            CompileOutputMode::Silent,
+        )?;
+    }
+    Ok(())
+}
+
 pub fn run_on_destination(project: &ProjectContext, args: &RunArgs) -> Result<()> {
     let platform = resolve_platform(
         project,
@@ -265,6 +294,41 @@ pub fn run_on_destination(project: &ProjectContext, args: &RunArgs) -> Result<()
     }
 }
 
+fn ide_prepare_targets<'a>(
+    project: &'a ProjectContext,
+    platform: ApplePlatform,
+    target_names: &[String],
+) -> Result<Vec<&'a TargetManifest>> {
+    let requested_names = if target_names.is_empty() {
+        vec![
+            project
+                .resolved_manifest
+                .default_build_target_for_platform(platform)?
+                .name
+                .clone(),
+        ]
+    } else {
+        target_names.to_vec()
+    };
+
+    let mut ordered_targets = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for target_name in requested_names {
+        let resolved_target = project
+            .resolved_manifest
+            .resolve_target(Some(&target_name))?;
+        for target in project
+            .resolved_manifest
+            .topological_targets(resolved_target.name.as_str())?
+        {
+            if seen.insert(target.name.clone()) {
+                ordered_targets.push(target);
+            }
+        }
+    }
+    Ok(ordered_targets)
+}
+
 fn build_project(project: &ProjectContext, request: &BuildRequest) -> Result<BuildOutcome> {
     let root_target = project
         .resolved_manifest
@@ -297,7 +361,15 @@ fn build_project(project: &ProjectContext, request: &BuildRequest) -> Result<Bui
     let mut built_targets = HashMap::new();
     let signing_required = build_requires_signing(profile, request.destination);
     for target in &ordered_targets {
-        let built = compile_target(project, &toolchain, target, &build_root, profile)?;
+        let built = compile_target(
+            project,
+            &toolchain,
+            target,
+            &build_root,
+            profile,
+            None,
+            CompileOutputMode::UserFacing,
+        )?;
         built_targets.insert(target.name.clone(), built);
     }
 

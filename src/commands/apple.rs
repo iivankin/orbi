@@ -1,11 +1,21 @@
 use anyhow::Result;
 
 use crate::apple;
-use crate::cli::{AppleCommand, AppleDeviceCommand, AppleSigningCommand, Cli, Command};
+use crate::cli::{AppleCommand, AppleDeviceCommand, AppleSigningCommand, Cli, Command, IdeCommand};
 use crate::context::AppContext;
 
 pub fn execute(app: &AppContext, cli: &Cli) -> Result<()> {
     match &cli.command {
+        Command::Init(_) => unreachable!("`init` is handled before Apple dispatch"),
+        Command::Lint(args) => apple::quality::lint_project(app, args, cli.manifest.as_deref()),
+        Command::Format(args) => apple::quality::format_project(app, args, cli.manifest.as_deref()),
+        Command::Bsp(_) => apple::bsp::serve(app, cli.manifest.as_deref()),
+        Command::Ide(ide_args) => match &ide_args.command {
+            IdeCommand::InstallBuildServer(_) => {
+                apple::bsp::install_connection_files(app, cli.manifest.as_deref())
+            }
+            IdeCommand::DumpArgs(args) => apple::ide::dump_args(app, args, cli.manifest.as_deref()),
+        },
         Command::Run(args) => {
             let project = app.load_project(cli.manifest.as_deref())?;
             apple::build::run_on_destination(&project, args)

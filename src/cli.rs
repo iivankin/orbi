@@ -20,7 +20,7 @@ pub const CLAP_STYLING: Styles = Styles::styled()
 #[command(arg_required_else_help = true)]
 #[command(styles = CLAP_STYLING)]
 #[command(
-    after_help = "Examples:\n  orbit run --platform ios --simulator\n  orbit build --platform ios --distribution development\n  orbit build --platform ios --distribution app-store --release\n  orbit submit --platform ios --wait\n  orbit clean --all\n  orbit apple device list --refresh\n  orbit apple signing export --platform ios --distribution development\n  orbit apple signing import --platform ios --distribution development --p12 ./signing.p12 --password secret"
+    after_help = "Examples:\n  orbit init\n  orbit lint\n  orbit lint --platform ios\n  orbit format\n  orbit format --write\n  orbit ide install-build-server\n  orbit ide dump-args\n  orbit ide dump-args --platform ios --file Sources/App/App.swift\n  orbit run --platform ios --simulator\n  orbit build --platform ios --distribution development\n  orbit build --platform ios --distribution app-store --release\n  orbit submit --platform ios --wait\n  orbit clean --all\n  orbit apple device list --refresh\n  orbit apple signing export --platform ios --distribution development\n  orbit apple signing import --platform ios --distribution development --p12 ./signing.p12 --password secret"
 )]
 pub struct Cli {
     #[arg(long, global = true)]
@@ -35,11 +35,59 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    Init(InitArgs),
+    Lint(LintArgs),
+    Format(FormatArgs),
+    Ide(Box<IdeArgs>),
+    Bsp(BspArgs),
     Run(RunArgs),
     Build(BuildArgs),
     Submit(SubmitArgs),
     Clean(CleanArgs),
     Apple(Box<AppleArgs>),
+}
+
+#[derive(Debug, Args)]
+pub struct InitArgs {}
+
+#[derive(Debug, Args)]
+pub struct LintArgs {
+    #[arg(long, value_enum)]
+    pub platform: Option<TargetPlatform>,
+}
+
+#[derive(Debug, Args)]
+pub struct FormatArgs {
+    #[arg(long)]
+    pub write: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct BspArgs {}
+
+#[derive(Debug, Args)]
+#[command(arg_required_else_help = true)]
+pub struct IdeArgs {
+    #[command(subcommand)]
+    pub command: IdeCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum IdeCommand {
+    InstallBuildServer(IdeInstallBuildServerArgs),
+    DumpArgs(IdeDumpArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct IdeInstallBuildServerArgs {}
+
+#[derive(Debug, Args)]
+pub struct IdeDumpArgs {
+    #[arg(long, value_enum)]
+    pub platform: Option<TargetPlatform>,
+
+    #[arg(long)]
+    pub file: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]

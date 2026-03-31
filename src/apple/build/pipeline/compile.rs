@@ -1,4 +1,3 @@
-use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -8,13 +7,17 @@ use super::artifacts::remove_existing_path;
 use super::info_plist::{needs_info_plist, write_info_plist};
 use super::resources::{ResourceWorkSummary, process_resources, should_process_resources};
 use super::{
-    BuiltTarget, SwiftCompilePlan, build_progress_step, bundle_frameworks_root,
-    embedded_dependency_root, product_layout,
+    BuiltTarget, build_progress_step, bundle_frameworks_root, embedded_dependency_root,
+    product_layout,
+};
+use crate::apple::build::clang::{
+    ClangCompilePlan, ClangSourceLanguage, object_file_name, target_clang_invocation,
 };
 use crate::apple::build::external::{
     ExternalLinkInputs, PackageBuildOutput, apply_external_link_inputs, compile_swift_package,
     resolve_external_link_inputs,
 };
+use crate::apple::build::swiftc::{SwiftTargetCompilePlan, target_swiftc_invocation};
 use crate::apple::build::toolchain::Toolchain;
 use crate::context::ProjectContext;
 use crate::manifest::{ApplePlatform, ProfileManifest, TargetKind, TargetManifest};
@@ -23,12 +26,20 @@ use crate::util::{
     resolve_path, run_command,
 };
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum CompileOutputMode {
+    UserFacing,
+    Silent,
+}
+
 pub(super) fn compile_target(
     project: &ProjectContext,
     toolchain: &Toolchain,
     target: &TargetManifest,
     build_root: &Path,
     profile: &ProfileManifest,
+    index_store_path: Option<&Path>,
+    output_mode: CompileOutputMode,
 ) -> Result<BuiltTarget> {
     let target_dir = build_root.join(&target.name);
     let intermediates_dir = target_dir.join("intermediates");
@@ -45,7 +56,8 @@ pub(super) fn compile_target(
     let package_outputs = if target.swift_packages.is_empty() {
         Vec::new()
     } else {
-        build_progress_step(
+        run_compile_step(
+            output_mode,
             format!("Compiling Swift packages for target `{}`", target.name),
             |outputs: &Vec<PackageBuildOutput>| {
                 format!(
@@ -54,12 +66,22 @@ pub(super) fn compile_target(
                     target.name
                 )
             },
-            || compile_swift_packages(project, toolchain, profile, &intermediates_dir, target),
+            || {
+                compile_swift_packages(
+                    project,
+                    toolchain,
+                    profile,
+                    &intermediates_dir,
+                    index_store_path,
+                    target,
+                )
+            },
         )?
     };
     let external_link_inputs =
         resolve_external_link_inputs(project, toolchain, &intermediates_dir, target)?;
-    let c_objects = build_progress_step(
+    let c_objects = run_compile_step(
+        output_mode,
         format!("Compiling C-family sources for target `{}`", target.name),
         |objects: &Vec<PathBuf>| {
             if objects.is_empty() {
@@ -75,12 +97,23 @@ pub(super) fn compile_target(
                 )
             }
         },
-        || compile_c_family_sources(project, toolchain, profile, &intermediates_dir, target),
+        || {
+            compile_c_family_sources(
+                project,
+                toolchain,
+                profile,
+                &intermediates_dir,
+                index_store_path,
+                &external_link_inputs,
+                target,
+            )
+        },
     )?;
     let swift_sources = resolve_target_sources(project, target, &["swift"])?;
 
     if !swift_sources.is_empty() {
-        build_progress_step(
+        run_compile_step(
+            output_mode,
             format!("Compiling Swift target `{}`", target.name),
             |_| {
                 format!(
@@ -93,21 +126,23 @@ pub(super) fn compile_target(
                 compile_swift_target(
                     toolchain,
                     profile,
-                    SwiftCompilePlan {
+                    SwiftTargetCompilePlan {
                         target_kind: target.kind,
+                        module_name: &target.name,
+                        product_path: &product.binary_path,
+                        module_output_path: product.module_output_path.as_deref(),
                         swift_sources: &swift_sources,
                         package_outputs: &package_outputs,
                         external_link_inputs: &external_link_inputs,
                         object_files: &c_objects,
-                        module_name: &target.name,
-                        product_path: &product.binary_path,
-                        module_output_path: product.module_output_path.as_deref(),
+                        index_store_path,
                     },
                 )
             },
         )?;
     } else if !c_objects.is_empty() {
-        build_progress_step(
+        run_compile_step(
+            output_mode,
             format!("Linking native target `{}`", target.name),
             |_| {
                 format!(
@@ -139,7 +174,8 @@ pub(super) fn compile_target(
     }
 
     if needs_info_plist(target.kind) {
-        build_progress_step(
+        run_compile_step(
+            output_mode,
             format!("Writing Info.plist for target `{}`", target.name),
             |_| format!("Wrote Info.plist for target `{}`.", target.name),
             || write_info_plist(project, toolchain, target, &product.product_path),
@@ -147,7 +183,8 @@ pub(super) fn compile_target(
     }
     if target.kind.is_bundle() {
         if should_process_resources(toolchain.platform, target) {
-            build_progress_step(
+            run_compile_step(
+                output_mode,
                 format!("Processing resources for target `{}`", target.name),
                 |summary: &ResourceWorkSummary| {
                     format!(
@@ -160,7 +197,8 @@ pub(super) fn compile_target(
             )?;
         }
         if !external_link_inputs.embedded_payloads.is_empty() {
-            build_progress_step(
+            run_compile_step(
+                output_mode,
                 format!("Embedding external payloads for target `{}`", target.name),
                 |_| {
                     format!(
@@ -186,6 +224,22 @@ pub(super) fn compile_target(
         target_kind: target.kind,
         bundle_path: product.product_path,
     })
+}
+
+fn run_compile_step<T, F, G>(
+    output_mode: CompileOutputMode,
+    message: impl Into<String>,
+    success_message: G,
+    action: F,
+) -> Result<T>
+where
+    F: FnOnce() -> Result<T>,
+    G: FnOnce(&T) -> String,
+{
+    match output_mode {
+        CompileOutputMode::UserFacing => build_progress_step(message, success_message, action),
+        CompileOutputMode::Silent => action(),
+    }
 }
 
 pub(super) fn embed_dependencies(
@@ -274,38 +328,31 @@ fn compile_c_family_sources(
     toolchain: &Toolchain,
     profile: &ProfileManifest,
     intermediates_dir: &Path,
+    index_store_path: Option<&Path>,
+    external_link_inputs: &ExternalLinkInputs,
     target: &TargetManifest,
 ) -> Result<Vec<PathBuf>> {
     let mut object_files = Vec::new();
-    let specs = [
-        ("c", false),
-        ("m", false),
-        ("mm", true),
-        ("cpp", true),
-        ("cc", true),
-        ("cxx", true),
-    ];
-
-    for (extension, is_cpp) in specs {
+    for extension in ["c", "m", "mm", "cpp", "cc", "cxx"] {
         for source in resolve_target_sources(project, target, &[extension])? {
-            let object_name = source
-                .file_name()
-                .and_then(OsStr::to_str)
-                .map(|value| format!("{value}.o"))
-                .context("failed to derive object file name")?;
+            let language = ClangSourceLanguage::from_extension(extension)
+                .with_context(|| format!("unsupported C-family extension `{extension}`"))?;
+            let object_name = object_file_name(&source)?;
             let object_path = intermediates_dir.join(object_name);
-            let mut command = toolchain.clang(is_cpp);
-            command.arg("-target").arg(&toolchain.target_triple);
-            command.arg("-isysroot").arg(&toolchain.sdk_path);
-            command.arg("-c").arg(&source);
-            command.arg("-o").arg(&object_path);
-            if profile.is_debug() {
-                command.arg("-g");
-            } else {
-                command.arg("-O2");
-            }
+            let invocation = target_clang_invocation(
+                toolchain,
+                profile,
+                ClangCompilePlan {
+                    source_file: &source,
+                    output_path: &object_path,
+                    language,
+                    external_link_inputs,
+                    index_store_path,
+                },
+            )?;
+            let mut command = invocation.command(toolchain);
             run_command(&mut command)?;
-            object_files.push(object_path);
+            object_files.push(invocation.output_path);
         }
     }
 
@@ -315,60 +362,15 @@ fn compile_c_family_sources(
 fn compile_swift_target(
     toolchain: &Toolchain,
     profile: &ProfileManifest,
-    plan: SwiftCompilePlan<'_>,
+    plan: SwiftTargetCompilePlan<'_>,
 ) -> Result<()> {
-    let mut command = toolchain.swiftc();
-    command.arg("-parse-as-library");
-    command.arg("-target").arg(&toolchain.target_triple);
-    command.arg("-module-name").arg(plan.module_name);
-    if profile.is_debug() {
-        command.args(["-Onone", "-g"]);
-    } else {
-        command.arg("-O");
-    }
-    match plan.target_kind {
-        TargetKind::StaticLibrary => {
-            command.arg("-emit-library");
-            command.arg("-static");
-        }
-        TargetKind::DynamicLibrary | TargetKind::Framework => {
-            command.arg("-emit-library");
-        }
-        _ => {}
-    }
-    if matches!(
-        plan.target_kind,
-        TargetKind::StaticLibrary | TargetKind::DynamicLibrary | TargetKind::Framework
-    ) {
-        command.arg("-emit-module");
-        if let Some(module_output_path) = plan.module_output_path {
-            ensure_parent_dir(module_output_path)?;
-            command.arg("-emit-module-path").arg(module_output_path);
-        }
-    }
-    command.arg("-o").arg(plan.product_path);
-    if matches!(
-        plan.target_kind,
-        TargetKind::AppExtension | TargetKind::WatchExtension | TargetKind::WidgetExtension
-    ) {
-        // Extension bundles do not define `main`; the system loader enters through NSExtensionMain.
-        command.args(["-Xlinker", "-e", "-Xlinker", "_NSExtensionMain"]);
-    }
-    for package in plan.package_outputs {
-        command.arg("-I").arg(&package.module_dir);
-        command.arg("-L").arg(&package.library_dir);
-        for library in &package.link_libraries {
-            command.arg("-l").arg(library);
-        }
-    }
-    apply_external_link_inputs(&mut command, plan.external_link_inputs);
-    for object_file in plan.object_files {
-        command.arg(object_file);
-    }
-    for source in plan.swift_sources {
-        command.arg(source);
-    }
-    run_command(&mut command)
+    let module_name = plan.module_name.to_owned();
+    let invocation = target_swiftc_invocation(toolchain, profile, plan)?;
+    let source_count = invocation.source_files.len();
+    let mut command = invocation.command(toolchain);
+    run_command(&mut command).with_context(|| {
+        format!("failed to compile Swift target `{module_name}` from {source_count} source file(s)")
+    })
 }
 
 fn link_native_target(
@@ -430,6 +432,7 @@ fn compile_swift_packages(
     toolchain: &Toolchain,
     profile: &ProfileManifest,
     intermediates_dir: &Path,
+    index_store_path: Option<&Path>,
     target: &TargetManifest,
 ) -> Result<Vec<PackageBuildOutput>> {
     let mut outputs = Vec::new();
@@ -446,7 +449,16 @@ fn compile_swift_packages(
                     dependency.product, target.name
                 )
             },
-            || compile_swift_package(project, toolchain, profile, intermediates_dir, dependency),
+            || {
+                compile_swift_package(
+                    project,
+                    toolchain,
+                    profile,
+                    intermediates_dir,
+                    index_store_path,
+                    dependency,
+                )
+            },
         )?);
     }
 

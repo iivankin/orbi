@@ -493,7 +493,7 @@ mod tests {
         fs::write(
             &manifest_path,
             serde_json::to_vec_pretty(&json!({
-                "$schema": "../../schemas/apple-app.v1.json",
+                "$schema": "/tmp/.orbit/schemas/apple-app.v1.json",
                 "name": "ExampleMacApp",
                 "bundle_id": "dev.orbit.examples.macos",
                 "version": "0.1.0",
@@ -514,7 +514,7 @@ mod tests {
             serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
         assert_eq!(
             manifest.get("$schema").and_then(|value| value.as_str()),
-            Some("../../schemas/apple-app.v1.json")
+            Some("/tmp/.orbit/schemas/apple-app.v1.json")
         );
         assert_eq!(
             manifest.get("bundle_id").and_then(|value| value.as_str()),

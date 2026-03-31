@@ -22,7 +22,7 @@ use crate::apple::device::CachedDevice;
 use crate::context::{AppContext, GlobalPaths, ProjectContext, ProjectPaths};
 use crate::manifest::{
     ApplePlatform, BuildConfiguration, DistributionKind, ManifestSchema, PlatformManifest,
-    ResolvedManifest, TargetKind, TargetManifest,
+    QualityManifest, ResolvedManifest, TargetKind, TargetManifest,
 };
 
 fn test_project() -> (TempDir, ProjectContext) {
@@ -45,6 +45,7 @@ fn test_project() -> (TempDir, ProjectContext) {
         version: "0.1.0".to_owned(),
         team_id: Some("TEAM123456".to_owned()),
         provider_id: None,
+        quality: QualityManifest::default(),
         platforms: BTreeMap::from([(
             ApplePlatform::Ios,
             PlatformManifest {
@@ -87,6 +88,7 @@ fn test_project() -> (TempDir, ProjectContext) {
         global_paths: GlobalPaths {
             data_dir: data_dir.clone(),
             cache_dir,
+            schema_dir: data_dir.join("schemas"),
             auth_state_path: data_dir.join("auth.json"),
             device_cache_path: data_dir.join("devices.json"),
             keychain_path: data_dir.join("orbit.keychain-db"),

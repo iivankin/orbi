@@ -92,6 +92,61 @@ pub fn create_build_xcrun_mock(mock_bin: &Path, sdk_root: &Path) {
     create_xcrun_mock(mock_bin, sdk_root, XcrunMockKind::Build);
 }
 
+pub fn create_quality_swift_mock(mock_bin: &Path) {
+    write_executable(
+        &mock_bin.join("swift"),
+        r#"#!/bin/sh
+set -eu
+echo "swift $@" >> "$MOCK_LOG"
+scratch=""
+product=""
+show_bin_path=0
+prev=""
+for arg in "$@"; do
+  if [ "$prev" = "--scratch-path" ]; then
+    scratch="$arg"
+  fi
+  if [ "$prev" = "--product" ]; then
+    product="$arg"
+  fi
+  if [ "$arg" = "--show-bin-path" ]; then
+    show_bin_path=1
+  fi
+  prev="$arg"
+done
+if [ -z "$scratch" ]; then
+  echo "missing --scratch-path" >&2
+  exit 1
+fi
+bin_dir="$scratch/release"
+mkdir -p "$bin_dir"
+if [ "$show_bin_path" -eq 1 ]; then
+  printf '%s\n' "$bin_dir"
+  exit 0
+fi
+case "$product" in
+  orbit-swift-format|orbit-swiftlint)
+    cat > "$bin_dir/$product" <<'SCRIPT'
+#!/bin/sh
+set -eu
+echo "__PRODUCT__ $@" >> "$MOCK_LOG"
+printf '%s\n' "__PRODUCT__ request:" >> "$MOCK_LOG"
+cat "$1" >> "$MOCK_LOG"
+printf '\n' >> "$MOCK_LOG"
+SCRIPT
+    sed -i '' "s#__PRODUCT__#$product#g" "$bin_dir/$product"
+    chmod +x "$bin_dir/$product"
+    exit 0
+    ;;
+  *)
+    echo "unexpected swift product: $product" >&2
+    exit 1
+    ;;
+esac
+"#,
+    );
+}
+
 pub fn create_ditto_mock(mock_bin: &Path) {
     write_executable(
         &mock_bin.join("ditto"),
@@ -206,6 +261,10 @@ if [ "$#" -ge 3 ] && [ "$1" = "--sdk" ] && [ "$3" = "--show-sdk-path" ]; then
   printf '%s\n' "{sdk}"
   exit 0
 fi
+if [ "$#" -ge 2 ] && [ "$1" = "--find" ] && [ "$2" = "swiftc" ]; then
+  printf '%s\n' "{sdk}/Toolchains/OrbitDefault.xctoolchain/usr/bin/swiftc"
+  exit 0
+fi
 if [ "$#" -ge 3 ] && [ "$1" = "--sdk" ] && [ "$3" = "--show-sdk-version" ]; then
 {sdk_version_block}
 fi
@@ -231,6 +290,21 @@ if [ "$#" -ge 3 ] && [ "$1" = "--sdk" ] && [ "$3" = "swiftc" ]; then
   if [ -n "$module" ]; then
     mkdir -p "$(dirname "$module")"
     : > "$module"
+  fi
+  exit 0
+fi
+if [ "$#" -ge 3 ] && [ "$1" = "--sdk" ] && {{ [ "$3" = "clang" ] || [ "$3" = "clang++" ]; }}; then
+  out=""
+  prev=""
+  for arg in "$@"; do
+    if [ "$prev" = "-o" ]; then
+      out="$arg"
+    fi
+    prev="$arg"
+  done
+  if [ -n "$out" ]; then
+    mkdir -p "$(dirname "$out")"
+    : > "$out"
   fi
   exit 0
 fi

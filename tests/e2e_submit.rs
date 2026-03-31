@@ -154,7 +154,7 @@ fn developer_id_submit_uses_xcode_like_notary_flow() {
     fs::write(
         workspace.join("orbit.json"),
         serde_json::to_vec_pretty(&serde_json::json!({
-            "$schema": "https://orbit.dev/schemas/apple-app.v1.json",
+            "$schema": "/tmp/.orbit/schemas/apple-app.v1.json",
             "name": "ExampleMacApp",
             "bundle_id": "dev.orbit.fixture.mac",
             "version": "0.1.0",

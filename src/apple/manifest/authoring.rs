@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
 use super::ApplePlatform;
@@ -44,6 +44,37 @@ pub struct AppManifest {
     pub hooks: Option<HooksManifest>,
     #[serde(default)]
     pub tests: Option<TestsManifest>,
+    #[serde(default)]
+    pub quality: QualityManifest,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct QualityManifest {
+    #[serde(default)]
+    pub lint: LintQualityManifest,
+    #[serde(default)]
+    pub format: FormatQualityManifest,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LintQualityManifest {
+    #[serde(default)]
+    pub ignore: Vec<String>,
+    #[serde(default)]
+    pub rules: BTreeMap<String, JsonValue>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct FormatQualityManifest {
+    #[serde(default)]
+    pub ignore: Vec<String>,
+    #[serde(default)]
+    pub rules: BTreeMap<String, JsonValue>,
+    #[serde(default)]
+    pub editorconfig: bool,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]

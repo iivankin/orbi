@@ -4,7 +4,7 @@ use std::fs;
 
 use support::{
     base_command, create_home, create_p12, create_security_mock, create_signing_workspace,
-    run_and_capture,
+    orbit_data_dir, run_and_capture,
 };
 
 #[test]
@@ -45,16 +45,15 @@ fn signing_import_export_and_clean_round_trip() {
         String::from_utf8_lossy(&import_output.stderr)
     );
 
-    let state_path = home.join("Library/Application Support/orbit/teams/TEAM123456/signing.json");
+    let state_path = orbit_data_dir(&home).join("teams/TEAM123456/signing.json");
     let mut signing_state: serde_json::Value =
         serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
     let certificate_id = signing_state["certificates"][0]["id"]
         .as_str()
         .unwrap()
         .to_owned();
-    let profile_path = home.join(
-        "Library/Application Support/orbit/teams/TEAM123456/profiles/fixture.mobileprovision",
-    );
+    let profile_path =
+        orbit_data_dir(&home).join("teams/TEAM123456/profiles/fixture.mobileprovision");
     fs::create_dir_all(profile_path.parent().unwrap()).unwrap();
     fs::write(&profile_path, b"fixture-profile").unwrap();
     signing_state["profiles"] = serde_json::json!([{

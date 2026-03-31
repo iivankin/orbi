@@ -104,12 +104,22 @@
     "tests": {
       "$ref": "#/$defs/testsManifest",
       "description": "Optional test target declarations."
+    },
+    "quality": {
+      "$ref": "#/$defs/qualityManifest",
+      "description": "Lint and format configuration owned by Orbit."
     }
   },
   "$defs": {
     "applePlatform": {
       "type": "string",
-      "enum": ["ios", "macos", "tvos", "visionos", "watchos"]
+      "enum": [
+        "ios",
+        "macos",
+        "tvos",
+        "visionos",
+        "watchos"
+      ]
     },
     "pathArray": {
       "type": "array",
@@ -118,6 +128,62 @@
         "minLength": 1
       },
       "default": []
+    },
+    "globArray": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "default": []
+    },
+    "qualityManifest": {
+      "type": "object",
+      "additionalProperties": false,
+      "default": {},
+      "properties": {
+        "lint": {
+          "$ref": "#/$defs/lintQualityManifest"
+        },
+        "format": {
+          "$ref": "#/$defs/formatQualityManifest"
+        }
+      }
+    },
+    "lintQualityManifest": {
+      "type": "object",
+      "additionalProperties": false,
+      "default": {},
+      "properties": {
+        "ignore": {
+          "$ref": "#/$defs/globArray",
+          "description": "Glob patterns excluded from `orbit lint`."
+        },
+        "rules": {
+          "$ref": "#/$defs/lintRuleConfig",
+          "description": "SwiftLint rule configuration. Orbit accepts ESLint-style levels (`off`, `warn`, `error`) plus raw SwiftLint rule options."
+        }
+      }
+    },
+    "formatQualityManifest": {
+      "type": "object",
+      "additionalProperties": false,
+      "default": {},
+      "properties": {
+        "ignore": {
+          "$ref": "#/$defs/globArray",
+          "description": "Glob patterns excluded from `orbit format`."
+        },
+        "rules": {
+          "$ref": "#/$defs/formatRuleConfig",
+          "description": "swift-format configuration overlay. PascalCase keys target formatter rule ids; lowerCamelCase keys target raw swift-format configuration fields."
+        },
+        "editorconfig": {
+          "type": "boolean",
+          "default": false,
+          "description": "When true, Orbit applies supported `.editorconfig` formatting keys (`indent_style`, `indent_size`, `tab_width`, `max_line_length`) before `quality.format.rules`."
+        }
+      }
     },
     "platformTargets": {
       "type": "object",
@@ -159,7 +225,9 @@
         {
           "type": "object",
           "additionalProperties": false,
-          "required": ["path"],
+          "required": [
+            "path"
+          ],
           "properties": {
             "path": {
               "type": "string",
@@ -175,7 +243,9 @@
         {
           "type": "object",
           "additionalProperties": false,
-          "required": ["framework"],
+          "required": [
+            "framework"
+          ],
           "properties": {
             "framework": {
               "const": true,
@@ -190,7 +260,9 @@
         {
           "type": "object",
           "additionalProperties": false,
-          "required": ["xcframework"],
+          "required": [
+            "xcframework"
+          ],
           "properties": {
             "xcframework": {
               "type": "string",
@@ -483,7 +555,11 @@
             "NSUserNotificationAlertStyle": {
               "type": "string",
               "description": "macOS notification style for the app.",
-              "enum": ["banner", "alert", "none"]
+              "enum": [
+                "banner",
+                "alert",
+                "none"
+              ]
             },
             "NSSystemAdministrationUsageDescription": {
               "type": "string",
@@ -601,7 +677,10 @@
           "description": "NFC reader session formats.",
           "items": {
             "type": "string",
-            "enum": ["NDEF", "TAG"]
+            "enum": [
+              "NDEF",
+              "TAG"
+            ]
           }
         },
         "vpn_api": {
@@ -610,7 +689,9 @@
           "description": "Personal VPN API modes.",
           "items": {
             "type": "string",
-            "enum": ["allow-vpn"]
+            "enum": [
+              "allow-vpn"
+            ]
           }
         },
         "pass_type_identifiers": {
@@ -623,7 +704,9 @@
           "description": "Apple ID sign-in modes.",
           "items": {
             "type": "string",
-            "enum": ["Default"]
+            "enum": [
+              "Default"
+            ]
           }
         },
         "user_fonts": {
@@ -632,7 +715,10 @@
           "description": "Font installation modes.",
           "items": {
             "type": "string",
-            "enum": ["app-usage", "system-installation"]
+            "enum": [
+              "app-usage",
+              "system-installation"
+            ]
           }
         },
         "apple_pay_later_merchandising": {
@@ -641,7 +727,9 @@
           "description": "Apple Pay Later merchandising modes.",
           "items": {
             "type": "string",
-            "enum": ["payinfour-merchandising"]
+            "enum": [
+              "payinfour-merchandising"
+            ]
           }
         },
         "sensitive_content_analysis": {
@@ -650,7 +738,9 @@
           "description": "Sensitive content analysis client modes.",
           "items": {
             "type": "string",
-            "enum": ["analysis"]
+            "enum": [
+              "analysis"
+            ]
           }
         },
         "app_attest_environment": {
@@ -663,7 +753,9 @@
           "description": "Journaling suggestions modes.",
           "items": {
             "type": "string",
-            "enum": ["suggestions"]
+            "enum": [
+              "suggestions"
+            ]
           }
         },
         "managed_app_distribution_install_ui": {
@@ -672,7 +764,9 @@
           "description": "Managed app distribution install UI modes.",
           "items": {
             "type": "string",
-            "enum": ["managed-app"]
+            "enum": [
+              "managed-app"
+            ]
           }
         },
         "network_slicing_app_category": {
@@ -681,7 +775,11 @@
           "description": "Network slicing application categories.",
           "items": {
             "type": "string",
-            "enum": ["gaming-6014", "communication-9000", "streaming-9001"]
+            "enum": [
+              "gaming-6014",
+              "communication-9000",
+              "streaming-9001"
+            ]
           }
         },
         "network_slicing_traffic_category": {
@@ -905,7 +1003,10 @@
     },
     "devProdString": {
       "type": "string",
-      "enum": ["development", "production"]
+      "enum": [
+        "development",
+        "production"
+      ]
     },
     "nsServiceEntry": {
       "type": "object",
@@ -970,7 +1071,11 @@
         "NSUbiquitousContainerSupportedFolderLevels": {
           "type": "string",
           "description": "Maximum nesting level allowed in the container's Documents directory.",
-          "enum": ["None", "One", "Any"]
+          "enum": [
+            "None",
+            "One",
+            "Any"
+          ]
         }
       },
       "additionalProperties": {
@@ -994,7 +1099,10 @@
           "default": [],
           "items": {
             "type": "string",
-            "enum": ["client", "server"]
+            "enum": [
+              "client",
+              "server"
+            ]
           }
         },
         "files": {
@@ -1002,7 +1110,10 @@
           "default": [],
           "items": {
             "type": "string",
-            "enum": ["user-selected.read-only", "user-selected.read-write"]
+            "enum": [
+              "user-selected.read-only",
+              "user-selected.read-write"
+            ]
           }
         }
       }
@@ -1010,7 +1121,9 @@
     "entryConfig": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["class"],
+      "required": [
+        "class"
+      ],
       "properties": {
         "class": {
           "type": "string",
@@ -1022,11 +1135,21 @@
     "extensionConfig": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["kind", "sources", "entry"],
+      "required": [
+        "kind",
+        "sources",
+        "entry"
+      ],
       "properties": {
         "kind": {
           "type": "string",
-          "enum": ["packet-tunnel", "widget", "share", "safari", "safari-web"]
+          "enum": [
+            "packet-tunnel",
+            "widget",
+            "share",
+            "safari",
+            "safari-web"
+          ]
         },
         "platforms": {
           "type": "array",
@@ -1058,7 +1181,9 @@
     "watchConfig": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["extension"],
+      "required": [
+        "extension"
+      ],
       "properties": {
         "sources": {
           "$ref": "#/$defs/pathArray"
@@ -1083,7 +1208,10 @@
     "watchExtensionConfig": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["sources", "entry"],
+      "required": [
+        "sources",
+        "entry"
+      ],
       "properties": {
         "sources": {
           "$ref": "#/$defs/pathArray"
@@ -1108,7 +1236,9 @@
     "appClipConfig": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["sources"],
+      "required": [
+        "sources"
+      ],
       "properties": {
         "sources": {
           "$ref": "#/$defs/pathArray"
@@ -1157,6 +1287,1078 @@
       "properties": {
         "sources": {
           "$ref": "#/$defs/pathArray"
+        }
+      }
+    },
+    "qualitySeverity": {
+      "type": "string",
+      "enum": [
+        "off",
+        "warn",
+        "warning",
+        "error",
+        "err"
+      ]
+    },
+    "lintRuleSetting": {
+      "description": "Rule setting. Orbit accepts `off`, `warn`, `error`, `[level, options]`, or raw SwiftLint rule configuration.",
+      "anyOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "boolean"
+        },
+        {
+          "type": "number"
+        },
+        {
+          "type": "string"
+        },
+        {
+          "type": "array"
+        },
+        {
+          "type": "object"
+        }
+      ]
+    },
+    "formatRuleSetting": {
+      "description": "Rule setting. Orbit accepts `off`, `warn`, `error`, `[level, options]`, or raw swift-format rule configuration.",
+      "anyOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "boolean"
+        },
+        {
+          "type": "number"
+        },
+        {
+          "type": "string"
+        },
+        {
+          "type": "array"
+        },
+        {
+          "type": "object"
+        }
+      ]
+    },
+    "lintRuleConfig": {
+      "type": "object",
+      "default": {},
+      "additionalProperties": false,
+      "properties": {
+        "accessibility_label_for_image": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "accessibility_trait_for_button": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "anonymous_argument_in_multiline_closure": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "array_init": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "async_without_await": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "attribute_name_spacing": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "attributes": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "balanced_xctest_lifecycle": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "blanket_disable_command": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "block_based_kvo": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "capture_variable": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "class_delegate_protocol": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "closing_brace": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "closure_body_length": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "closure_end_indentation": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "closure_parameter_position": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "closure_spacing": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "collection_alignment": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "colon": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "comma": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "comma_inheritance": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "comment_spacing": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "compiler_protocol_init": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "computed_accessors_order": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "conditional_returns_on_newline": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "contains_over_filter_count": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "contains_over_filter_is_empty": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "contains_over_first_not_nil": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "contains_over_range_nil_comparison": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "contrasted_opening_brace": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "control_statement": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "convenience_type": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "custom_rules": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "cyclomatic_complexity": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "deployment_target": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "direct_return": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "discarded_notification_center_observer": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "discouraged_assert": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "discouraged_direct_init": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "discouraged_none_name": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "discouraged_object_literal": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "discouraged_optional_boolean": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "discouraged_optional_collection": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "duplicate_conditions": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "duplicate_enum_cases": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "duplicate_imports": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "duplicated_key_in_dictionary_literal": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "dynamic_inline": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "empty_collection_literal": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "empty_count": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "empty_enum_arguments": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "empty_parameters": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "empty_parentheses_with_trailing_closure": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "empty_string": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "empty_xctest_method": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "enum_case_associated_values_count": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "expiring_todo": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "explicit_acl": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "explicit_enum_raw_value": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "explicit_init": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "explicit_self": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "explicit_top_level_acl": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "explicit_type_interface": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "extension_access_modifier": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "fallthrough": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "fatal_error_message": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "file_header": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "file_length": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "file_name": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "file_name_no_space": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "file_types_order": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "final_test_case": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "first_where": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "flatmap_over_map_reduce": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "for_where": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "force_cast": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "force_try": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "force_unwrapping": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "function_body_length": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "function_default_parameter_at_end": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "function_name_whitespace": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "function_parameter_count": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "generic_type_name": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "ibinspectable_in_extension": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "identical_operands": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "identifier_name": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "implicit_getter": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "implicit_optional_initialization": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "implicit_return": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "implicitly_unwrapped_optional": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "inclusive_language": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "incompatible_concurrency_annotation": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "indentation_width": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "invalid_swiftlint_command": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "is_disjoint": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "joined_default_parameter": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "large_tuple": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "last_where": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "leading_whitespace": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "legacy_cggeometry_functions": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "legacy_constant": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "legacy_constructor": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "legacy_hashing": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "legacy_multiple": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "legacy_nsgeometry_functions": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "legacy_objc_type": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "legacy_random": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "let_var_whitespace": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "line_length": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "literal_expression_end_indentation": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "local_doc_comment": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "lower_acl_than_parent": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "mark": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "missing_docs": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "modifier_order": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "multiline_arguments": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "multiline_arguments_brackets": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "multiline_call_arguments": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "multiline_function_chains": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "multiline_literal_brackets": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "multiline_parameters": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "multiline_parameters_brackets": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "multiple_closures_with_trailing_closure": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "nesting": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "nimble_operator": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "no_empty_block": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "no_extension_access_modifier": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "no_fallthrough_only": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "no_grouping_extension": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "no_magic_numbers": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "no_space_in_method_call": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "non_optional_string_data_conversion": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "non_overridable_class_declaration": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "notification_center_detachment": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "ns_number_init_as_function_reference": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "nslocalizedstring_key": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "nslocalizedstring_require_bundle": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "nsobject_prefer_isequal": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "number_separator": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "object_literal": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "one_declaration_per_file": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "opening_brace": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "operator_usage_whitespace": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "optional_data_string_conversion": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "optional_enum_case_matching": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "orphaned_doc_comment": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "overridden_super_call": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "override_in_extension": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "pattern_matching_keywords": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "period_spacing": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "prefer_asset_symbols": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "prefer_condition_list": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "prefer_key_path": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "prefer_nimble": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "prefer_self_in_static_references": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "prefer_self_type_over_type_of_self": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "prefer_type_checking": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "prefer_zero_over_explicit_init": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "prefixed_toplevel_constant": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "private_action": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "private_outlet": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "private_over_fileprivate": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "private_subject": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "private_swiftui_state": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "private_unit_test": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "prohibited_interface_builder": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "prohibited_super_call": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "protocol_property_accessors_order": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "quick_discouraged_call": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "quick_discouraged_focused_test": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "quick_discouraged_pending_test": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "raw_value_for_camel_cased_codable_enum": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "reduce_boolean": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "reduce_into": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "redundant_discardable_let": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "redundant_nil_coalescing": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "redundant_objc_attribute": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "redundant_self": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "redundant_sendable": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "redundant_set_access_control": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "redundant_string_enum_value": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "redundant_type_annotation": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "redundant_void_return": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "required_deinit": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "required_enum_case": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "return_arrow_whitespace": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "return_value_from_void_function": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "self_binding": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "self_in_property_initialization": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "shorthand_argument": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "shorthand_operator": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "shorthand_optional_binding": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "single_test_class": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "sorted_enum_cases": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "sorted_first_last": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "sorted_imports": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "statement_position": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "static_operator": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "static_over_final_class": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "strict_fileprivate": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "strong_iboutlet": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "superfluous_disable_command": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "superfluous_else": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "switch_case_alignment": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "switch_case_on_newline": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "syntactic_sugar": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "test_case_accessibility": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "todo": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "toggle_bool": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "trailing_closure": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "trailing_comma": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "trailing_newline": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "trailing_semicolon": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "trailing_whitespace": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "type_body_length": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "type_contents_order": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "type_name": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "typesafe_array_init": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "unavailable_condition": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "unavailable_function": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "unhandled_throwing_task": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "unneeded_break_in_switch": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "unneeded_escaping": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "unneeded_override": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "unneeded_parentheses_in_closure_argument": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "unneeded_synthesized_initializer": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "unneeded_throws_rethrows": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "unowned_variable_capture": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "untyped_error_in_catch": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "unused_closure_parameter": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "unused_control_flow_label": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "unused_declaration": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "unused_enumerated": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "unused_import": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "unused_optional_binding": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "unused_parameter": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "unused_setter_value": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "valid_ibinspectable": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "vertical_parameter_alignment": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "vertical_parameter_alignment_on_call": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "vertical_whitespace": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "vertical_whitespace_between_cases": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "vertical_whitespace_closing_braces": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "vertical_whitespace_opening_braces": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "void_function_in_ternary": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "void_return": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "weak_delegate": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "xct_specific_matcher": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "xctfail_message": {
+          "$ref": "#/$defs/lintRuleSetting"
+        },
+        "yoda_condition": {
+          "$ref": "#/$defs/lintRuleSetting"
+        }
+      }
+    },
+    "formatRuleConfig": {
+      "type": "object",
+      "default": {},
+      "additionalProperties": false,
+      "properties": {
+        "AllPublicDeclarationsHaveDocumentation": {
+          "$ref": "#/$defs/formatRuleSetting"
+        },
+        "AlwaysUseLiteralForEmptyCollectionInit": {
+          "$ref": "#/$defs/formatRuleSetting"
+        },
+        "AlwaysUseLowerCamelCase": {
+          "$ref": "#/$defs/formatRuleSetting"
+        },
+        "AmbiguousTrailingClosureOverload": {
+          "$ref": "#/$defs/formatRuleSetting"
+        },
+        "AvoidRetroactiveConformances": {
+          "$ref": "#/$defs/formatRuleSetting"
+        },
+        "BeginDocumentationCommentWithOneLineSummary": {
+          "$ref": "#/$defs/formatRuleSetting"
+        },
+        "DoNotUseSemicolons": {
+          "$ref": "#/$defs/formatRuleSetting"
+        },
+        "DontRepeatTypeInStaticProperties": {
+          "$ref": "#/$defs/formatRuleSetting"
+        },
+        "FileScopedDeclarationPrivacy": {
+          "$ref": "#/$defs/formatRuleSetting"
+        },
+        "FullyIndirectEnum": {
+          "$ref": "#/$defs/formatRuleSetting"
+        },
+        "GroupNumericLiterals": {
+          "$ref": "#/$defs/formatRuleSetting"
+        },
+        "IdentifiersMustBeASCII": {
+          "$ref": "#/$defs/formatRuleSetting"
+        },
+        "NeverForceUnwrap": {
+          "$ref": "#/$defs/formatRuleSetting"
+        },
+        "NeverUseForceTry": {
+          "$ref": "#/$defs/formatRuleSetting"
+        },
+        "NeverUseImplicitlyUnwrappedOptionals": {
+          "$ref": "#/$defs/formatRuleSetting"
+        },
+        "NoAccessLevelOnExtensionDeclaration": {
+          "$ref": "#/$defs/formatRuleSetting"
+        },
+        "NoAssignmentInExpressions": {
+          "$ref": "#/$defs/formatRuleSetting"
+        },
+        "NoBlockComments": {
+          "$ref": "#/$defs/formatRuleSetting"
+        },
+        "NoCasesWithOnlyFallthrough": {
+          "$ref": "#/$defs/formatRuleSetting"
+        },
+        "NoEmptyLinesOpeningClosingBraces": {
+          "$ref": "#/$defs/formatRuleSetting"
+        },
+        "NoEmptyTrailingClosureParentheses": {
+          "$ref": "#/$defs/formatRuleSetting"
+        },
+        "NoLabelsInCasePatterns": {
+          "$ref": "#/$defs/formatRuleSetting"
+        },
+        "NoLeadingUnderscores": {
+          "$ref": "#/$defs/formatRuleSetting"
+        },
+        "NoParensAroundConditions": {
+          "$ref": "#/$defs/formatRuleSetting"
+        },
+        "NoPlaygroundLiterals": {
+          "$ref": "#/$defs/formatRuleSetting"
+        },
+        "NoVoidReturnOnFunctionSignature": {
+          "$ref": "#/$defs/formatRuleSetting"
+        },
+        "OmitExplicitReturns": {
+          "$ref": "#/$defs/formatRuleSetting"
+        },
+        "OneCasePerLine": {
+          "$ref": "#/$defs/formatRuleSetting"
+        },
+        "OneVariableDeclarationPerLine": {
+          "$ref": "#/$defs/formatRuleSetting"
+        },
+        "OnlyOneTrailingClosureArgument": {
+          "$ref": "#/$defs/formatRuleSetting"
+        },
+        "OrderedImports": {
+          "$ref": "#/$defs/formatRuleSetting"
+        },
+        "ReplaceForEachWithForLoop": {
+          "$ref": "#/$defs/formatRuleSetting"
+        },
+        "ReturnVoidInsteadOfEmptyTuple": {
+          "$ref": "#/$defs/formatRuleSetting"
+        },
+        "TypeNamesShouldBeCapitalized": {
+          "$ref": "#/$defs/formatRuleSetting"
+        },
+        "UseEarlyExits": {
+          "$ref": "#/$defs/formatRuleSetting"
+        },
+        "UseExplicitNilCheckInConditions": {
+          "$ref": "#/$defs/formatRuleSetting"
+        },
+        "UseLetInEveryBoundCaseVariable": {
+          "$ref": "#/$defs/formatRuleSetting"
+        },
+        "UseShorthandTypeNames": {
+          "$ref": "#/$defs/formatRuleSetting"
+        },
+        "UseSingleLinePropertyGetter": {
+          "$ref": "#/$defs/formatRuleSetting"
+        },
+        "UseSynthesizedInitializer": {
+          "$ref": "#/$defs/formatRuleSetting"
+        },
+        "UseTripleSlashForDocumentationComments": {
+          "$ref": "#/$defs/formatRuleSetting"
+        },
+        "UseWhereClausesInForLoops": {
+          "$ref": "#/$defs/formatRuleSetting"
+        },
+        "ValidateDocumentationComments": {
+          "$ref": "#/$defs/formatRuleSetting"
+        },
+        "maximumBlankLines": {
+          "type": "integer"
+        },
+        "lineLength": {
+          "type": "integer"
+        },
+        "spacesBeforeEndOfLineComments": {
+          "type": "integer"
+        },
+        "tabWidth": {
+          "type": "integer"
+        },
+        "indentation": {
+          "$ref": "#/$defs/swiftFormatIndentation"
+        },
+        "respectsExistingLineBreaks": {
+          "type": "boolean"
+        },
+        "lineBreakBeforeControlFlowKeywords": {
+          "type": "boolean"
+        },
+        "lineBreakBeforeEachArgument": {
+          "type": "boolean"
+        },
+        "lineBreakBeforeEachGenericRequirement": {
+          "type": "boolean"
+        },
+        "lineBreakBetweenDeclarationAttributes": {
+          "type": "boolean"
+        },
+        "prioritizeKeepingFunctionOutputTogether": {
+          "type": "boolean"
+        },
+        "indentConditionalCompilationBlocks": {
+          "type": "boolean"
+        },
+        "lineBreakAroundMultilineExpressionChainComponents": {
+          "type": "boolean"
+        },
+        "fileScopedDeclarationPrivacy": {
+          "$ref": "#/$defs/swiftFormatFileScopedDeclarationPrivacy"
+        },
+        "indentSwitchCaseLabels": {
+          "type": "boolean"
+        },
+        "spacesAroundRangeFormationOperators": {
+          "type": "boolean"
+        },
+        "noAssignmentInExpressions": {
+          "$ref": "#/$defs/swiftFormatNoAssignmentInExpressions"
+        },
+        "multiElementCollectionTrailingCommas": {
+          "type": "boolean"
+        },
+        "reflowMultilineStringLiterals": {
+          "enum": [
+            "never",
+            "onlyLinesOverLength",
+            "always"
+          ]
+        },
+        "indentBlankLines": {
+          "type": "boolean"
+        },
+        "version": {
+          "type": "integer"
+        }
+      }
+    },
+    "swiftFormatIndentation": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "spaces"
+          ],
+          "properties": {
+            "spaces": {
+              "type": "integer"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "tabs"
+          ],
+          "properties": {
+            "tabs": {
+              "type": "integer"
+            }
+          }
+        }
+      ]
+    },
+    "swiftFormatFileScopedDeclarationPrivacy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "accessLevel"
+      ],
+      "properties": {
+        "accessLevel": {
+          "enum": [
+            "private",
+            "fileprivate"
+          ]
+        }
+      }
+    },
+    "swiftFormatNoAssignmentInExpressions": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "allowedFunctions": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
         }
       }
     }

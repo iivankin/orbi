@@ -30,6 +30,7 @@ pub struct ProjectContext {
 pub struct GlobalPaths {
     pub data_dir: PathBuf,
     pub cache_dir: PathBuf,
+    pub schema_dir: PathBuf,
     pub auth_state_path: PathBuf,
     pub device_cache_path: PathBuf,
     pub keychain_path: PathBuf,
@@ -167,16 +168,23 @@ fn resolve_global_paths() -> Result<GlobalPaths> {
             .unwrap_or_else(|| data_dir.join("cache"))
             .join("orbit"),
     };
+    let schema_dir = match env_path("ORBIT_SCHEMA_DIR") {
+        Some(path) => path,
+        None => dirs::home_dir()
+            .context("failed to resolve the user home directory for Orbit schemas")?
+            .join(".orbit")
+            .join("schemas"),
+    };
     let keychain_path = data_dir.join("orbit.keychain-db");
 
     ensure_dir(&data_dir)?;
     ensure_dir(&cache_dir)?;
-
     Ok(GlobalPaths {
         auth_state_path: data_dir.join("auth.json"),
         device_cache_path: data_dir.join("devices.json"),
         data_dir,
         cache_dir,
+        schema_dir,
         keychain_path,
     })
 }

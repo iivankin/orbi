@@ -20,19 +20,30 @@ pub fn create_home(root: &Path) -> PathBuf {
     home
 }
 
+pub fn orbit_data_dir(home: &Path) -> PathBuf {
+    home.join(".orbit-data")
+}
+
+pub fn orbit_cache_dir(home: &Path) -> PathBuf {
+    home.join(".orbit-cache")
+}
+
 pub fn base_command(workspace: &Path, home: &Path, mock_bin: &Path, log_path: &Path) -> Command {
     let mut command = Command::new(orbit_bin());
+    apply_test_environment(&mut command, home, mock_bin, log_path);
     command.current_dir(workspace);
-    command.env("HOME", home);
-    command.env(
-        "PATH",
-        format!(
-            "{}:{}",
-            mock_bin.display(),
-            std::env::var("PATH").unwrap_or_default()
-        ),
-    );
-    command.env("MOCK_LOG", log_path);
+    command
+}
+
+pub fn sourcekit_lsp_command(
+    workspace: &Path,
+    home: &Path,
+    mock_bin: &Path,
+    log_path: &Path,
+) -> Command {
+    let mut command = Command::new("sourcekit-lsp");
+    apply_test_environment(&mut command, home, mock_bin, log_path);
+    command.current_dir(workspace);
     command
 }
 
@@ -56,4 +67,19 @@ pub fn latest_receipt_path(workspace: &Path) -> PathBuf {
         .collect::<Vec<_>>();
     receipts.sort();
     receipts.pop().unwrap()
+}
+
+fn apply_test_environment(command: &mut Command, home: &Path, mock_bin: &Path, log_path: &Path) {
+    command.env("HOME", home);
+    command.env("ORBIT_DATA_DIR", orbit_data_dir(home));
+    command.env("ORBIT_CACHE_DIR", orbit_cache_dir(home));
+    command.env(
+        "PATH",
+        format!(
+            "{}:{}",
+            mock_bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        ),
+    );
+    command.env("MOCK_LOG", log_path);
 }
