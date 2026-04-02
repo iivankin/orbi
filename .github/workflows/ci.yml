@@ -14,14 +14,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.94.1
+        with:
+          components: rustfmt, clippy
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Check formatting
-        run: cargo fmt --check
+      - name: Format check
+        run: cargo fmt --all --check
 
-      - name: Run clippy
+      - name: Typecheck
+        run: cargo check
+
+      - name: Clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
 
       - name: Run tests

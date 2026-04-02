@@ -1,0 +1,14 @@
+glob_matcher: doublestar
+
+pre-commit:
+  parallel: false
+  jobs:
+    - name: rust-format
+      glob: "**/*.rs"
+      run: cargo fmt --all --check
+    - name: rust-check
+      glob: "**/*.{rs,toml,lock}"
+      run: cargo check
+    - name: rust-clippy
+      glob: "**/*.{rs,toml,lock}"
+      run: cargo clippy --all-targets --all-features -- -D warnings
