@@ -4,8 +4,8 @@ use std::fs;
 
 use support::submit_mock::spawn_submit_mock;
 use support::{
-    base_command, clear_log, create_api_key, create_build_xcrun_mock, create_ditto_mock,
-    create_home, create_passthrough_mock, create_security_mock, create_signing_workspace,
+    base_command, clear_log, create_api_key, create_build_xcrun_mock, create_codesign_mock,
+    create_ditto_mock, create_home, create_security_mock, create_signing_workspace,
     create_submit_swinfo_mock, latest_receipt_path, read_log, run_and_capture, spawn_asc_mock,
 };
 
@@ -22,7 +22,7 @@ fn app_store_build_submit_and_clean_complete_full_lifecycle() {
 
     create_build_xcrun_mock(&mock_bin, &sdk_root);
     create_security_mock(&mock_bin, &security_db);
-    create_passthrough_mock(&mock_bin, "codesign");
+    create_codesign_mock(&mock_bin);
     create_ditto_mock(&mock_bin);
     create_submit_swinfo_mock(&mock_bin);
 

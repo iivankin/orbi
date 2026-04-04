@@ -4,7 +4,8 @@ use anyhow::{Context, Result, bail};
 use serde::Serialize;
 
 use crate::apple::analysis::{
-    SemanticCompilerInvocation, build_semantic_compilation_artifact, load_cached_analysis_project,
+    SemanticCompilerInvocation, build_cached_semantic_compilation_artifact_with_status,
+    load_cached_analysis_project,
 };
 use crate::apple::runtime::apple_platform_from_cli;
 use crate::cli::IdeDumpArgs;
@@ -26,16 +27,21 @@ pub fn dump_args(
     requested_manifest: Option<&Path>,
 ) -> Result<()> {
     let analysis_project = load_cached_analysis_project(app, requested_manifest)?;
+    let explicit_platform = args.platform.map(apple_platform_from_cli);
     let requested_file = args
         .file
         .as_deref()
         .map(|path| resolve_filter_file(&analysis_project.project.root, path))
         .transpose()?;
-    let mut artifact = build_semantic_compilation_artifact(
+    let cached_artifact = build_cached_semantic_compilation_artifact_with_status(
         &analysis_project.project,
-        args.platform.map(apple_platform_from_cli),
-        &|_| true,
+        explicit_platform,
     )?;
+    eprintln!(
+        "orbit > {}",
+        cached_artifact.cache_status.message(explicit_platform)
+    );
+    let mut artifact = cached_artifact.artifact;
 
     if let Some(filter_file) = requested_file.as_ref() {
         artifact.invocations.retain(|invocation| {

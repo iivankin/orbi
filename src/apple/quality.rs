@@ -1,13 +1,15 @@
 mod config;
 mod tooling;
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 
 use crate::apple::analysis::{
-    SemanticCompilationArtifact, SemanticCompilerInvocation, build_semantic_compilation_artifact,
-    collect_project_swift_files, load_cached_analysis_project,
+    SemanticCompilationArtifact, SemanticCompilerInvocation,
+    build_cached_semantic_compilation_artifact_with_status, collect_project_swift_files,
+    load_cached_analysis_project,
 };
 use crate::apple::runtime::apple_platform_from_cli;
 use crate::apple::xcode::xcrun_command;
@@ -27,6 +29,7 @@ pub fn lint_project(
 ) -> Result<()> {
     let analysis_project = load_cached_analysis_project(app, requested_manifest)?;
     let project = &analysis_project.project;
+    let explicit_platform = args.platform.map(apple_platform_from_cli);
     let lint_quality = lint_quality_config(project)?;
     let include_source = |path: &Path| {
         !lint_quality
@@ -34,11 +37,11 @@ pub fn lint_project(
             .is_some_and(|matcher| matcher.is_ignored(path))
     };
     let swift_files = collect_project_swift_files(project, &include_source)?;
-    let artifact = build_semantic_compilation_artifact(
-        project,
-        args.platform.map(apple_platform_from_cli),
+    let artifact = filter_semantic_compilation_artifact(
+        build_cached_semantic_compilation_artifact_with_status(project, explicit_platform)?
+            .artifact,
         &include_source,
-    )?;
+    );
     let swift_compiler_invocations = artifact
         .invocations
         .iter()
@@ -224,6 +227,62 @@ fn c_family_source_count(artifact: &SemanticCompilationArtifact) -> usize {
         .iter()
         .filter(|invocation| is_c_family_semantic_invocation(invocation))
         .flat_map(|invocation| invocation.source_files.iter())
-        .collect::<std::collections::BTreeSet<_>>()
+        .collect::<BTreeSet<_>>()
         .len()
+}
+
+fn filter_semantic_compilation_artifact<F>(
+    mut artifact: SemanticCompilationArtifact,
+    include_source: &F,
+) -> SemanticCompilationArtifact
+where
+    F: Fn(&Path) -> bool,
+{
+    artifact.invocations.retain_mut(|invocation| {
+        let filtered_source_files = invocation
+            .source_files
+            .iter()
+            .filter(|path| include_source(path))
+            .cloned()
+            .collect::<Vec<_>>();
+        if filtered_source_files.is_empty() {
+            return false;
+        }
+        if invocation.language == "swift" {
+            invocation.arguments = filter_swift_invocation_arguments(
+                &invocation.arguments,
+                &invocation.source_files,
+                &filtered_source_files,
+            );
+        }
+        invocation.source_files = filtered_source_files;
+        true
+    });
+    artifact
+}
+
+fn filter_swift_invocation_arguments(
+    arguments: &[String],
+    original_source_files: &[PathBuf],
+    filtered_source_files: &[PathBuf],
+) -> Vec<String> {
+    if filtered_source_files.len() == original_source_files.len() {
+        return arguments.to_vec();
+    }
+
+    let kept_paths = filtered_source_files
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let removed_source_arguments = original_source_files
+        .iter()
+        .filter(|path| !kept_paths.contains(*path))
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect::<BTreeSet<_>>();
+
+    arguments
+        .iter()
+        .filter(|argument| !removed_source_arguments.contains(argument.as_str()))
+        .cloned()
+        .collect()
 }

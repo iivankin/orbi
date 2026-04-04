@@ -130,6 +130,58 @@ fn lint_runs_compiler_backed_c_family_diagnostics_for_mixed_targets() {
 }
 
 #[test]
+fn lint_reuses_cached_semantic_artifact_between_runs() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = create_signing_workspace(temp.path());
+    let home = create_home(temp.path());
+    let mock_bin = temp.path().join("mock-bin");
+    let log_path = temp.path().join("commands.log");
+    let sdk_root = temp.path().join("sdk");
+    fs::create_dir_all(&mock_bin).unwrap();
+
+    create_build_xcrun_mock(&mock_bin, &sdk_root);
+    create_quality_swift_mock(&mock_bin);
+
+    let manifest_path = workspace.join("orbit.json");
+
+    let mut first = base_command(&workspace, &home, &mock_bin, &log_path);
+    first.args([
+        "--non-interactive",
+        "--manifest",
+        manifest_path.to_str().unwrap(),
+        "lint",
+    ]);
+    let first_output = run_and_capture(&mut first);
+    assert!(
+        first_output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first_output.stderr)
+    );
+
+    let first_log = read_log(&log_path);
+    assert!(first_log.contains("xcrun --find swiftc"));
+
+    clear_log(&log_path);
+
+    let mut second = base_command(&workspace, &home, &mock_bin, &log_path);
+    second.args([
+        "--non-interactive",
+        "--manifest",
+        manifest_path.to_str().unwrap(),
+        "lint",
+    ]);
+    let second_output = run_and_capture(&mut second);
+    assert!(
+        second_output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&second_output.stderr)
+    );
+
+    let second_log = read_log(&log_path);
+    assert!(!second_log.contains("xcrun --find swiftc"));
+}
+
+#[test]
 fn lint_reuses_cached_swift_package_outputs_between_runs() {
     let temp = tempfile::tempdir().unwrap();
     let workspace = create_swift_package_workspace(temp.path());

@@ -4,6 +4,13 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 
 use super::artifacts::remove_existing_path;
+use super::cache::{
+    cached_bundle_phase_can_be_reused, cached_code_phase_can_be_reused,
+    cached_embedded_dependencies_can_be_reused, clear_embedded_dependency_outputs,
+    compute_bundle_phase_fingerprint, compute_code_phase_fingerprint,
+    compute_embedded_dependency_fingerprint, print_target_build_cache_hit,
+    write_bundle_phase_cache, write_code_phase_cache, write_embedded_dependency_cache,
+};
 use super::info_plist::{needs_info_plist, write_info_plist};
 use super::resources::{ResourceWorkSummary, process_resources, should_process_resources};
 use super::{
@@ -11,7 +18,8 @@ use super::{
     product_layout,
 };
 use crate::apple::build::clang::{
-    ClangCompilePlan, ClangSourceLanguage, object_file_name, target_clang_invocation,
+    ClangCompilePlan, ClangCompileSummary, ClangSourceLanguage, cached_object_can_be_reused,
+    object_depfile_path, object_file_name, target_clang_invocation, write_object_cache,
 };
 use crate::apple::build::external::{
     ExternalLinkInputs, PackageBuildOutput, apply_external_link_inputs, compile_swift_package,
@@ -25,6 +33,7 @@ use crate::util::{
     collect_files_with_extensions, copy_dir_recursive, copy_file, ensure_dir, ensure_parent_dir,
     resolve_path, run_command,
 };
+use tempfile::tempdir;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum CompileOutputMode {
@@ -50,14 +59,6 @@ pub(super) fn compile_target(
     let target_dir = build_root.join(&target.name);
     let intermediates_dir = target_dir.join("intermediates");
     let product = product_layout(&target_dir, &intermediates_dir, target, toolchain);
-    ensure_dir(&intermediates_dir)?;
-    remove_existing_path(&product.product_path)?;
-    if target.kind.is_bundle() {
-        ensure_dir(&product.product_path)?;
-    } else {
-        ensure_parent_dir(&product.product_path)?;
-    }
-    ensure_parent_dir(&product.binary_path)?;
 
     let package_outputs = if target.swift_packages.is_empty() {
         Vec::new()
@@ -87,100 +88,183 @@ pub(super) fn compile_target(
     };
     let external_link_inputs =
         resolve_external_link_inputs(project, toolchain, &intermediates_dir, target)?;
-    let c_objects = run_compile_step(
-        output.mode,
-        output.log_prefix,
-        format!("Compiling C-family sources for target `{}`", target.name),
-        |objects: &Vec<PathBuf>| {
-            if objects.is_empty() {
-                format!(
-                    "No C-family sources were compiled for target `{}`.",
-                    target.name
-                )
-            } else {
-                format!(
-                    "Compiled {} C-family object file(s) for target `{}`.",
-                    objects.len(),
-                    target.name
-                )
-            }
-        },
-        || {
-            compile_c_family_sources(
-                project,
-                toolchain,
-                profile,
-                &intermediates_dir,
-                output.index_store_path,
-                &external_link_inputs,
-                target,
-            )
-        },
+    let code_fingerprint = compute_code_phase_fingerprint(
+        project,
+        toolchain,
+        profile,
+        target,
+        output.index_store_path,
+        &package_outputs,
+        &external_link_inputs,
     )?;
-    let swift_sources = resolve_target_sources(project, target, &["swift"])?;
+    let bundle_fingerprint =
+        compute_bundle_phase_fingerprint(project, toolchain, target, &external_link_inputs)?;
 
-    if !swift_sources.is_empty() {
-        run_compile_step(
-            output.mode,
-            output.log_prefix,
-            format!("Compiling Swift target `{}`", target.name),
-            |_| {
-                format!(
-                    "Compiled {} Swift source file(s) for target `{}`.",
-                    swift_sources.len(),
-                    target.name
-                )
-            },
-            || {
-                compile_swift_target(
-                    toolchain,
-                    profile,
-                    SwiftTargetCompilePlan {
-                        target_kind: target.kind,
-                        module_name: &target.name,
-                        product_path: &product.binary_path,
-                        module_output_path: product.module_output_path.as_deref(),
-                        swift_sources: &swift_sources,
-                        package_outputs: &package_outputs,
-                        external_link_inputs: &external_link_inputs,
-                        object_files: &c_objects,
-                        index_store_path: output.index_store_path,
-                    },
-                )
-            },
-        )?;
-    } else if !c_objects.is_empty() {
-        run_compile_step(
-            output.mode,
-            output.log_prefix,
-            format!("Linking native target `{}`", target.name),
-            |_| {
-                format!(
-                    "Linked {} object file(s) into target `{}`.",
-                    c_objects.len(),
-                    target.name
-                )
-            },
-            || {
-                link_native_target(
-                    toolchain,
-                    profile,
-                    target.kind,
-                    &external_link_inputs,
-                    &c_objects,
-                    &product.binary_path,
-                )
-            },
-        )?;
+    let code_cache_hit = cached_code_phase_can_be_reused(&target_dir, &product, &code_fingerprint)?;
+    let bundle_cache_hit = if target.kind.is_bundle() && code_cache_hit {
+        cached_bundle_phase_can_be_reused(
+            &target_dir,
+            target,
+            toolchain,
+            &product,
+            &external_link_inputs,
+            &bundle_fingerprint,
+        )?
     } else {
-        bail!(
-            "target `{}` did not resolve any compilable sources",
-            target.name
-        );
+        false
+    };
+
+    if code_cache_hit && (bundle_cache_hit || !target.kind.is_bundle()) {
+        if matches!(output.mode, CompileOutputMode::UserFacing) {
+            print_target_build_cache_hit(&target.name, output.log_prefix);
+        }
+        return Ok(BuiltTarget {
+            target_name: target.name.clone(),
+            target_kind: target.kind,
+            target_dir: target_dir.clone(),
+            bundle_path: product.product_path,
+            binary_path: product.binary_path,
+            module_output_path: product.module_output_path,
+            code_phase_fingerprint: code_fingerprint,
+            bundle_phase_fingerprint: bundle_fingerprint,
+        });
     }
 
-    if target.kind.is_bundle() {
-        relocate_bundle_debug_artifacts(&target_dir, &product.product_path, &product.binary_path)?;
+    if code_cache_hit {
+        rebuild_bundle_layout_preserving_code_outputs(&product)?;
+    } else {
+        ensure_dir(&intermediates_dir)?;
+        remove_existing_path(&product.product_path)?;
+        if target.kind.is_bundle() {
+            ensure_dir(&product.product_path)?;
+        } else {
+            ensure_parent_dir(&product.product_path)?;
+        }
+        ensure_parent_dir(&product.binary_path)?;
+
+        let c_family_summary = run_compile_step(
+            output.mode,
+            output.log_prefix,
+            format!("Compiling C-family sources for target `{}`", target.name),
+            |summary: &ClangCompileSummary| {
+                if summary.object_files.is_empty() {
+                    format!(
+                        "No C-family sources were compiled for target `{}`.",
+                        target.name
+                    )
+                } else if summary.reused_count == 0 {
+                    format!(
+                        "Compiled {} C-family object file(s) for target `{}`.",
+                        summary.compiled_count, target.name
+                    )
+                } else if summary.compiled_count == 0 {
+                    format!(
+                        "Reused {} cached C-family object file(s) for target `{}`.",
+                        summary.reused_count, target.name
+                    )
+                } else {
+                    format!(
+                        "Compiled {} and reused {} cached C-family object file(s) for target `{}`.",
+                        summary.compiled_count, summary.reused_count, target.name
+                    )
+                }
+            },
+            || {
+                compile_c_family_sources(
+                    project,
+                    toolchain,
+                    profile,
+                    &intermediates_dir,
+                    output.index_store_path,
+                    &external_link_inputs,
+                    target,
+                )
+            },
+        )?;
+        let c_objects = c_family_summary.object_files;
+        let swift_sources = resolve_target_sources(project, target, &["swift"])?;
+
+        if !swift_sources.is_empty() {
+            run_compile_step(
+                output.mode,
+                output.log_prefix,
+                format!("Compiling Swift target `{}`", target.name),
+                |_| {
+                    format!(
+                        "Compiled {} Swift source file(s) for target `{}`.",
+                        swift_sources.len(),
+                        target.name
+                    )
+                },
+                || {
+                    compile_swift_target(
+                        toolchain,
+                        profile,
+                        SwiftTargetCompilePlan {
+                            target_kind: target.kind,
+                            module_name: &target.name,
+                            product_path: &product.binary_path,
+                            module_output_path: product.module_output_path.as_deref(),
+                            swift_sources: &swift_sources,
+                            package_outputs: &package_outputs,
+                            external_link_inputs: &external_link_inputs,
+                            object_files: &c_objects,
+                            index_store_path: output.index_store_path,
+                        },
+                    )
+                },
+            )?;
+        } else if !c_objects.is_empty() {
+            run_compile_step(
+                output.mode,
+                output.log_prefix,
+                format!("Linking native target `{}`", target.name),
+                |_| {
+                    format!(
+                        "Linked {} object file(s) into target `{}`.",
+                        c_objects.len(),
+                        target.name
+                    )
+                },
+                || {
+                    link_native_target(
+                        toolchain,
+                        profile,
+                        target.kind,
+                        &external_link_inputs,
+                        &c_objects,
+                        &product.binary_path,
+                    )
+                },
+            )?;
+        } else {
+            bail!(
+                "target `{}` did not resolve any compilable sources",
+                target.name
+            );
+        }
+
+        if target.kind.is_bundle() {
+            relocate_bundle_debug_artifacts(
+                &target_dir,
+                &product.product_path,
+                &product.binary_path,
+            )?;
+        }
+        write_code_phase_cache(&target_dir, &code_fingerprint)?;
+    }
+
+    if !target.kind.is_bundle() {
+        return Ok(BuiltTarget {
+            target_name: target.name.clone(),
+            target_kind: target.kind,
+            target_dir: target_dir.clone(),
+            bundle_path: product.product_path,
+            binary_path: product.binary_path,
+            module_output_path: product.module_output_path,
+            code_phase_fingerprint: code_fingerprint,
+            bundle_phase_fingerprint: bundle_fingerprint,
+        });
     }
 
     if needs_info_plist(target.kind) {
@@ -205,7 +289,15 @@ pub(super) fn compile_target(
                         summary.describe()
                     )
                 },
-                || process_resources(project, toolchain, target, &product.product_path),
+                || {
+                    process_resources(
+                        project,
+                        toolchain,
+                        target,
+                        &product.product_path,
+                        &target_dir,
+                    )
+                },
             )?;
         }
         if !external_link_inputs.embedded_payloads.is_empty() {
@@ -231,14 +323,48 @@ pub(super) fn compile_target(
             )?;
         }
     }
+    write_bundle_phase_cache(&target_dir, &bundle_fingerprint)?;
 
     Ok(BuiltTarget {
         target_name: target.name.clone(),
         target_kind: target.kind,
+        target_dir,
         bundle_path: product.product_path,
         binary_path: product.binary_path,
         module_output_path: product.module_output_path,
+        code_phase_fingerprint: code_fingerprint,
+        bundle_phase_fingerprint: bundle_fingerprint,
     })
+}
+
+fn rebuild_bundle_layout_preserving_code_outputs(product: &super::ProductLayout) -> Result<()> {
+    let preserved_root = tempdir().context("failed to create bundle cache preservation tempdir")?;
+    let bundle_root = &product.product_path;
+    let mut preserved_paths = vec![product.binary_path.clone()];
+    if let Some(module_output_path) = &product.module_output_path
+        && module_output_path.starts_with(bundle_root)
+    {
+        preserved_paths.push(module_output_path.clone());
+    }
+
+    for path in &preserved_paths {
+        let relative = path
+            .strip_prefix(bundle_root)
+            .with_context(|| format!("failed to relativize preserved path {}", path.display()))?;
+        let destination = preserved_root.path().join(relative);
+        copy_file(path, &destination)?;
+    }
+
+    remove_existing_path(bundle_root)?;
+    ensure_dir(bundle_root)?;
+    for path in preserved_paths {
+        let relative = path
+            .strip_prefix(bundle_root)
+            .with_context(|| format!("failed to relativize preserved path {}", path.display()))?;
+        let source = preserved_root.path().join(relative);
+        copy_file(&source, &path)?;
+    }
+    Ok(())
 }
 
 fn run_compile_step<T, F, G>(
@@ -263,7 +389,7 @@ where
     }
 }
 
-fn prefixed_compile_message(prefix: Option<&str>, message: String) -> String {
+pub(super) fn prefixed_compile_message(prefix: Option<&str>, message: String) -> String {
     match prefix {
         Some(prefix) => format!("[{prefix}] {message}"),
         None => message,
@@ -276,7 +402,76 @@ pub(super) fn embed_dependencies(
     root_target: &TargetManifest,
     built_targets: &std::collections::HashMap<String, BuiltTarget>,
     built_root_target: &mut BuiltTarget,
+    bundle_content_fingerprints: &std::collections::HashMap<String, String>,
 ) -> Result<()> {
+    let planned_embeddings = planned_embedded_dependencies(
+        project,
+        platform,
+        root_target,
+        built_targets,
+        built_root_target,
+        bundle_content_fingerprints,
+    )?;
+    let outputs = planned_embeddings
+        .iter()
+        .map(|embedding| embedding.relative_output.clone())
+        .collect::<Vec<_>>();
+    let dependency_fingerprints = planned_embeddings
+        .iter()
+        .map(|embedding| embedding.dependency_fingerprint.clone())
+        .collect::<Vec<_>>();
+    let embedding_fingerprint = compute_embedded_dependency_fingerprint(
+        platform,
+        root_target,
+        built_root_target,
+        &outputs,
+        &dependency_fingerprints,
+    );
+    if cached_embedded_dependencies_can_be_reused(
+        &built_root_target.target_dir,
+        &built_root_target.bundle_path,
+        &outputs,
+        &embedding_fingerprint,
+    )? {
+        return Ok(());
+    }
+
+    clear_embedded_dependency_outputs(
+        &built_root_target.target_dir,
+        &built_root_target.bundle_path,
+        &outputs,
+    )?;
+    for embedding in planned_embeddings {
+        if embedding.source_path.is_dir() {
+            copy_dir_recursive(&embedding.source_path, &embedding.destination)?;
+        } else {
+            copy_file(&embedding.source_path, &embedding.destination)?;
+        }
+    }
+    write_embedded_dependency_cache(
+        &built_root_target.target_dir,
+        &embedding_fingerprint,
+        &outputs,
+    )?;
+    Ok(())
+}
+
+struct PlannedEmbeddedDependency {
+    source_path: PathBuf,
+    destination: PathBuf,
+    relative_output: PathBuf,
+    dependency_fingerprint: String,
+}
+
+fn planned_embedded_dependencies(
+    project: &ProjectContext,
+    platform: ApplePlatform,
+    root_target: &TargetManifest,
+    built_targets: &std::collections::HashMap<String, BuiltTarget>,
+    built_root_target: &BuiltTarget,
+    bundle_content_fingerprints: &std::collections::HashMap<String, String>,
+) -> Result<Vec<PlannedEmbeddedDependency>> {
+    let mut planned = Vec::new();
     for dependency_name in &root_target.dependencies {
         let dependency_target = project
             .resolved_manifest
@@ -295,13 +490,28 @@ pub(super) fn embed_dependencies(
                 .file_name()
                 .context("dependency bundle name missing")?,
         );
-        if built.bundle_path.is_dir() {
-            copy_dir_recursive(&built.bundle_path, &destination)?;
-        } else {
-            copy_file(&built.bundle_path, &destination)?;
-        }
+        let relative_output = destination
+            .strip_prefix(&built_root_target.bundle_path)
+            .with_context(|| {
+                format!(
+                    "failed to relativize embedded dependency output {}",
+                    destination.display()
+                )
+            })?
+            .to_path_buf();
+        planned.push(PlannedEmbeddedDependency {
+            source_path: built.bundle_path.clone(),
+            destination,
+            relative_output,
+            dependency_fingerprint: bundle_content_fingerprints
+                .get(dependency_name)
+                .cloned()
+                .with_context(|| {
+                    format!("missing bundle content fingerprint for dependency `{dependency_name}`")
+                })?,
+        });
     }
-    Ok(())
+    Ok(planned)
 }
 
 pub(super) fn relocate_bundle_debug_artifacts(
@@ -359,32 +569,40 @@ fn compile_c_family_sources(
     index_store_path: Option<&Path>,
     external_link_inputs: &ExternalLinkInputs,
     target: &TargetManifest,
-) -> Result<Vec<PathBuf>> {
-    let mut object_files = Vec::new();
+) -> Result<ClangCompileSummary> {
+    let mut summary = ClangCompileSummary::default();
     for extension in ["c", "m", "mm", "cpp", "cc", "cxx"] {
         for source in resolve_target_sources(project, target, &[extension])? {
             let language = ClangSourceLanguage::from_extension(extension)
                 .with_context(|| format!("unsupported C-family extension `{extension}`"))?;
             let object_name = object_file_name(&source)?;
             let object_path = intermediates_dir.join(object_name);
+            let depfile_path = object_depfile_path(&object_path);
             let invocation = target_clang_invocation(
                 toolchain,
                 profile,
                 ClangCompilePlan {
                     source_file: &source,
                     output_path: &object_path,
+                    depfile_path: Some(depfile_path.as_path()),
                     language,
                     external_link_inputs,
                     index_store_path,
                 },
             )?;
-            let mut command = invocation.command(toolchain);
-            run_command(&mut command)?;
-            object_files.push(invocation.output_path);
+            if cached_object_can_be_reused(toolchain, &invocation)? {
+                summary.reused_count += 1;
+            } else {
+                let mut command = invocation.command(toolchain);
+                run_command(&mut command)?;
+                write_object_cache(toolchain, &invocation)?;
+                summary.compiled_count += 1;
+            }
+            summary.object_files.push(invocation.output_path);
         }
     }
 
-    Ok(object_files)
+    Ok(summary)
 }
 
 fn compile_swift_target(

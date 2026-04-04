@@ -395,6 +395,31 @@ src_name="$(basename "$src")"
     );
 }
 
+pub fn create_codesign_mock(mock_bin: &Path) {
+    write_executable(
+        &mock_bin.join("codesign"),
+        r#"#!/bin/sh
+set -eu
+echo "codesign $@" >> "$MOCK_LOG"
+if [ "$#" -lt 1 ]; then
+  echo "codesign mock expects a bundle path" >&2
+  exit 1
+fi
+bundle=""
+for arg in "$@"; do
+  bundle="$arg"
+done
+if [ -d "$bundle/Contents" ]; then
+  signature_root="$bundle/Contents/_CodeSignature"
+else
+  signature_root="$bundle/_CodeSignature"
+fi
+mkdir -p "$signature_root"
+printf 'signed\n' > "$signature_root/CodeResources"
+"#,
+    );
+}
+
 pub fn create_submit_swinfo_mock(mock_bin: &Path) {
     write_executable(
         &mock_bin.join("swinfo"),
@@ -1001,9 +1026,45 @@ if [ "$#" -ge 3 ] && [ "$1" = "--sdk" ] && [ "$3" = "swiftc" ]; then
 fi
 if [ "$#" -ge 3 ] && [ "$1" = "--sdk" ] && {{ [ "$3" = "clang" ] || [ "$3" = "clang++" ]; }}; then
   out=""
+  depfile=""
+  source=""
   prev=""
   for arg in "$@"; do
     if [ "$prev" = "-o" ]; then
+      out="$arg"
+    fi
+    if [ "$prev" = "-MF" ]; then
+      depfile="$arg"
+    fi
+    if [ "$prev" = "-c" ]; then
+      source="$arg"
+    fi
+    prev="$arg"
+  done
+  if [ -n "$out" ]; then
+    mkdir -p "$(dirname "$out")"
+    : > "$out"
+  fi
+  if [ -n "$depfile" ] && [ -n "$out" ]; then
+    mkdir -p "$(dirname "$depfile")"
+    deps="$source"
+    if [ -n "$source" ] && [ -f "$source" ]; then
+      source_dir="$(dirname "$source")"
+      for header in "$source_dir"/*.h "$source_dir"/*.hh "$source_dir"/*.hpp "$source_dir"/*.hxx; do
+        if [ -f "$header" ]; then
+          deps="$deps $header"
+        fi
+      done
+    fi
+    printf '%s: %s\n' "$out" "$deps" > "$depfile"
+  fi
+  exit 0
+fi
+if [ "$#" -ge 1 ] && [ "$1" = "lipo" ]; then
+  out=""
+  prev=""
+  for arg in "$@"; do
+    if [ "$prev" = "-output" ]; then
       out="$arg"
     fi
     prev="$arg"

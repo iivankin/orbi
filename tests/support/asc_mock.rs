@@ -251,6 +251,56 @@ fn asc_response_body(
         .to_string());
     }
 
+    if first_line.starts_with("GET /v1/devices") {
+        let include_device = first_line
+            .split_whitespace()
+            .nth(1)
+            .is_none_or(|path| !path.contains("filter%5Budid%5D=") || path.contains("MAC-UDID"));
+        let data = if include_device {
+            vec![serde_json::json!({
+                "id": "DEVICE1",
+                "type": "devices",
+                "attributes": {
+                    "name": "Orbit Mock Mac",
+                    "platform": "MAC_OS",
+                    "udid": "MAC-UDID",
+                    "deviceClass": "MAC",
+                    "status": "ENABLED",
+                    "model": "MacBook Pro",
+                    "addedDate": "2026-04-05T00:00:00Z"
+                }
+            })]
+        } else {
+            Vec::new()
+        };
+        return Ok(serde_json::json!({ "data": data, "included": [] }).to_string());
+    }
+
+    if first_line.starts_with("POST /v1/devices") {
+        let body = request
+            .split("\r\n\r\n")
+            .nth(1)
+            .ok_or_else(|| "missing request body".to_owned())?;
+        let json: serde_json::Value =
+            serde_json::from_str(body).map_err(|error| error.to_string())?;
+        return Ok(serde_json::json!({
+            "data": {
+                "id": "DEVICE1",
+                "type": "devices",
+                "attributes": {
+                    "name": json["data"]["attributes"]["name"].as_str().unwrap_or("Orbit Mock Mac"),
+                    "platform": json["data"]["attributes"]["platform"].as_str().unwrap_or("MAC_OS"),
+                    "udid": json["data"]["attributes"]["udid"].as_str().unwrap_or("MAC-UDID"),
+                    "deviceClass": "MAC",
+                    "status": "ENABLED",
+                    "model": "MacBook Pro",
+                    "addedDate": "2026-04-05T00:00:00Z"
+                }
+            }
+        })
+        .to_string());
+    }
+
     if first_line.starts_with("GET /v1/profiles") {
         return Ok(serde_json::json!({ "data": [], "included": [] }).to_string());
     }

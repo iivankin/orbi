@@ -109,6 +109,88 @@ pub fn create_mixed_language_workspace(root: &Path) -> PathBuf {
     )
 }
 
+pub fn create_resource_workspace(root: &Path) -> PathBuf {
+    create_workspace(
+        root,
+        "resource-workspace",
+        &[
+            (
+                "Sources/App/App.swift",
+                "import SwiftUI\n@main struct ExampleApp: App { var body: some Scene { WindowGroup { Text(\"App\") } } }\n",
+            ),
+            ("Resources/config.json", "{\n  \"value\": 1\n}\n"),
+        ],
+        &serde_json::json!({
+            "$schema": "/tmp/.orbit/schemas/apple-app.v1.json",
+            "name": "ExampleApp",
+            "bundle_id": "dev.orbit.fixture.resources",
+            "version": "0.1.0",
+            "build": 1,
+            "platforms": {
+                "ios": "18.0"
+            },
+            "sources": ["Sources/App"],
+            "resources": ["Resources"]
+        }),
+    )
+}
+
+pub fn create_asset_resource_workspace(root: &Path) -> PathBuf {
+    create_workspace(
+        root,
+        "asset-resource-workspace",
+        &[
+            (
+                "Sources/App/App.swift",
+                "import SwiftUI\n@main struct ExampleApp: App { var body: some Scene { WindowGroup { Text(\"App\") } } }\n",
+            ),
+            (
+                "Resources/Assets.xcassets/Contents.json",
+                "{\n  \"info\": {\n    \"author\": \"xcode\",\n    \"version\": 1\n  }\n}\n",
+            ),
+            ("Resources/config.json", "{\n  \"value\": 1\n}\n"),
+        ],
+        &serde_json::json!({
+            "$schema": "/tmp/.orbit/schemas/apple-app.v1.json",
+            "name": "ExampleApp",
+            "bundle_id": "dev.orbit.fixture.asset-resources",
+            "version": "0.1.0",
+            "build": 1,
+            "platforms": {
+                "ios": "18.0"
+            },
+            "sources": ["Sources/App"],
+            "resources": ["Resources"]
+        }),
+    )
+}
+
+pub fn create_macos_universal_workspace(root: &Path) -> PathBuf {
+    create_workspace(
+        root,
+        "macos-universal-workspace",
+        &[(
+            "Sources/App/App.swift",
+            "import SwiftUI\n@main struct ExampleMacApp: App { var body: some Scene { WindowGroup { Text(\"Mac\") } } }\n",
+        )],
+        &serde_json::json!({
+            "$schema": "/tmp/.orbit/schemas/apple-app.v1.json",
+            "name": "ExampleMacApp",
+            "bundle_id": "dev.orbit.fixture.macos-universal",
+            "version": "0.1.0",
+            "build": 1,
+            "team_id": "TEAM123456",
+            "platforms": {
+                "macos": "15.0"
+            },
+            "macos": {
+                "universal_binary": true
+            },
+            "sources": ["Sources/App"]
+        }),
+    )
+}
+
 pub fn create_swift_package_workspace(root: &Path) -> PathBuf {
     create_workspace(
         root,

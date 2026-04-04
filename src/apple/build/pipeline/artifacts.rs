@@ -7,6 +7,9 @@ use anyhow::{Context, Result, bail};
 use tempfile::tempdir;
 
 use super::BuiltTarget;
+use super::cache::{
+    cached_exported_artifact_path, compute_artifact_fingerprint, write_artifact_cache,
+};
 use crate::context::ProjectContext;
 use crate::manifest::{ApplePlatform, DistributionKind, ProfileManifest, TargetKind};
 use crate::util::{copy_dir_recursive, copy_file, ensure_dir, resolve_path, run_command};
@@ -17,6 +20,7 @@ pub(super) fn export_artifact(
     built_target: &BuiltTarget,
     explicit_output: Option<&Path>,
     profile: &ProfileManifest,
+    signed_bundle_fingerprint: Option<&str>,
 ) -> Result<std::path::PathBuf> {
     if !matches!(
         built_target.target_kind,
@@ -37,6 +41,12 @@ pub(super) fn export_artifact(
             Ok(built_target.bundle_path.clone())
         }
         DistributionKind::AdHoc | DistributionKind::AppStore => {
+            let signed_bundle_fingerprint = signed_bundle_fingerprint.with_context(|| {
+                format!(
+                    "missing signing fingerprint for exported artifact `{}`",
+                    built_target.target_name
+                )
+            })?;
             let artifact_name = explicit_output.map(Path::to_path_buf).unwrap_or_else(|| {
                 project.project_paths.artifacts_dir.join(format!(
                     "{}-{:?}.ipa",
@@ -44,6 +54,20 @@ pub(super) fn export_artifact(
                 ))
             });
             let artifact_path = resolve_path(&project.root, &artifact_name);
+            let artifact_fingerprint =
+                compute_artifact_fingerprint(profile.distribution, signed_bundle_fingerprint, None);
+            if let Some(cached_artifact) = cached_exported_artifact_path(
+                &built_target.target_dir,
+                &artifact_path,
+                &artifact_fingerprint,
+            )? {
+                return reuse_cached_artifact(
+                    &built_target.target_dir,
+                    &artifact_fingerprint,
+                    &cached_artifact,
+                    &artifact_path,
+                );
+            }
             if artifact_path.exists() {
                 remove_existing_path(&artifact_path)?;
             }
@@ -70,11 +94,21 @@ pub(super) fn export_artifact(
                     .context("artifact path contains invalid UTF-8")?,
             ]);
             run_command(&mut command)?;
+            write_artifact_cache(
+                &built_target.target_dir,
+                &artifact_fingerprint,
+                &artifact_path,
+            )?;
             Ok(artifact_path)
         }
-        DistributionKind::DeveloperId | DistributionKind::MacAppStore => {
-            export_macos_artifact(project, platform, built_target, explicit_output, profile)
-        }
+        DistributionKind::DeveloperId | DistributionKind::MacAppStore => export_macos_artifact(
+            project,
+            platform,
+            built_target,
+            explicit_output,
+            profile,
+            signed_bundle_fingerprint,
+        ),
     }
 }
 
@@ -96,6 +130,7 @@ fn export_macos_artifact(
     built_target: &BuiltTarget,
     explicit_output: Option<&Path>,
     profile: &ProfileManifest,
+    signed_bundle_fingerprint: Option<&str>,
 ) -> Result<std::path::PathBuf> {
     if platform != ApplePlatform::Macos {
         bail!("macOS artifact export was requested for non-macOS platform `{platform}`");
@@ -107,9 +142,31 @@ fn export_macos_artifact(
         ))
     });
     let artifact_path = resolve_path(&project.root, &artifact_name);
-    remove_existing_path(&artifact_path)?;
-
+    let signed_bundle_fingerprint = signed_bundle_fingerprint.with_context(|| {
+        format!(
+            "missing signing fingerprint for exported artifact `{}`",
+            built_target.target_name
+        )
+    })?;
     let signing = crate::apple::signing::prepare_package_signing(project, profile)?;
+    let artifact_fingerprint = compute_artifact_fingerprint(
+        profile.distribution,
+        signed_bundle_fingerprint,
+        Some(&signing),
+    );
+    if let Some(cached_artifact) = cached_exported_artifact_path(
+        &built_target.target_dir,
+        &artifact_path,
+        &artifact_fingerprint,
+    )? {
+        return reuse_cached_artifact(
+            &built_target.target_dir,
+            &artifact_fingerprint,
+            &cached_artifact,
+            &artifact_path,
+        );
+    }
+    remove_existing_path(&artifact_path)?;
     let mut command = Command::new("productbuild");
     command.arg("--component");
     command.arg(&built_target.bundle_path);
@@ -119,6 +176,11 @@ fn export_macos_artifact(
     command.arg("--timestamp");
     command.arg(&artifact_path);
     run_command(&mut command)?;
+    write_artifact_cache(
+        &built_target.target_dir,
+        &artifact_fingerprint,
+        &artifact_path,
+    )?;
     Ok(artifact_path)
 }
 
@@ -150,4 +212,18 @@ fn copy_product(source: &Path, destination: &Path) -> Result<()> {
     } else {
         copy_file(source, destination)
     }
+}
+
+fn reuse_cached_artifact(
+    target_dir: &Path,
+    fingerprint: &str,
+    cached_artifact: &Path,
+    desired_artifact_path: &Path,
+) -> Result<std::path::PathBuf> {
+    if cached_artifact != desired_artifact_path {
+        remove_existing_path(desired_artifact_path)?;
+        copy_product(cached_artifact, desired_artifact_path)?;
+    }
+    write_artifact_cache(target_dir, fingerprint, desired_artifact_path)?;
+    Ok(desired_artifact_path.to_path_buf())
 }

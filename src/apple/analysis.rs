@@ -1,8 +1,9 @@
 use std::collections::BTreeSet;
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::apple::build::clang::{
@@ -13,22 +14,27 @@ use crate::apple::build::external::{
 };
 use crate::apple::build::swiftc::{SwiftTargetCompilePlan, target_swiftc_invocation};
 use crate::apple::build::toolchain::{DestinationKind, Toolchain};
+use crate::apple::lockfile::lockfile_path;
 use crate::apple::xcode::resolve_requested_xcode_for_app;
 use crate::context::{AppContext, ProjectContext, ProjectPaths};
 use crate::manifest::{
     ApplePlatform, BuildConfiguration, DistributionKind, ManifestSchema, ProfileManifest,
-    ResolvedManifest, TargetKind, TargetManifest, detect_schema,
+    ResolvedManifest, SwiftPackageSource, TargetKind, TargetManifest, detect_schema,
 };
-use crate::util::{collect_files_with_extensions, ensure_dir, resolve_path};
+use crate::util::{
+    collect_files_with_extensions, ensure_dir, read_json_file_if_exists, resolve_path,
+    write_json_file,
+};
 
 pub(crate) const C_FAMILY_SOURCE_EXTENSIONS: &[&str] = &["c", "m", "mm", "cpp", "cc", "cxx"];
 pub(crate) const C_FAMILY_HEADER_EXTENSIONS: &[&str] = &["h", "hh", "hpp", "hxx"];
+const SEMANTIC_ARTIFACT_CACHE_VERSION: u32 = 1;
 
 pub(crate) struct AnalysisProject {
     pub(crate) project: ProjectContext,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub(crate) struct SemanticCompilationArtifact {
     pub platforms: Vec<String>,
     pub index_store_path: PathBuf,
@@ -36,7 +42,7 @@ pub(crate) struct SemanticCompilationArtifact {
     pub invocations: Vec<SemanticCompilerInvocation>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub(crate) struct SemanticCompilerInvocation {
     pub platform: String,
     pub destination: String,
@@ -50,6 +56,36 @@ pub(crate) struct SemanticCompilerInvocation {
     pub arguments: Vec<String>,
     pub source_files: Vec<PathBuf>,
     pub output_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct SemanticCompilationArtifactCacheInfo {
+    version: u32,
+    fingerprint: String,
+    artifact: SemanticCompilationArtifact,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SemanticArtifactCacheStatus {
+    Hit,
+    Miss,
+}
+
+impl SemanticArtifactCacheStatus {
+    pub(crate) fn message(self, explicit_platform: Option<ApplePlatform>) -> String {
+        let scope = explicit_platform
+            .map(|platform| platform.to_string())
+            .unwrap_or_else(|| "all platforms".to_owned());
+        match self {
+            Self::Hit => format!("Semantic analysis cache hit for {scope}."),
+            Self::Miss => format!("Semantic analysis cache miss for {scope}; rebuilding."),
+        }
+    }
+}
+
+pub(crate) struct CachedSemanticCompilationArtifact {
+    pub(crate) artifact: SemanticCompilationArtifact,
+    pub(crate) cache_status: SemanticArtifactCacheStatus,
 }
 
 pub(crate) fn load_persistent_analysis_project(
@@ -216,6 +252,38 @@ where
     })
 }
 
+pub(crate) fn build_cached_semantic_compilation_artifact_with_status(
+    project: &ProjectContext,
+    explicit_platform: Option<ApplePlatform>,
+) -> Result<CachedSemanticCompilationArtifact> {
+    let cache_path = semantic_artifact_cache_path(project, explicit_platform);
+    let fingerprint = semantic_artifact_fingerprint(project, explicit_platform)?;
+    if let Some(cache_info) =
+        read_json_file_if_exists::<SemanticCompilationArtifactCacheInfo>(&cache_path)?
+        && cache_info.version == SEMANTIC_ARTIFACT_CACHE_VERSION
+        && cache_info.fingerprint == fingerprint
+    {
+        return Ok(CachedSemanticCompilationArtifact {
+            artifact: cache_info.artifact,
+            cache_status: SemanticArtifactCacheStatus::Hit,
+        });
+    }
+
+    let artifact = build_semantic_compilation_artifact(project, explicit_platform, &|_| true)?;
+    write_json_file(
+        &cache_path,
+        &SemanticCompilationArtifactCacheInfo {
+            version: SEMANTIC_ARTIFACT_CACHE_VERSION,
+            fingerprint,
+            artifact: artifact.clone(),
+        },
+    )?;
+    Ok(CachedSemanticCompilationArtifact {
+        artifact,
+        cache_status: SemanticArtifactCacheStatus::Miss,
+    })
+}
+
 pub(crate) fn collect_project_swift_files<F>(
     project: &ProjectContext,
     include_source: &F,
@@ -263,6 +331,59 @@ fn semantic_compilation_platforms(
         .keys()
         .copied()
         .collect())
+}
+
+fn semantic_artifact_cache_path(
+    project: &ProjectContext,
+    explicit_platform: Option<ApplePlatform>,
+) -> PathBuf {
+    project.project_paths.orbit_dir.join(format!(
+        "semantic-artifact-{}.json",
+        semantic_platform_cache_key(explicit_platform)
+    ))
+}
+
+fn semantic_platform_cache_key(explicit_platform: Option<ApplePlatform>) -> String {
+    explicit_platform
+        .map(|platform| platform.to_string())
+        .unwrap_or_else(|| "all".to_owned())
+}
+
+fn semantic_artifact_fingerprint(
+    project: &ProjectContext,
+    explicit_platform: Option<ApplePlatform>,
+) -> Result<String> {
+    let mut hasher = Sha256::new();
+    hasher.update(SEMANTIC_ARTIFACT_CACHE_VERSION.to_le_bytes());
+    hasher.update(semantic_platform_cache_key(explicit_platform).as_bytes());
+    hash_optional_file(&mut hasher, &project.manifest_path)?;
+    hash_optional_file(&mut hasher, &lockfile_path(&project.manifest_path)?)?;
+
+    let mut platforms = semantic_compilation_platforms(project, explicit_platform)?;
+    platforms.sort();
+    for platform in &platforms {
+        let platform_manifest = project
+            .resolved_manifest
+            .platforms
+            .get(platform)
+            .context("platform configuration missing from manifest")?;
+        let toolchain = Toolchain::resolve(
+            *platform,
+            &platform_manifest.deployment_target,
+            analysis_destination_for_platform(*platform),
+            project.selected_xcode.as_ref(),
+        )?;
+        hash_toolchain(&mut hasher, &toolchain);
+    }
+
+    for root in source_roots(project) {
+        hash_path_tree(&mut hasher, &root)?;
+    }
+    for root in semantic_dependency_roots(project) {
+        hash_path_tree(&mut hasher, &root)?;
+    }
+
+    Ok(hex_digest(hasher.finalize()))
 }
 
 fn semantic_target_compiler_invocations<F>(
@@ -421,6 +542,7 @@ where
                 ClangCompilePlan {
                     source_file: &source,
                     output_path: &output_path,
+                    depfile_path: None,
                     language,
                     external_link_inputs: plan.external_link_inputs,
                     index_store_path: Some(plan.index_store_path),
@@ -555,4 +677,106 @@ fn source_roots(project: &ProjectContext) -> Vec<PathBuf> {
         }
     }
     roots.into_iter().collect()
+}
+
+fn semantic_dependency_roots(project: &ProjectContext) -> Vec<PathBuf> {
+    let mut roots = BTreeSet::new();
+    for target in &project.resolved_manifest.targets {
+        for dependency in &target.swift_packages {
+            if let SwiftPackageSource::Path { path } = &dependency.source {
+                roots.insert(resolve_path(&project.root, path));
+            }
+        }
+        for dependency in &target.xcframeworks {
+            roots.insert(resolve_path(&project.root, &dependency.path));
+        }
+    }
+    roots.into_iter().collect()
+}
+
+fn hash_toolchain(hasher: &mut Sha256, toolchain: &Toolchain) {
+    hasher.update(toolchain.platform.to_string().as_bytes());
+    hasher.update(toolchain.destination.as_str().as_bytes());
+    hasher.update(toolchain.sdk_name.as_bytes());
+    hasher.update(toolchain.sdk_path.to_string_lossy().as_bytes());
+    hasher.update(toolchain.deployment_target.as_bytes());
+    hasher.update(toolchain.architecture.as_bytes());
+    hasher.update(toolchain.target_triple.as_bytes());
+    if let Some(selected_xcode) = &toolchain.selected_xcode {
+        hasher.update(selected_xcode.version.as_bytes());
+        hasher.update(selected_xcode.build_version.as_bytes());
+        hasher.update(selected_xcode.developer_dir.to_string_lossy().as_bytes());
+    } else {
+        hasher.update(b"system-xcode");
+    }
+}
+
+fn hash_optional_file(hasher: &mut Sha256, path: &Path) -> Result<()> {
+    hasher.update(path.to_string_lossy().as_bytes());
+    if !path.exists() {
+        hasher.update(b"missing");
+        return Ok(());
+    }
+    let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    hasher.update(bytes.len().to_le_bytes());
+    hasher.update(bytes);
+    Ok(())
+}
+
+fn hash_path_tree(hasher: &mut Sha256, path: &Path) -> Result<()> {
+    hasher.update(path.to_string_lossy().as_bytes());
+    if !path.exists() {
+        hasher.update(b"missing");
+        return Ok(());
+    }
+
+    let mut paths = Vec::new();
+    for entry in walkdir::WalkDir::new(path).follow_links(false) {
+        let entry = entry.with_context(|| format!("failed to walk {}", path.display()))?;
+        paths.push(entry.into_path());
+    }
+    paths.sort();
+
+    for entry_path in paths {
+        hash_path_entry(hasher, &entry_path)?;
+    }
+    Ok(())
+}
+
+fn hash_path_entry(hasher: &mut Sha256, path: &Path) -> Result<()> {
+    hasher.update(path.to_string_lossy().as_bytes());
+    let metadata =
+        fs::symlink_metadata(path).with_context(|| format!("failed to stat {}", path.display()))?;
+    if metadata.file_type().is_symlink() {
+        hasher.update(b"symlink");
+        hasher.update(
+            fs::read_link(path)
+                .with_context(|| format!("failed to read symlink {}", path.display()))?
+                .to_string_lossy()
+                .as_bytes(),
+        );
+        return Ok(());
+    }
+    if metadata.is_dir() {
+        hasher.update(b"dir");
+        return Ok(());
+    }
+
+    hasher.update(b"file");
+    hasher.update(metadata.len().to_le_bytes());
+    let modified = metadata
+        .modified()
+        .with_context(|| format!("failed to read mtime for {}", path.display()))?
+        .duration_since(std::time::UNIX_EPOCH)
+        .with_context(|| format!("mtime for {} was before UNIX_EPOCH", path.display()))?;
+    hasher.update(modified.as_nanos().to_le_bytes());
+    Ok(())
+}
+
+fn hex_digest(digest: impl AsRef<[u8]>) -> String {
+    digest
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }

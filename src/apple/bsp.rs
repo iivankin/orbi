@@ -9,8 +9,9 @@ use serde_json::{Value, json};
 
 use crate::apple::analysis::{
     AnalysisProject, C_FAMILY_HEADER_EXTENSIONS, C_FAMILY_SOURCE_EXTENSIONS,
-    SemanticCompilationArtifact, SemanticCompilerInvocation, build_semantic_compilation_artifact,
-    collect_target_header_files, load_persistent_analysis_project,
+    SemanticArtifactCacheStatus, SemanticCompilationArtifact, SemanticCompilerInvocation,
+    build_cached_semantic_compilation_artifact_with_status, collect_target_header_files,
+    load_persistent_analysis_project,
 };
 use crate::apple::build;
 use crate::apple::build::external::target_dependency_watch_roots;
@@ -83,6 +84,7 @@ struct BspServer {
     app: AppContext,
     requested_manifest: Option<PathBuf>,
     snapshot: Option<BspSnapshot>,
+    last_snapshot_cache_status: Option<SemanticArtifactCacheStatus>,
     shutdown_requested: bool,
     next_task_id: u64,
 }
@@ -102,6 +104,7 @@ impl BspServer {
             app: app.clone(),
             requested_manifest: requested_manifest.map(PathBuf::from),
             snapshot: None,
+            last_snapshot_cache_status: None,
             shutdown_requested: false,
             next_task_id: 1,
         }
@@ -392,6 +395,7 @@ impl BspServer {
     ) -> Result<Option<Value>> {
         let origin_id = origin_id_from_params(params);
         let task = self.new_task_id();
+        let snapshot_was_missing = self.snapshot.is_none();
         let grouped_targets = {
             let target_ids = target_ids_from_params(params)?;
             let snapshot = self.snapshot()?;
@@ -437,6 +441,20 @@ impl BspServer {
 
         let response = match self.prepare_targets(params) {
             Ok(value) => {
+                if snapshot_was_missing && let Some(cache_status) = self.last_snapshot_cache_status
+                {
+                    self.emit_log_message(
+                        writer,
+                        4,
+                        cache_status.message(None),
+                        Some(&task),
+                        origin_id.as_deref(),
+                        Some(structured_log_payload(
+                            "report",
+                            Some("Semantic analysis cache"),
+                        )),
+                    )?;
+                }
                 if let Some(notification) = self.take_pending_did_change_notification() {
                     write_jsonrpc_message(writer, &notification)?;
                 }
@@ -523,6 +541,19 @@ impl BspServer {
         )?;
         let response = match self.reload_workspace() {
             Ok(value) => {
+                if let Some(cache_status) = self.last_snapshot_cache_status {
+                    self.emit_log_message(
+                        writer,
+                        4,
+                        cache_status.message(None),
+                        Some(&task),
+                        None,
+                        Some(structured_log_payload(
+                            "report",
+                            Some("Semantic analysis cache"),
+                        )),
+                    )?;
+                }
                 self.emit_task_progress(
                     writer,
                     TaskProgress {
@@ -574,8 +605,12 @@ impl BspServer {
     fn reload_snapshot(&mut self, changed_files: &[PathBuf]) -> Result<()> {
         let analysis_project =
             load_persistent_analysis_project(&self.app, self.requested_manifest.as_deref())?;
-        let artifact =
-            build_semantic_compilation_artifact(&analysis_project.project, None, &|_| true)?;
+        let cached_artifact = build_cached_semantic_compilation_artifact_with_status(
+            &analysis_project.project,
+            None,
+        )?;
+        self.last_snapshot_cache_status = Some(cached_artifact.cache_status);
+        let artifact = cached_artifact.artifact;
         let new_snapshot = BspSnapshot::from_analysis(analysis_project, artifact)?;
         let did_change_notification = if self.snapshot.is_some() {
             build_target_did_change_notification_with_changed_files(
