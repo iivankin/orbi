@@ -156,14 +156,18 @@ fn extract_last_tag_text<'a>(text: &'a str, tag: &str) -> Option<&'a str> {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
     use std::io::Read;
-    use std::process::{self, Command};
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    use anyhow::Result;
 
     use super::{find_member, open_member_stream};
+
+    #[cfg(target_os = "macos")]
+    use anyhow::Result;
+    #[cfg(target_os = "macos")]
+    use std::fs;
+    #[cfg(target_os = "macos")]
+    use std::process::{self, Command};
+    #[cfg(target_os = "macos")]
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn finds_content_member_in_xar_toc() {
@@ -187,6 +191,7 @@ mod tests {
         assert_eq!(member.length, 15);
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn streams_named_member_from_real_xar() -> Result<()> {
         let temp_root = test_temp_dir("orbit-xar-stream");
@@ -215,6 +220,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(target_os = "macos")]
     fn run_test_command(program: &str, args: &[&str]) -> Result<()> {
         let status = Command::new(program).args(args).status()?;
         if !status.success() {
@@ -223,6 +229,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(target_os = "macos")]
     fn test_temp_dir(prefix: &str) -> std::path::PathBuf {
         let millis = SystemTime::now()
             .duration_since(UNIX_EPOCH)

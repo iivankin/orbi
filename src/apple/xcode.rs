@@ -1611,6 +1611,7 @@ mod tests {
         assert_eq!(resolved, Some(install_root));
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn extracts_full_xcode_bundle_from_streamed_fake_xip() -> Result<()> {
         let temp = tempfile::tempdir().unwrap();
@@ -1693,6 +1694,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(target_os = "macos")]
     fn run_test_command(program: &str, args: &[&str]) -> Result<()> {
         let status = Command::new(program).args(args).status()?;
         if !status.success() {
