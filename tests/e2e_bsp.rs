@@ -7,9 +7,11 @@ use std::process::Stdio;
 use reqwest::Url;
 use serde_json::{Value, json};
 
+#[cfg(target_os = "macos")]
+use support::create_mixed_language_workspace;
 use support::{
-    base_command, create_build_xcrun_mock, create_home, create_mixed_language_workspace,
-    create_signing_workspace, create_xcframework_workspace, orbit_bin, read_log, run_and_capture,
+    base_command, create_build_xcrun_mock, create_home, create_signing_workspace,
+    create_xcframework_workspace, orbit_bin, read_log, run_and_capture,
 };
 
 #[test]
@@ -696,6 +698,7 @@ fn read_jsonrpc_message<R: BufRead>(reader: &mut R) -> Value {
     serde_json::from_slice(&body).unwrap()
 }
 
+#[cfg(target_os = "macos")]
 fn read_jsonrpc_messages_until_response<R: BufRead>(
     reader: &mut R,
     response_id: i64,
