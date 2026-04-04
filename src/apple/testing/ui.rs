@@ -578,6 +578,19 @@ struct PreparedUiSession {
     selected_xcode: Option<crate::apple::xcode::SelectedXcode>,
 }
 
+#[derive(Debug, Clone, Default)]
+struct UiTracePlan {
+    prelaunch_commands: Vec<UiCommand>,
+    launch: Option<UiLaunchApp>,
+}
+
+#[derive(Debug, Default)]
+struct UiTracePlanState {
+    prelaunch_commands: Vec<UiCommand>,
+    launch: Option<UiLaunchApp>,
+    seen_runtime_command: bool,
+}
+
 pub fn run_ui_tests(project: &ProjectContext, args: &TestArgs) -> Result<()> {
     let ui_tests = project
         .resolved_manifest
@@ -590,13 +603,21 @@ pub fn run_ui_tests(project: &ProjectContext, args: &TestArgs) -> Result<()> {
         args.platform.map(runtime::apple_platform_from_cli),
         "Select a platform to test",
     )?;
-    if platform == ApplePlatform::Macos {
-        let status = backend::macos_doctor(project)?;
-        ensure_macos_ui_test_requirements(&status)?;
-    }
     let flow_paths = collect_ui_flow_paths(project, ui_tests)?;
     if flow_paths.is_empty() {
         bail!("`tests.ui.sources` did not contain any `.yml` or `.yaml` files");
+    }
+    let trace_plan = match (platform, args.trace) {
+        (ApplePlatform::Ios, kind) => {
+            crate::profile::ensure_simulator_profiling_supported(kind)?;
+            None
+        }
+        (ApplePlatform::Macos, Some(_)) => Some(plan_macos_ui_trace(flow_paths.as_slice())?),
+        _ => None,
+    };
+    if platform == ApplePlatform::Macos {
+        let status = backend::macos_doctor(project)?;
+        ensure_macos_ui_test_requirements(&status)?;
     }
 
     let run_id = format!("{}-{}", unix_timestamp_secs(), Uuid::new_v4());
@@ -611,70 +632,101 @@ pub fn run_ui_tests(project: &ProjectContext, args: &TestArgs) -> Result<()> {
 
     let started_at_unix = unix_timestamp_secs();
     let started = Instant::now();
-    let prepared = prepare_ui_session(project, platform, false)?;
-
-    let report_path = run_root.join("report.json");
-    let mut flow_reports = Vec::new();
-    let _app_logs = start_ui_app_logs(&prepared);
-    let mut runner = UiFlowRunner::new(
-        prepared.backend,
-        artifacts_dir.clone(),
-        prepared.build_outcome.receipt.bundle_id.clone(),
-    );
-    let mut has_failures = false;
-    for flow_path in &flow_paths {
-        if !runner.execute_flow(flow_path, None, &mut flow_reports)? {
-            has_failures = true;
-        }
-    }
-    if let Err(error) = runner
-        .backend
-        .stop_app(prepared.build_outcome.receipt.bundle_id.as_str())
-    {
-        eprintln!(
-            "warning: failed to stop `{}` after UI tests on {}: {error:#}",
-            prepared.build_outcome.receipt.bundle_id,
-            runner.backend.target_name()
+    let mut prepared = prepare_ui_session(project, platform, false)?;
+    let traced_bundle_id = prepared.build_outcome.receipt.bundle_id.clone();
+    let trace_recording = start_ui_trace_recording(
+        project,
+        args,
+        traced_bundle_id.as_str(),
+        &mut prepared,
+        trace_plan.as_ref(),
+    )?;
+    let run_result = (|| {
+        let report_path = run_root.join("report.json");
+        let mut flow_reports = Vec::new();
+        let _app_logs = start_ui_app_logs(&prepared);
+        let mut runner = UiFlowRunner::new(
+            prepared.backend,
+            artifacts_dir.clone(),
+            prepared.build_outcome.receipt.bundle_id.clone(),
+            trace_plan
+                .as_ref()
+                .is_some_and(|plan| plan.launch.is_some()),
         );
+        let mut has_failures = false;
+        for flow_path in &flow_paths {
+            if !runner.execute_flow(flow_path, None, &mut flow_reports)? {
+                has_failures = true;
+            }
+        }
+        if let Err(error) = runner
+            .backend
+            .stop_app(prepared.build_outcome.receipt.bundle_id.as_str())
+        {
+            eprintln!(
+                "warning: failed to stop `{}` after UI tests on {}: {error:#}",
+                prepared.build_outcome.receipt.bundle_id,
+                runner.backend.target_name()
+            );
+        }
+
+        let finished_at_unix = unix_timestamp_secs();
+        let report = UiTestRunReport {
+            id: run_id,
+            platform,
+            backend: runner.backend.backend_name().to_owned(),
+            bundle_id: prepared.build_outcome.receipt.bundle_id.clone(),
+            bundle_path: prepared.build_outcome.receipt.bundle_path.clone(),
+            receipt_path: prepared.build_outcome.receipt_path.clone(),
+            target_name: runner.backend.target_name().to_owned(),
+            target_id: runner.backend.target_id().to_owned(),
+            report_path: report_path.clone(),
+            artifacts_dir: artifacts_dir.clone(),
+            started_at_unix,
+            finished_at_unix,
+            duration_ms: started.elapsed().as_millis() as u64,
+            status: if has_failures {
+                RunStatus::Failed
+            } else {
+                RunStatus::Passed
+            },
+            flows: flow_reports,
+        };
+        write_json_file(&report_path, &report)?;
+        println!("report: {}", report_path.display());
+
+        if has_failures {
+            bail!("UI tests failed; see {}", report_path.display());
+        }
+
+        print_success(format!(
+            "UI tests passed for `{}` on {} using {} flow(s) in {}.",
+            prepared.build_outcome.receipt.target,
+            runner.backend.target_name(),
+            flow_paths.len(),
+            format_elapsed(started.elapsed())
+        ));
+        Ok(())
+    })();
+    let trace_result = trace_recording
+        .map(|(kind, recording)| crate::profile::finish_started_trace(kind, recording))
+        .transpose();
+    match (run_result, trace_result) {
+        (Err(run_error), Err(trace_error)) => {
+            Err(run_error.context(format!("also failed to finalize UI trace: {trace_error:#}")))
+        }
+        (Err(run_error), Ok(Some(path))) => {
+            println!("trace: {}", path.display());
+            Err(run_error)
+        }
+        (Err(run_error), Ok(None)) => Err(run_error),
+        (Ok(()), Err(trace_error)) => Err(trace_error),
+        (Ok(()), Ok(Some(path))) => {
+            println!("trace: {}", path.display());
+            Ok(())
+        }
+        (Ok(()), Ok(None)) => Ok(()),
     }
-
-    let finished_at_unix = unix_timestamp_secs();
-    let report = UiTestRunReport {
-        id: run_id,
-        platform,
-        backend: runner.backend.backend_name().to_owned(),
-        bundle_id: prepared.build_outcome.receipt.bundle_id.clone(),
-        bundle_path: prepared.build_outcome.receipt.bundle_path.clone(),
-        receipt_path: prepared.build_outcome.receipt_path.clone(),
-        target_name: runner.backend.target_name().to_owned(),
-        target_id: runner.backend.target_id().to_owned(),
-        report_path: report_path.clone(),
-        artifacts_dir: artifacts_dir.clone(),
-        started_at_unix,
-        finished_at_unix,
-        duration_ms: started.elapsed().as_millis() as u64,
-        status: if has_failures {
-            RunStatus::Failed
-        } else {
-            RunStatus::Passed
-        },
-        flows: flow_reports,
-    };
-    write_json_file(&report_path, &report)?;
-    println!("report: {}", report_path.display());
-
-    if has_failures {
-        bail!("UI tests failed; see {}", report_path.display());
-    }
-
-    print_success(format!(
-        "UI tests passed for `{}` on {} using {} flow(s) in {}.",
-        prepared.build_outcome.receipt.target,
-        runner.backend.target_name(),
-        flow_paths.len(),
-        format_elapsed(started.elapsed())
-    ));
-    Ok(())
 }
 
 fn start_ui_app_logs(prepared: &PreparedUiSession) -> Option<SimulatorAppLogStream> {
@@ -814,10 +866,16 @@ struct UiFlowRunner {
     stack: Vec<PathBuf>,
     clipboard: Option<String>,
     manual_recording: Option<PathBuf>,
+    skip_initial_launch: bool,
 }
 
 impl UiFlowRunner {
-    fn new(backend: Box<dyn UiBackend>, artifacts_dir: PathBuf, bundle_id: String) -> Self {
+    fn new(
+        backend: Box<dyn UiBackend>,
+        artifacts_dir: PathBuf,
+        bundle_id: String,
+        skip_initial_launch: bool,
+    ) -> Self {
         Self {
             backend,
             artifacts_dir,
@@ -825,6 +883,7 @@ impl UiFlowRunner {
             stack: Vec::new(),
             clipboard: None,
             manual_recording: None,
+            skip_initial_launch,
         }
     }
 
@@ -1092,6 +1151,10 @@ impl UiFlowRunner {
     fn run_leaf_command(&mut self, command: &UiCommand) -> Result<Option<PathBuf>> {
         match command {
             UiCommand::LaunchApp(command) => {
+                if self.skip_initial_launch {
+                    self.skip_initial_launch = false;
+                    return Ok(None);
+                }
                 let app_id = self.resolve_bundle_id(command.app_id.as_deref());
                 if command.clear_keychain {
                     self.backend.clear_keychain()?;
@@ -1682,7 +1745,7 @@ fn prepare_ui_session(
     }
 }
 
-pub(super) fn idb_requirement_message() -> &'static str {
+pub(crate) fn idb_requirement_message() -> &'static str {
     "Orbit UI tooling for iOS simulators requires `idb` and `idb_companion` on PATH.\n\nInstall them with:\n  brew tap facebook/fb\n  brew install idb-companion\n  python3 -m pip install fb-idb\n\nIf `idb` was installed with pip, ensure your user Python bin directory is on PATH, for example `~/Library/Python/3.12/bin`."
 }
 
@@ -1707,6 +1770,294 @@ fn ensure_idb_tooling_available() -> Result<()> {
             .collect::<Vec<_>>()
             .join(", ")
     )
+}
+
+fn start_ui_trace_recording(
+    project: &ProjectContext,
+    args: &TestArgs,
+    bundle_id: &str,
+    prepared: &mut PreparedUiSession,
+    trace_plan: Option<&UiTracePlan>,
+) -> Result<Option<(crate::cli::ProfileKind, crate::profile::TraceRecording)>> {
+    let Some(kind) = args.trace else {
+        return Ok(None);
+    };
+
+    match prepared.build_outcome.receipt.platform {
+        ApplePlatform::Macos => {
+            let plan = trace_plan.context("macOS UI trace plan was not prepared")?;
+            let target = project.resolved_manifest.resolve_target(None)?;
+            crate::apple::signing::prepare_macos_bundle_for_debug_tracing(
+                project,
+                target,
+                &prepared.build_outcome.receipt.bundle_path,
+            )?;
+            apply_macos_ui_trace_prelaunch(prepared.backend.as_ref(), bundle_id, plan)?;
+            let launch_command = prepare_macos_ui_trace_launch_command(
+                project,
+                &prepared.build_outcome.receipt,
+                plan.launch.as_ref(),
+            )?;
+            let trace = crate::profile::start_optional_launched_command_trace(
+                &project.root,
+                project.selected_xcode.as_ref(),
+                project.app.interactive,
+                Some(kind),
+                &launch_command,
+                None,
+            )?
+            .expect("trace kind should produce a launched trace");
+            let traced_executable = launch_command
+                .first()
+                .context("macOS UI trace launch command is empty")?;
+            let recorder_pid = crate::profile::trace_recording_process_id(&trace.1);
+            prepared.backend.pin_running_target_by_executable(
+                Path::new(traced_executable),
+                Some(recorder_pid),
+            )?;
+            Ok(Some(trace))
+        }
+        ApplePlatform::Ios => {
+            crate::profile::ensure_simulator_profiling_supported(Some(kind))?;
+            Ok(None)
+        }
+        _ => bail!(
+            "UI test profiling currently supports only `--platform macos`; {} UI automation is not traceable yet",
+            prepared.build_outcome.receipt.platform
+        ),
+    }
+}
+
+fn plan_macos_ui_trace(flow_paths: &[PathBuf]) -> Result<UiTracePlan> {
+    let mut state = UiTracePlanState::default();
+    let mut stack = Vec::new();
+    for flow_path in flow_paths {
+        analyze_macos_ui_trace_flow(flow_path, &mut state, &mut stack)?;
+    }
+    Ok(UiTracePlan {
+        prelaunch_commands: state.prelaunch_commands,
+        launch: state.launch,
+    })
+}
+
+fn analyze_macos_ui_trace_flow(
+    flow_path: &Path,
+    state: &mut UiTracePlanState,
+    stack: &mut Vec<PathBuf>,
+) -> Result<()> {
+    let canonical = canonical_or_absolute(flow_path)?;
+    if stack.contains(&canonical) {
+        let chain = stack
+            .iter()
+            .map(|entry| entry.display().to_string())
+            .chain([canonical.display().to_string()])
+            .collect::<Vec<_>>()
+            .join(" -> ");
+        bail!("detected recursive `runFlow` chain while planning UI trace: {chain}");
+    }
+
+    let flow = parse_ui_flow(&canonical)?;
+    stack.push(canonical);
+    let result = analyze_macos_ui_trace_commands(
+        flow.path.as_path(),
+        flow.commands.as_slice(),
+        state,
+        stack,
+    );
+    stack.pop();
+    result
+}
+
+fn analyze_macos_ui_trace_commands(
+    flow_path: &Path,
+    commands: &[UiCommand],
+    state: &mut UiTracePlanState,
+    stack: &mut Vec<PathBuf>,
+) -> Result<()> {
+    for command in commands {
+        match command {
+            UiCommand::LaunchApp(launch) => {
+                if state.launch.is_some() {
+                    bail!(
+                        "UI test profiling currently supports only one `launchApp` across the traced suite; found another in `{}`",
+                        flow_path.display()
+                    );
+                }
+                if state.seen_runtime_command {
+                    bail!(
+                        "UI test profiling requires `launchApp` to happen before runtime interaction commands; move the launch earlier in `{}`",
+                        flow_path.display()
+                    );
+                }
+                state.launch = Some(launch.clone());
+                state.seen_runtime_command = true;
+            }
+            UiCommand::StopApp(_) | UiCommand::KillApp(_) => {
+                bail!(
+                    "UI test profiling does not support `{}` because Orbit records one launched app process for the whole run",
+                    command.summary()
+                );
+            }
+            UiCommand::ClearState(_) | UiCommand::ClearKeychain | UiCommand::SetPermissions(_) => {
+                if state.seen_runtime_command {
+                    bail!(
+                        "UI test profiling supports `{}` only before the traced app launches; move it into the prelaunch prefix in `{}`",
+                        command.summary(),
+                        flow_path.display()
+                    );
+                }
+                state.prelaunch_commands.push(command.clone());
+            }
+            UiCommand::RunFlow(relative_path) => {
+                let nested_path = resolve_relative_flow(flow_path, relative_path);
+                analyze_macos_ui_trace_flow(&nested_path, state, stack)?;
+            }
+            UiCommand::Repeat { times, commands } => {
+                for _ in 0..*times {
+                    analyze_macos_ui_trace_commands(flow_path, commands, state, stack)?;
+                }
+            }
+            UiCommand::Retry { commands, .. } => {
+                if commands_use_trace_sensitive_process_control(flow_path, commands, stack)? {
+                    bail!(
+                        "UI test profiling does not support app lifecycle or prelaunch commands inside `retry` blocks in `{}`",
+                        flow_path.display()
+                    );
+                }
+                analyze_macos_ui_trace_commands(flow_path, commands, state, stack)?;
+            }
+            _ => state.seen_runtime_command = true,
+        }
+    }
+    Ok(())
+}
+
+fn commands_use_trace_sensitive_process_control(
+    flow_path: &Path,
+    commands: &[UiCommand],
+    stack: &mut Vec<PathBuf>,
+) -> Result<bool> {
+    for command in commands {
+        match command {
+            UiCommand::LaunchApp(_)
+            | UiCommand::StopApp(_)
+            | UiCommand::KillApp(_)
+            | UiCommand::ClearState(_)
+            | UiCommand::ClearKeychain
+            | UiCommand::SetPermissions(_) => return Ok(true),
+            UiCommand::RunFlow(relative_path) => {
+                let nested_path = resolve_relative_flow(flow_path, relative_path);
+                let canonical = canonical_or_absolute(&nested_path)?;
+                if stack.contains(&canonical) {
+                    continue;
+                }
+                let nested_flow = parse_ui_flow(&canonical)?;
+                stack.push(canonical);
+                let result = commands_use_trace_sensitive_process_control(
+                    nested_flow.path.as_path(),
+                    nested_flow.commands.as_slice(),
+                    stack,
+                );
+                stack.pop();
+                if result? {
+                    return Ok(true);
+                }
+            }
+            UiCommand::Repeat { commands, .. } | UiCommand::Retry { commands, .. } => {
+                if commands_use_trace_sensitive_process_control(flow_path, commands, stack)? {
+                    return Ok(true);
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(false)
+}
+
+fn apply_macos_ui_trace_prelaunch(
+    backend: &dyn UiBackend,
+    bundle_id: &str,
+    trace_plan: &UiTracePlan,
+) -> Result<()> {
+    for command in &trace_plan.prelaunch_commands {
+        match command {
+            UiCommand::ClearState(app_id) => {
+                backend.clear_app_state(resolve_trace_bundle_id(
+                    bundle_id,
+                    app_id.as_deref(),
+                    command.summary().as_str(),
+                )?)?;
+            }
+            UiCommand::ClearKeychain => backend.clear_keychain()?,
+            UiCommand::SetPermissions(config) => {
+                backend.set_permissions(
+                    resolve_trace_bundle_id(
+                        bundle_id,
+                        config.app_id.as_deref(),
+                        command.summary().as_str(),
+                    )?,
+                    config,
+                )?;
+            }
+            _ => unreachable!("trace plan only stores prelaunch-safe commands"),
+        }
+    }
+
+    let Some(launch) = trace_plan.launch.as_ref() else {
+        return Ok(());
+    };
+    let launch_bundle_id =
+        resolve_trace_bundle_id(bundle_id, launch.app_id.as_deref(), "launchApp")?;
+    if launch.clear_keychain {
+        backend.clear_keychain()?;
+    }
+    if launch.clear_state {
+        backend.clear_app_state(launch_bundle_id)?;
+    }
+    if let Some(permissions) = launch.permissions.as_ref() {
+        backend.set_permissions(
+            resolve_trace_bundle_id(
+                launch_bundle_id,
+                permissions.app_id.as_deref(),
+                "launchApp.permissions",
+            )?,
+            permissions,
+        )?;
+    }
+    Ok(())
+}
+
+fn resolve_trace_bundle_id<'a>(
+    bundle_id: &'a str,
+    requested: Option<&'a str>,
+    source: &str,
+) -> Result<&'a str> {
+    if let Some(requested) = requested
+        && requested != bundle_id
+    {
+        bail!(
+            "{source} targets `{requested}`, but traced UI runs currently support only Orbit's built app `{bundle_id}`"
+        );
+    }
+    Ok(requested.unwrap_or(bundle_id))
+}
+
+fn prepare_macos_ui_trace_launch_command(
+    project: &ProjectContext,
+    receipt: &crate::apple::build::receipt::BuildReceipt,
+    launch: Option<&UiLaunchApp>,
+) -> Result<Vec<String>> {
+    let launch_executable =
+        crate::apple::build::pipeline::prepare_macos_trace_launch_executable(project, receipt)?;
+    let launch_executable = launch_executable.to_owned();
+    let mut command = vec![launch_executable];
+    if let Some(launch) = launch {
+        for (key, value) in &launch.arguments {
+            command.push(format!("-{key}"));
+            command.push(value.clone());
+        }
+    }
+    Ok(command)
 }
 
 fn path_contains_executable(name: &str) -> bool {
@@ -2213,12 +2564,195 @@ fn json_number(value: &JsonValue) -> Option<f64> {
 
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Mutex};
 
+    use anyhow::Result;
+    use serde_json::json;
+    use tempfile::tempdir;
+
+    use super::backend::UiBackend;
     use super::{
-        UiCommand, UiSelector, find_element_by_selector, find_visible_element_by_selector,
-        find_visible_scroll_container, infer_screen_frame,
+        UiCommand, UiCrashDeleteRequest, UiCrashQuery, UiFlowRunner, UiHardwareButton,
+        UiKeyModifier, UiKeyPress, UiPermissionConfig, UiSelector, UiSwipeDirection, UiTravel,
+        find_element_by_selector, find_visible_element_by_selector, find_visible_scroll_container,
+        infer_screen_frame, plan_macos_ui_trace,
     };
+
+    type LaunchRecords = Arc<Mutex<Vec<Vec<(String, String)>>>>;
+
+    #[derive(Default)]
+    struct TestUiBackend {
+        launches: LaunchRecords,
+    }
+
+    impl UiBackend for TestUiBackend {
+        fn backend_name(&self) -> &'static str {
+            "test"
+        }
+
+        fn target_name(&self) -> &str {
+            "test-target"
+        }
+
+        fn target_id(&self) -> &str {
+            "test-target"
+        }
+
+        fn describe_all(&self) -> Result<serde_json::Value> {
+            Ok(json!([]))
+        }
+
+        fn describe_point(&self, _x: f64, _y: f64) -> Result<serde_json::Value> {
+            Ok(json!({}))
+        }
+
+        fn launch_app(
+            &self,
+            _bundle_id: &str,
+            _stop_app: bool,
+            arguments: &[(String, String)],
+        ) -> Result<()> {
+            self.launches.lock().unwrap().push(arguments.to_vec());
+            Ok(())
+        }
+
+        fn stop_app(&self, _bundle_id: &str) -> Result<()> {
+            Ok(())
+        }
+
+        fn clear_app_state(&self, _bundle_id: &str) -> Result<()> {
+            Ok(())
+        }
+
+        fn focus(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn tap_point(&self, _x: f64, _y: f64, _duration_ms: Option<u32>) -> Result<()> {
+            Ok(())
+        }
+
+        fn swipe_points(
+            &self,
+            _start: (f64, f64),
+            _end: (f64, f64),
+            _duration_ms: Option<u32>,
+            _delta: Option<u32>,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        fn input_text(&self, _text: &str) -> Result<()> {
+            Ok(())
+        }
+
+        fn press_button(&self, _button: UiHardwareButton, _duration_ms: Option<u32>) -> Result<()> {
+            Ok(())
+        }
+
+        fn press_key(&self, _key: &UiKeyPress) -> Result<()> {
+            Ok(())
+        }
+
+        fn press_key_code(
+            &self,
+            _keycode: u32,
+            _duration_ms: Option<u32>,
+            _modifiers: &[UiKeyModifier],
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        fn press_key_sequence(&self, _keycodes: &[u32]) -> Result<()> {
+            Ok(())
+        }
+
+        fn take_screenshot(&self, path: &Path) -> Result<()> {
+            fs::write(path, b"png")?;
+            Ok(())
+        }
+
+        fn open_link(&self, _url: &str) -> Result<()> {
+            Ok(())
+        }
+
+        fn clear_keychain(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn set_location(&self, _latitude: f64, _longitude: f64) -> Result<()> {
+            Ok(())
+        }
+
+        fn set_permissions(&self, _bundle_id: &str, _config: &UiPermissionConfig) -> Result<()> {
+            Ok(())
+        }
+
+        fn travel(&self, _command: &UiTravel) -> Result<()> {
+            Ok(())
+        }
+
+        fn add_media(&self, _paths: &[PathBuf]) -> Result<()> {
+            Ok(())
+        }
+
+        fn install_dylib(&self, _path: &Path) -> Result<()> {
+            Ok(())
+        }
+
+        fn run_instruments(&self, _template: &str, _arguments: &[String]) -> Result<()> {
+            Ok(())
+        }
+
+        fn update_contacts(&self, _path: &Path) -> Result<()> {
+            Ok(())
+        }
+
+        fn list_crash_logs(&self, _query: &UiCrashQuery) -> Result<()> {
+            Ok(())
+        }
+
+        fn show_crash_log(&self, _name: &str) -> Result<()> {
+            Ok(())
+        }
+
+        fn delete_crash_logs(&self, _request: &UiCrashDeleteRequest) -> Result<()> {
+            Ok(())
+        }
+
+        fn stream_logs(&self, _arguments: &[String]) -> Result<()> {
+            Ok(())
+        }
+
+        fn scroll_in_direction(&self, _direction: UiSwipeDirection) -> Result<()> {
+            Ok(())
+        }
+
+        fn scroll_at_point(&self, _direction: UiSwipeDirection, _point: (f64, f64)) -> Result<()> {
+            Ok(())
+        }
+
+        fn hide_keyboard(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn start_video_recording(&mut self, path: &Path) -> Result<()> {
+            fs::write(path, b"video")?;
+            Ok(())
+        }
+
+        fn stop_video_recording(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    fn write_flow(root: &Path, name: &str, contents: &str) -> PathBuf {
+        let path = root.join(name);
+        fs::write(&path, contents).unwrap();
+        path
+    }
 
     #[test]
     fn finds_best_matching_element_by_accessibility_text() {
@@ -2329,5 +2863,67 @@ mod tests {
         assert_eq!(frame.y, 20.0);
         assert_eq!(frame.width, 260.0);
         assert_eq!(frame.height, 180.0);
+    }
+
+    #[test]
+    fn macos_trace_plan_allows_single_launch_with_prelaunch_commands() {
+        let temp = tempdir().unwrap();
+        let flow = write_flow(
+            temp.path(),
+            "flow.yaml",
+            "---\n- clearState\n- launchApp\n- assertVisible: Ready\n",
+        );
+
+        let plan = plan_macos_ui_trace(&[flow]).unwrap();
+        assert_eq!(plan.prelaunch_commands.len(), 1);
+        assert!(matches!(
+            plan.prelaunch_commands.first(),
+            Some(UiCommand::ClearState(None))
+        ));
+        assert!(plan.launch.is_some());
+    }
+
+    #[test]
+    fn macos_trace_plan_rejects_multiple_launches() {
+        let temp = tempdir().unwrap();
+        let first = write_flow(temp.path(), "first.yaml", "---\n- launchApp\n");
+        let second = write_flow(temp.path(), "second.yaml", "---\n- launchApp\n");
+
+        let error = plan_macos_ui_trace(&[first, second]).unwrap_err();
+        assert!(error.to_string().contains("only one `launchApp`"));
+    }
+
+    #[test]
+    fn ui_runner_skips_only_the_first_launch_when_trace_prelaunched_the_app() {
+        let temp = tempdir().unwrap();
+        let launches = Arc::new(Mutex::new(Vec::new()));
+        let backend = TestUiBackend {
+            launches: launches.clone(),
+        };
+        let mut runner = UiFlowRunner::new(
+            Box::new(backend),
+            temp.path().join("artifacts"),
+            "dev.orbit.fixture".to_owned(),
+            true,
+        );
+
+        runner
+            .run_leaf_command(&UiCommand::LaunchApp(super::UiLaunchApp::default()))
+            .unwrap();
+        assert!(launches.lock().unwrap().is_empty());
+
+        runner
+            .run_leaf_command(&UiCommand::LaunchApp(super::UiLaunchApp {
+                arguments: vec![("seedUser".to_owned(), "qa@example.com".to_owned())],
+                ..super::UiLaunchApp::default()
+            }))
+            .unwrap();
+
+        let recorded = launches.lock().unwrap();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(
+            recorded[0],
+            vec![("seedUser".to_owned(), "qa@example.com".to_owned())]
+        );
     }
 }

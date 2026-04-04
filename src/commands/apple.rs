@@ -10,6 +10,9 @@ use crate::context::AppContext;
 pub fn execute(app: &AppContext, cli: &Cli) -> Result<()> {
     match &cli.command {
         Command::Init(_) => unreachable!("`init` is handled before Apple dispatch"),
+        Command::InspectTrace(_) => {
+            unreachable!("`inspect-trace` is handled before Apple dispatch")
+        }
         Command::Lint(args) => apple::quality::lint_project(app, args, cli.manifest.as_deref()),
         Command::Format(args) => apple::quality::format_project(app, args, cli.manifest.as_deref()),
         Command::Test(args) => {

@@ -526,6 +526,432 @@ if [ "$#" -ge 3 ] && [ "$1" = "--sdk" ] && [ "$3" = "--show-sdk-build-version" ]
   printf '%s\n' "TESTSDK1"
   exit 0
 fi
+if [ "$#" -ge 2 ] && [ "$1" = "xctrace" ] && [ "$2" = "record" ]; then
+  shift 2
+  output=""
+  template=""
+  attach=""
+  launch=0
+  time_limit=""
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --output)
+        output="$2"
+        shift 2
+        ;;
+      --template)
+        template="$2"
+        shift 2
+        ;;
+      --attach)
+        attach="$2"
+        shift 2
+        ;;
+      --time-limit)
+        time_limit="$2"
+        shift 2
+        ;;
+      --device|--env)
+        shift 2
+        ;;
+      --no-prompt)
+        shift
+        ;;
+      --launch)
+        launch=1
+        shift
+        if [ "$#" -gt 0 ] && [ "$1" = "--" ]; then
+          shift
+        fi
+        break
+        ;;
+      *)
+        shift
+        ;;
+    esac
+  done
+  if [ -z "$output" ] || [ -z "$template" ]; then
+    echo "xctrace record mock requires --output and --template" >&2
+    exit 1
+  fi
+  if [ -z "$attach" ] && [ "$launch" -eq 0 ]; then
+    echo "xctrace record mock requires a target mode" >&2
+    exit 1
+  fi
+  mkdir -p "$output"
+  printf '%s\n' "$template" > "$output/template.txt"
+  if [ -n "$time_limit" ]; then
+    exit 0
+  fi
+  if [ "$launch" -eq 1 ] && [ "$#" -gt 0 ]; then
+    if command -v "$1" >/dev/null 2>&1; then
+      "$@"
+      exit $?
+    fi
+    if [ -x "$1" ]; then
+      "$@"
+      exit $?
+    fi
+  fi
+  trap 'exit 0' INT TERM
+  while :; do
+    sleep 1
+  done
+  exit 0
+fi
+if [ "$#" -ge 2 ] && [ "$1" = "xctrace" ] && [ "$2" = "export" ]; then
+  if [ -n "${{MOCK_XCTRACE_EXPORT_FAIL_COUNT_FILE:-}}" ] && [ -f "$MOCK_XCTRACE_EXPORT_FAIL_COUNT_FILE" ]; then
+    remaining="$(cat "$MOCK_XCTRACE_EXPORT_FAIL_COUNT_FILE" 2>/dev/null || printf '0')"
+    case "$remaining" in
+      ''|*[!0-9]*)
+        remaining=0
+        ;;
+    esac
+    if [ "$remaining" -gt 0 ]; then
+      printf '%s\n' "$((remaining - 1))" > "$MOCK_XCTRACE_EXPORT_FAIL_COUNT_FILE"
+      echo "Export failed: Document Missing Template Error" >&2
+      exit 10
+    fi
+  fi
+  if [ "${{MOCK_XCTRACE_EXPORT_FAIL:-0}}" = "1" ]; then
+    echo "Export failed: Document Missing Template Error" >&2
+    exit 10
+  fi
+  mode=""
+  output=""
+  input=""
+  xpath=""
+  prev=""
+  for arg in "$@"; do
+    if [ "$prev" = "--output" ]; then
+      output="$arg"
+    fi
+    if [ "$prev" = "--input" ]; then
+      input="$arg"
+    fi
+    if [ "$arg" = "--toc" ]; then
+      mode="toc"
+    fi
+    if [ "$prev" = "--xpath" ]; then
+      mode="xpath"
+      xpath="$arg"
+    fi
+    if [ "$arg" = "--har" ]; then
+      mode="har"
+    fi
+    prev="$arg"
+  done
+  if [ "$mode" = "toc" ]; then
+    case "$input" in
+      *allocations.trace*)
+      if [ -n "$output" ]; then
+        mkdir -p "$(dirname "$output")"
+        cat > "$output" <<'XML'
+<?xml version="1.0"?>
+<trace-toc>
+  <run number="1">
+    <info>
+      <target>
+        <device platform="macOS" model="MacBook Pro" name="Example Mac" os-version="26.4 (25E246)" uuid="DEVICE-UUID"/>
+        <process type="attached" return-exit-status="0" name="Orbit" pid="123" termination-reason="exit(0)"/>
+      </target>
+      <summary>
+        <duration>5.0</duration>
+        <template-name>Allocations</template-name>
+      </summary>
+    </info>
+    <processes>
+      <process name="Orbit" pid="123" path="/Applications/Orbit.app/Contents/MacOS/Orbit"/>
+    </processes>
+    <tracks>
+      <track name="Allocations">
+        <details>
+          <detail name="Statistics" kind="table"/>
+          <detail name="Allocations List" kind="table"/>
+        </details>
+      </track>
+      <track name="VM Tracker">
+        <details>
+          <detail name="Regions Map" kind="table"/>
+        </details>
+      </track>
+    </tracks>
+  </run>
+</trace-toc>
+XML
+      else
+        cat <<'XML'
+<?xml version="1.0"?>
+<trace-toc>
+  <run number="1">
+    <info>
+      <target>
+        <device platform="macOS" model="MacBook Pro" name="Example Mac" os-version="26.4 (25E246)" uuid="DEVICE-UUID"/>
+        <process type="attached" return-exit-status="0" name="Orbit" pid="123" termination-reason="exit(0)"/>
+      </target>
+      <summary>
+        <duration>5.0</duration>
+        <template-name>Allocations</template-name>
+      </summary>
+    </info>
+    <processes>
+      <process name="Orbit" pid="123" path="/Applications/Orbit.app/Contents/MacOS/Orbit"/>
+    </processes>
+    <tracks>
+      <track name="Allocations">
+        <details>
+          <detail name="Statistics" kind="table"/>
+          <detail name="Allocations List" kind="table"/>
+        </details>
+      </track>
+      <track name="VM Tracker">
+        <details>
+          <detail name="Regions Map" kind="table"/>
+        </details>
+      </track>
+    </tracks>
+  </run>
+</trace-toc>
+XML
+      fi
+      exit 0
+      ;;
+    esac
+    if [ -n "$output" ]; then
+      mkdir -p "$(dirname "$output")"
+      cat > "$output" <<'XML'
+<?xml version="1.0"?>
+<trace-toc>
+  <run number="1">
+    <info>
+      <target>
+        <device platform="macOS" model="MacBook Pro" name="Example Mac" os-version="26.4 (25E246)" uuid="DEVICE-UUID"/>
+        <process type="launched" return-exit-status="0" name="Orbit" pid="123" termination-reason="exit(0)"/>
+      </target>
+      <summary>
+        <start-date>2026-04-03T04:18:08.145+03:00</start-date>
+        <end-date>2026-04-03T04:18:10.083+03:00</end-date>
+        <duration>1.938214</duration>
+        <end-reason>Time limit reached</end-reason>
+        <instruments-version>16.0 (17E192)</instruments-version>
+        <template-name>Time Profiler</template-name>
+        <recording-mode>Deferred</recording-mode>
+        <time-limit>1 second</time-limit>
+      </summary>
+    </info>
+    <processes>
+      <process name="Orbit" pid="123" path="/Applications/Orbit.app/Contents/MacOS/Orbit"/>
+      <process name="xctrace" pid="456" path="/Applications/Xcode.app/Contents/Developer/usr/bin/xctrace"/>
+    </processes>
+    <data>
+      <table schema="tick" frequency="10"/>
+      <table schema="time-profile" target-pid="ALL"/>
+      <table schema="time-profile" target-pid="123"/>
+    </data>
+    <tracks/>
+  </run>
+</trace-toc>
+XML
+    else
+      cat <<'XML'
+<?xml version="1.0"?>
+<trace-toc>
+  <run number="1">
+    <info>
+      <target>
+        <device platform="macOS" model="MacBook Pro" name="Example Mac" os-version="26.4 (25E246)" uuid="DEVICE-UUID"/>
+        <process type="launched" return-exit-status="0" name="Orbit" pid="123" termination-reason="exit(0)"/>
+      </target>
+      <summary>
+        <start-date>2026-04-03T04:18:08.145+03:00</start-date>
+        <end-date>2026-04-03T04:18:10.083+03:00</end-date>
+        <duration>1.938214</duration>
+        <end-reason>Time limit reached</end-reason>
+        <instruments-version>16.0 (17E192)</instruments-version>
+        <template-name>Time Profiler</template-name>
+        <recording-mode>Deferred</recording-mode>
+        <time-limit>1 second</time-limit>
+      </summary>
+    </info>
+    <processes>
+      <process name="Orbit" pid="123" path="/Applications/Orbit.app/Contents/MacOS/Orbit"/>
+      <process name="xctrace" pid="456" path="/Applications/Xcode.app/Contents/Developer/usr/bin/xctrace"/>
+    </processes>
+    <data>
+      <table schema="tick" frequency="10"/>
+      <table schema="time-profile" target-pid="ALL"/>
+      <table schema="time-profile" target-pid="123"/>
+    </data>
+    <tracks/>
+  </run>
+</trace-toc>
+XML
+    fi
+    exit 0
+  fi
+  if [ "$mode" = "xpath" ]; then
+    case "$input" in
+      *allocations.trace*)
+      if [ "$xpath" = '/trace-toc/run/tracks/track[@name="Allocations"]/details/detail[@name="Statistics"]' ]; then
+        cat <<'XML'
+<?xml version="1.0"?>
+<trace-query-result>
+  <node xpath='//trace-toc[1]/run[1]/tracks[1]/track[1]/details[1]/detail[1]'>
+    <row category="All Heap &amp; Anonymous VM" persistent-bytes="33782272" count-persistent="1161" total-bytes="34183680" transient-bytes="401408" count-events="1183" count-transient="6" count-total="1167"/>
+    <row category="All Heap Allocations" persistent-bytes="33782272" count-persistent="1161" total-bytes="33790464" transient-bytes="8192" count-events="1175" count-transient="2" count-total="1163"/>
+    <row category="All Anonymous VM" persistent-bytes="0" count-persistent="0" total-bytes="393216" transient-bytes="393216" count-events="8" count-transient="4" count-total="4"/>
+    <row category="Malloc 256.0 KiB" persistent-bytes="33554432" count-persistent="128" total-bytes="33554432" transient-bytes="0" count-events="128" count-transient="0" count-total="128"/>
+    <row category="Malloc 48 Bytes" persistent-bytes="8208" count-persistent="171" total-bytes="8208" transient-bytes="0" count-events="171" count-transient="0" count-total="171"/>
+    <row category="VM: Anonymous VM" persistent-bytes="0" count-persistent="0" total-bytes="393216" transient-bytes="393216" count-events="8" count-transient="4" count-total="4"/>
+  </node>
+</trace-query-result>
+XML
+        exit 0
+      fi
+      if [ "$xpath" = '/trace-toc/run/tracks/track[@name="Allocations"]/details/detail[@name="Allocations List"]' ]; then
+        cat <<'XML'
+<?xml version="1.0"?>
+<trace-query-result>
+  <node xpath='//trace-toc[1]/run[1]/tracks[1]/track[1]/details[1]/detail[2]'>
+    <row address="0x10133c000" category="Malloc 256.0 KiB" live="true" responsible-caller="allocateChunk()" responsible-library="Orbit" size="262144"/>
+    <row address="0x10137c000" category="Malloc 256.0 KiB" live="true" responsible-caller="allocateChunk()" responsible-library="Orbit" size="262144"/>
+    <row address="0x10139c000" category="Malloc 48 Bytes" live="true" responsible-caller="bootstrap()" responsible-library="Orbit" size="48"/>
+    <row address="0x10139c100" category="VM: Anonymous VM" live="false" responsible-caller="&lt;Call stack limit reached&gt;" responsible-library="" size="393216"/>
+  </node>
+</trace-query-result>
+XML
+        exit 0
+      fi
+      ;;
+    esac
+    if [ -n "$output" ]; then
+      mkdir -p "$(dirname "$output")"
+      cat > "$output" <<'XML'
+<?xml version="1.0"?>
+<trace-query-result>
+  <node xpath='//trace-toc[1]/run[1]/data[1]/table[2]'>
+    <schema name="time-profile">
+      <col><mnemonic>time</mnemonic></col>
+      <col><mnemonic>thread</mnemonic></col>
+      <col><mnemonic>process</mnemonic></col>
+      <col><mnemonic>core</mnemonic></col>
+      <col><mnemonic>thread-state</mnemonic></col>
+      <col><mnemonic>weight</mnemonic></col>
+      <col><mnemonic>stack</mnemonic></col>
+    </schema>
+    <row>
+      <sample-time id="1" fmt="00:00.001.000">1000000</sample-time>
+      <weight id="2" fmt="3.00 ms">3000000</weight>
+      <tagged-backtrace id="3" fmt="heavyWork() ← main">
+        <backtrace id="4">
+          <frame id="5" name="heavyWork()" addr="0x102000100">
+            <binary id="6" name="Orbit" path="/Applications/Orbit.app/Contents/MacOS/Orbit"/>
+          </frame>
+          <frame id="7" name="main" addr="0x102000050">
+            <binary ref="6"/>
+          </frame>
+        </backtrace>
+      </tagged-backtrace>
+    </row>
+    <row>
+      <sample-time id="8" fmt="00:00.002.000">2000000</sample-time>
+      <weight ref="2"/>
+      <tagged-backtrace id="9" fmt="sin ← heavyWork() ← main">
+        <backtrace id="10">
+          <frame id="11" name="sin" addr="0x180000100">
+            <binary id="12" name="libsystem_m.dylib" path="/usr/lib/system/libsystem_m.dylib"/>
+          </frame>
+          <frame ref="5"/>
+          <frame ref="7"/>
+        </backtrace>
+      </tagged-backtrace>
+    </row>
+    <row>
+      <sample-time id="13" fmt="00:00.003.000">3000000</sample-time>
+      <weight id="14" fmt="1.00 ms">1000000</weight>
+      <tagged-backtrace id="15" fmt="0x102000200 ← main">
+        <backtrace id="16">
+          <frame id="17" name="0x102000200" addr="0x102000200"/>
+          <frame ref="7"/>
+        </backtrace>
+      </tagged-backtrace>
+    </row>
+  </node>
+</trace-query-result>
+XML
+    else
+      cat <<'XML'
+<?xml version="1.0"?>
+<trace-query-result>
+  <node xpath='//trace-toc[1]/run[1]/data[1]/table[2]'>
+    <schema name="time-profile">
+      <col><mnemonic>time</mnemonic></col>
+      <col><mnemonic>thread</mnemonic></col>
+      <col><mnemonic>process</mnemonic></col>
+      <col><mnemonic>core</mnemonic></col>
+      <col><mnemonic>thread-state</mnemonic></col>
+      <col><mnemonic>weight</mnemonic></col>
+      <col><mnemonic>stack</mnemonic></col>
+    </schema>
+    <row>
+      <sample-time id="1" fmt="00:00.001.000">1000000</sample-time>
+      <weight id="2" fmt="3.00 ms">3000000</weight>
+      <tagged-backtrace id="3" fmt="heavyWork() ← main">
+        <backtrace id="4">
+          <frame id="5" name="heavyWork()" addr="0x102000100">
+            <binary id="6" name="Orbit" path="/Applications/Orbit.app/Contents/MacOS/Orbit"/>
+          </frame>
+          <frame id="7" name="main" addr="0x102000050">
+            <binary ref="6"/>
+          </frame>
+        </backtrace>
+      </tagged-backtrace>
+    </row>
+    <row>
+      <sample-time id="8" fmt="00:00.002.000">2000000</sample-time>
+      <weight ref="2"/>
+      <tagged-backtrace id="9" fmt="sin ← heavyWork() ← main">
+        <backtrace id="10">
+          <frame id="11" name="sin" addr="0x180000100">
+            <binary id="12" name="libsystem_m.dylib" path="/usr/lib/system/libsystem_m.dylib"/>
+          </frame>
+          <frame ref="5"/>
+          <frame ref="7"/>
+        </backtrace>
+      </tagged-backtrace>
+    </row>
+    <row>
+      <sample-time id="13" fmt="00:00.003.000">3000000</sample-time>
+      <weight id="14" fmt="1.00 ms">1000000</weight>
+      <tagged-backtrace id="15" fmt="0x102000200 ← main">
+        <backtrace id="16">
+          <frame id="17" name="0x102000200" addr="0x102000200"/>
+          <frame ref="7"/>
+        </backtrace>
+      </tagged-backtrace>
+    </row>
+  </node>
+</trace-query-result>
+XML
+    fi
+    exit 0
+  fi
+  if [ "$mode" = "har" ]; then
+    if [ -n "$output" ]; then
+      mkdir -p "$(dirname "$output")"
+      cat > "$output" <<'JSON'
+{{"log":{{"version":"1.2"}}}}
+JSON
+    else
+      cat <<'JSON'
+{{"log":{{"version":"1.2"}}}}
+JSON
+    fi
+    exit 0
+  fi
+  echo "unexpected xctrace export command: $@" >&2
+  exit 1
+fi
 if [ "$#" -ge 3 ] && [ "$1" = "--sdk" ] && [ "$3" = "swiftc" ]; then
   out=""
   module=""

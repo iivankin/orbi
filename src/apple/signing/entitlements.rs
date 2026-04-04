@@ -151,6 +151,32 @@ pub(super) fn materialize_signing_entitlements(
     Ok(Some(path))
 }
 
+pub(super) fn materialize_macos_debug_trace_entitlements(
+    project: &ProjectContext,
+    target: &TargetManifest,
+    _bundle_path: &Path,
+) -> Result<PathBuf> {
+    let mut entitlements = target
+        .entitlements
+        .as_ref()
+        .map(|entitlements_path| load_plist_dictionary(&project.root.join(entitlements_path)))
+        .transpose()?
+        .unwrap_or_default();
+    set_dictionary_boolean(&mut entitlements, "com.apple.security.get-task-allow", true);
+
+    let generated_dir = project
+        .project_paths
+        .orbit_dir
+        .join("signing")
+        .join("entitlements");
+    ensure_dir(&generated_dir)?;
+    let path = generated_dir.join(format!("{}.debug.entitlements", target.name));
+    Value::Dictionary(entitlements)
+        .to_file_xml(&path)
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    Ok(path)
+}
+
 pub(super) fn load_plist_dictionary(path: &Path) -> Result<Dictionary> {
     Value::from_file(path)
         .with_context(|| format!("failed to parse plist {}", path.display()))?

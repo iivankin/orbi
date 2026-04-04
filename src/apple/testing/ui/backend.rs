@@ -50,6 +50,13 @@ pub trait UiBackend {
     fn stop_app(&self, bundle_id: &str) -> Result<()>;
     fn clear_app_state(&self, bundle_id: &str) -> Result<()>;
     fn focus(&self) -> Result<()>;
+    fn pin_running_target_by_executable(
+        &self,
+        _executable_path: &Path,
+        _ignored_pid: Option<u32>,
+    ) -> Result<()> {
+        Ok(())
+    }
     fn tap_point(&self, x: f64, y: f64, duration_ms: Option<u32>) -> Result<()>;
     fn hover_point(&self, _x: f64, _y: f64) -> Result<()> {
         bail!(
@@ -823,6 +830,7 @@ pub struct MacosBackend {
     executable_path: PathBuf,
     selected_xcode: Option<SelectedXcode>,
     verbose: bool,
+    pinned_target_pid: Mutex<Option<u32>>,
     launched_session: Mutex<Option<MacosLaunchedSession>>,
     last_tap_point: Mutex<Option<(f64, f64)>>,
     active_video: Option<ActiveVideoRecording>,
@@ -846,6 +854,7 @@ impl MacosBackend {
             executable_path: macos_executable_path(receipt)?,
             selected_xcode: project.selected_xcode.clone(),
             verbose: project.app.verbose,
+            pinned_target_pid: Mutex::new(None),
             launched_session: Mutex::new(None),
             last_tap_point: Mutex::new(None),
             active_video: None,
@@ -891,6 +900,65 @@ impl MacosBackend {
         let _ = session.child.kill();
         let _ = session.child.wait();
         Ok(())
+    }
+
+    fn target_selector_arguments(&self) -> Result<Vec<String>> {
+        let pinned_pid = *self
+            .pinned_target_pid
+            .lock()
+            .map_err(|_| anyhow::anyhow!("failed to lock the macOS UI backend target state"))?;
+        Ok(match pinned_pid {
+            Some(pid) => vec!["--pid".to_owned(), pid.to_string()],
+            None => vec!["--bundle-id".to_owned(), self.bundle_id.clone()],
+        })
+    }
+
+    fn pin_running_target_pid(&self, pid: u32) -> Result<()> {
+        *self
+            .pinned_target_pid
+            .lock()
+            .map_err(|_| anyhow::anyhow!("failed to lock the macOS UI backend target state"))? =
+            Some(pid);
+        Ok(())
+    }
+
+    fn wait_for_running_process_pid(
+        &self,
+        executable_path: &Path,
+        ignored_pid: Option<u32>,
+    ) -> Result<u32> {
+        let executable = executable_path
+            .to_str()
+            .context("macOS traced executable path contains invalid UTF-8")?;
+        let started = Instant::now();
+        let mut last_seen_pids = Vec::new();
+        while started.elapsed() < Duration::from_secs(10) {
+            let mut command = Command::new("pgrep");
+            command.args(["-f", executable]);
+            let (success, stdout, _stderr) = command_output_allow_failure(&mut command)?;
+            if success {
+                let pids = traced_process_candidates(&stdout, ignored_pid);
+                if pids.len() == 1 {
+                    return Ok(pids[0]);
+                }
+                if !pids.is_empty() {
+                    last_seen_pids = pids;
+                }
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+
+        if last_seen_pids.len() > 1 {
+            bail!(
+                "timed out waiting for traced macOS app `{}` to settle to a single process; saw pids {:?}",
+                executable_path.display(),
+                last_seen_pids
+            );
+        }
+        bail!(
+            "timed out waiting for traced macOS app process `{}` to appear",
+            executable_path.display()
+        )
     }
 
     fn start_attached_log_session(
@@ -969,7 +1037,9 @@ impl MacosBackend {
         let mut last_error = None;
         while started.elapsed() < Duration::from_secs(10) {
             let mut command = Command::new(&self.helper_path);
-            command.args(["window-info", "--bundle-id", self.bundle_id.as_str()]);
+            let mut arguments = vec!["window-info".to_owned()];
+            arguments.extend(self.target_selector_arguments()?);
+            command.args(arguments);
             let (success, stdout, stderr) = command_output_allow_failure(&mut command)?;
             if success {
                 return serde_json::from_str(&stdout).context("failed to parse macOS window info");
@@ -995,7 +1065,9 @@ impl MacosBackend {
         let mut last_error = None;
         while started.elapsed() < Duration::from_secs(10) {
             let mut command = Command::new(&self.helper_path);
-            command.args(["focus", "--bundle-id", self.bundle_id.as_str()]);
+            let mut arguments = vec!["focus".to_owned()];
+            arguments.extend(self.target_selector_arguments()?);
+            command.args(arguments);
             let (success, _stdout, stderr) = command_output_allow_failure(&mut command)?;
             if success {
                 return Ok(());
@@ -1042,6 +1114,19 @@ impl MacosBackend {
     }
 }
 
+fn traced_process_candidates(stdout: &str, ignored_pid: Option<u32>) -> Vec<u32> {
+    let mut pids = stdout
+        .lines()
+        .filter_map(|line| line.trim().parse::<u32>().ok())
+        .collect::<Vec<_>>();
+    pids.sort_unstable();
+    pids.dedup();
+    if let Some(ignored_pid) = ignored_pid {
+        pids.retain(|pid| *pid != ignored_pid);
+    }
+    pids
+}
+
 impl Drop for MacosBackend {
     fn drop(&mut self) {
         let _ = self.stop_video_recording();
@@ -1075,11 +1160,9 @@ impl UiBackend for MacosBackend {
     }
 
     fn describe_all(&self) -> Result<JsonValue> {
-        let output = self.helper_output(&[
-            "describe-all".to_owned(),
-            "--bundle-id".to_owned(),
-            self.bundle_id.clone(),
-        ])?;
+        let mut arguments = vec!["describe-all".to_owned()];
+        arguments.extend(self.target_selector_arguments()?);
+        let output = self.helper_output(&arguments)?;
         serde_json::from_str(&output).context("failed to parse macOS accessibility tree")
     }
 
@@ -1155,6 +1238,11 @@ impl UiBackend for MacosBackend {
         let mut killall = Command::new("killall");
         killall.args(["-TERM", process_name]);
         let _ = command_output_allow_failure(&mut killall)?;
+        *self
+            .pinned_target_pid
+            .lock()
+            .map_err(|_| anyhow::anyhow!("failed to lock the macOS UI backend target state"))? =
+            None;
         Ok(())
     }
 
@@ -1206,11 +1294,18 @@ impl UiBackend for MacosBackend {
     }
 
     fn focus(&self) -> Result<()> {
-        self.run_helper(&[
-            "focus".to_owned(),
-            "--bundle-id".to_owned(),
-            self.bundle_id.clone(),
-        ])
+        let mut arguments = vec!["focus".to_owned()];
+        arguments.extend(self.target_selector_arguments()?);
+        self.run_helper(&arguments)
+    }
+
+    fn pin_running_target_by_executable(
+        &self,
+        executable_path: &Path,
+        ignored_pid: Option<u32>,
+    ) -> Result<()> {
+        let pid = self.wait_for_running_process_pid(executable_path, ignored_pid)?;
+        self.pin_running_target_pid(pid)
     }
 
     fn tap_point(&self, x: f64, y: f64, duration_ms: Option<u32>) -> Result<()> {
@@ -1288,11 +1383,8 @@ impl UiBackend for MacosBackend {
             bail!("`selectMenuItem` requires at least one menu label");
         }
 
-        let mut arguments = vec![
-            "menu-item".to_owned(),
-            "--bundle-id".to_owned(),
-            self.bundle_id.clone(),
-        ];
+        let mut arguments = vec!["menu-item".to_owned()];
+        arguments.extend(self.target_selector_arguments()?);
         for item in path {
             arguments.push("--item".to_owned());
             arguments.push(item.clone());
@@ -1392,11 +1484,10 @@ impl UiBackend for MacosBackend {
         thread::sleep(Duration::from_millis(120));
         let mut arguments = vec![
             "key".to_owned(),
-            "--bundle-id".to_owned(),
-            self.bundle_id.clone(),
             "--keycode".to_owned(),
             keycode.to_string(),
         ];
+        arguments.splice(1..1, self.target_selector_arguments()?);
         if let Some(character) = character {
             arguments.push("--character".to_owned());
             arguments.push(character.to_string());
@@ -1424,11 +1515,10 @@ impl UiBackend for MacosBackend {
         thread::sleep(Duration::from_millis(120));
         let mut arguments = vec![
             "key".to_owned(),
-            "--bundle-id".to_owned(),
-            self.bundle_id.clone(),
             "--keycode".to_owned(),
             keycode.to_string(),
         ];
+        arguments.splice(1..1, self.target_selector_arguments()?);
         if let Some(duration_ms) = duration_ms {
             arguments.push("--duration-ms".to_owned());
             arguments.push(duration_ms.to_string());
@@ -2021,4 +2111,21 @@ fn ensure_macos_driver_binary(project: &ProjectContext) -> Result<PathBuf> {
         eprintln!("{stderr}");
     }
     Ok(binary_path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::traced_process_candidates;
+
+    #[test]
+    fn filters_launch_recorder_pid_from_traced_process_candidates() {
+        let pids = traced_process_candidates("30368\n30421\n", Some(30368));
+        assert_eq!(pids, vec![30421]);
+    }
+
+    #[test]
+    fn keeps_unique_sorted_traced_process_candidates() {
+        let pids = traced_process_candidates("42\n7\n42\n", None);
+        assert_eq!(pids, vec![7, 42]);
+    }
 }

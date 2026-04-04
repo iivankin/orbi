@@ -6,6 +6,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
+use plist::Value;
 use serde::Deserialize;
 use tempfile::{NamedTempFile, tempdir};
 
@@ -17,10 +18,12 @@ use crate::apple::xcode::{
     log_redirect_dylib_path as selected_xcode_log_redirect_dylib_path, open_simulator_command,
     xcodebuild_command, xcrun_command,
 };
+use crate::cli::ProfileKind;
 use crate::context::ProjectContext;
 use crate::manifest::ApplePlatform;
 use crate::util::{
-    CliSpinner, command_output_allow_failure, debug_command, prompt_select, run_command,
+    CliSpinner, command_output_allow_failure, debug_command, ensure_dir, prompt_select,
+    run_command, timestamp_slug,
 };
 
 pub(super) fn validate_run_platform(platform: ApplePlatform) -> Result<()> {
@@ -33,13 +36,46 @@ pub(super) fn validate_run_platform(platform: ApplePlatform) -> Result<()> {
     }
 }
 
-pub(super) fn run_on_macos(project: &ProjectContext, receipt: &BuildReceipt) -> Result<()> {
+pub(super) fn run_on_macos(
+    project: &ProjectContext,
+    receipt: &BuildReceipt,
+    trace: Option<ProfileKind>,
+) -> Result<()> {
+    stop_existing_macos_application(receipt)?;
+    if let Some(kind) = trace {
+        let target = project
+            .resolved_manifest
+            .resolve_target(Some(&receipt.target))
+            .with_context(|| format!("missing manifest target `{}`", receipt.target))?;
+        crate::apple::signing::prepare_macos_bundle_for_debug_tracing(
+            project,
+            target,
+            &receipt.bundle_path,
+        )?;
+        let launch_target = prepare_macos_trace_launch_executable(project, receipt)?;
+        println!(
+            "Launching {} under xctrace on the local Mac. Orbit will wait for the recording to finish; press Ctrl-C to stop.",
+            receipt.bundle_id
+        );
+        if project.app.interactive {
+            spawn_macos_focus_helper(receipt.target.as_str())?;
+        }
+        let trace = crate::profile::start_optional_launched_process_trace(
+            &project.root,
+            project.selected_xcode.as_ref(),
+            project.app.interactive,
+            Some(kind),
+            &launch_target,
+            None,
+        )?
+        .expect("trace kind should produce a launched trace");
+        return crate::profile::wait_for_launched_trace_exit(trace.0, trace.1);
+    }
+
     println!(
         "Launching {} on the local Mac. Orbit will hand control to the app until it exits; press Ctrl-C to stop.",
         receipt.bundle_id
     );
-
-    stop_existing_macos_application(receipt)?;
     run_macos_application(project, receipt)
 }
 
@@ -241,7 +277,13 @@ exit 0"#,
     Ok(())
 }
 
-pub(super) fn run_on_simulator(project: &ProjectContext, receipt: &BuildReceipt) -> Result<()> {
+pub(super) fn run_on_simulator(
+    project: &ProjectContext,
+    receipt: &BuildReceipt,
+    trace: Option<ProfileKind>,
+) -> Result<()> {
+    crate::profile::ensure_simulator_profiling_supported(trace)?;
+
     let device = prepare_simulator_installation(project, receipt)?;
     let _app_logs = start_simulator_app_logs(project, &device, receipt);
 
@@ -255,11 +297,13 @@ pub(super) fn run_on_simulator(project: &ProjectContext, receipt: &BuildReceipt)
         "iOS simulator launch wrapper",
         true,
     )?;
-    if project.app.interactive {
-        return run_macos_wrapper_session(script.path());
-    }
-
-    run_inherited_shell_script(script.path())
+    let result = if project.app.interactive {
+        run_macos_wrapper_session(script.path())
+    } else {
+        run_inherited_shell_script(script.path())
+    };
+    debug_assert!(trace.is_none());
+    result
 }
 
 pub(super) fn debug_on_simulator(project: &ProjectContext, receipt: &BuildReceipt) -> Result<()> {
@@ -294,32 +338,32 @@ pub(super) fn run_on_device(
     project: &ProjectContext,
     device: &PhysicalDevice,
     receipt: &BuildReceipt,
+    trace: Option<ProfileKind>,
 ) -> Result<()> {
     let installed = install_on_device(project.selected_xcode.as_ref(), device, receipt)?;
+    if let Some(kind) = trace {
+        println!(
+            "Launching {} under xctrace on {}. Orbit will wait for the recording to finish; press Ctrl-C to stop.",
+            receipt.bundle_id,
+            device.name()
+        );
+        return run_on_device_with_trace(project, device, &installed.installation_url, kind);
+    }
+
     println!(
         "Launching {} on {}. Orbit will stay attached to the device console; press Ctrl-C to stop.",
         receipt.bundle_id,
         device.name()
     );
-    if receipt.platform == ApplePlatform::Ios {
-        launch_device_console_process(
-            project.selected_xcode.as_ref(),
-            device,
-            &receipt.bundle_id,
-            receipt.target.as_str(),
-            project.app.verbose,
-        )?;
-    } else {
-        let remote_bundle_path = remote_app_bundle_path(&installed.installation_url)?;
-        launch_device_console_process(
-            project.selected_xcode.as_ref(),
-            device,
-            &remote_bundle_path,
-            receipt.target.as_str(),
-            project.app.verbose,
-        )?;
-    }
-    Ok(())
+
+    let remote_bundle_path = remote_app_bundle_path(&installed.installation_url)?;
+    launch_device_console_process(
+        project.selected_xcode.as_ref(),
+        device,
+        &remote_bundle_path,
+        receipt.target.as_str(),
+        project.app.verbose,
+    )
 }
 
 pub(super) fn debug_on_device(
@@ -618,6 +662,154 @@ fn debug_on_ios_device(
     result
 }
 
+fn run_on_device_with_trace(
+    project: &ProjectContext,
+    device: &PhysicalDevice,
+    installation_url: &str,
+    kind: ProfileKind,
+) -> Result<()> {
+    // On physical iOS devices, `xctrace --launch` is reliable only when given the
+    // installed remote `.app` path; bundle IDs and remote executables produced
+    // broken traces in live validation.
+    let remote_bundle_path = remote_app_bundle_path(installation_url)?;
+    let trace = crate::profile::start_optional_launched_process_trace(
+        &project.root,
+        project.selected_xcode.as_ref(),
+        project.app.interactive,
+        Some(kind),
+        &remote_bundle_path,
+        Some(device.provisioning_udid()),
+    )?
+    .expect("trace kind should produce a launched trace");
+    crate::profile::wait_for_launched_trace_exit(trace.0, trace.1)
+}
+
+pub(crate) fn prepare_macos_trace_launch_executable(
+    project: &ProjectContext,
+    receipt: &BuildReceipt,
+) -> Result<String> {
+    let launch_dir = project
+        .project_paths
+        .artifacts_dir
+        .join("profiles")
+        .join("launch-targets");
+    ensure_dir(&launch_dir)?;
+    let launch_alias = launch_dir.join(format!("{}-{}.app", timestamp_slug(), receipt.target));
+    remove_existing_trace_launch_target(&launch_alias)?;
+    let mut command = Command::new("ditto");
+    command.arg(&receipt.bundle_path);
+    command.arg(&launch_alias);
+    run_command(&mut command).with_context(|| {
+        format!(
+            "failed to materialize macOS trace launch bundle {} from {}",
+            launch_alias.display(),
+            receipt.bundle_path.display()
+        )
+    })?;
+    // `xctrace --launch -- <bundle.app>` spawns an extra Dock-visible app instance on macOS.
+    // Launching a uniquely named executable inside a copied bundle avoids that duplicate process,
+    // but still gives Orbit a stable, unambiguous target for tracing.
+    let launch_executable_name = macos_trace_launch_executable_name(
+        launch_alias
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap_or(receipt.target.as_str()),
+    );
+    let launch_executable =
+        rewrite_macos_trace_launch_bundle_executable(&launch_alias, &launch_executable_name)?;
+    let mut codesign = Command::new("codesign");
+    // The copied trace launch target must stay ad-hoc signed without extra entitlements.
+    // Adding `get-task-allow` here makes `xctrace --launch` spawn a duplicate Dock-visible
+    // macOS app process for this copied bundle in live validation.
+    codesign.args(["--force", "--sign", "-"]);
+    codesign.arg(&launch_alias);
+    run_command(&mut codesign).with_context(|| {
+        format!(
+            "failed to re-sign macOS trace launch bundle {}",
+            launch_alias.display()
+        )
+    })?;
+    launch_executable
+        .to_str()
+        .map(ToOwned::to_owned)
+        .context("macOS trace launch executable path contains invalid UTF-8")
+}
+
+fn remove_existing_trace_launch_target(path: &Path) -> Result<()> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to inspect {}", path.display()));
+        }
+    };
+
+    if metadata.file_type().is_symlink() || metadata.is_file() {
+        fs::remove_file(path).with_context(|| format!("failed to replace {}", path.display()))?;
+        return Ok(());
+    }
+
+    if metadata.is_dir() {
+        fs::remove_dir_all(path)
+            .with_context(|| format!("failed to replace {}", path.display()))?;
+        return Ok(());
+    }
+
+    bail!(
+        "unsupported existing macOS trace launch target {}",
+        path.display()
+    )
+}
+
+fn rewrite_macos_trace_launch_bundle_executable(
+    bundle_path: &Path,
+    executable_name: &str,
+) -> Result<PathBuf> {
+    let info_plist_path = bundle_path.join("Contents").join("Info.plist");
+    let mut info_plist = Value::from_file(&info_plist_path)
+        .with_context(|| format!("failed to parse {}", info_plist_path.display()))?
+        .into_dictionary()
+        .context("Info.plist must contain a top-level dictionary")?;
+    let original_executable = info_plist
+        .get("CFBundleExecutable")
+        .and_then(Value::as_string)
+        .context("Info.plist is missing `CFBundleExecutable`")?;
+    let macos_dir = bundle_path.join("Contents").join("MacOS");
+    let original_executable_path = macos_dir.join(original_executable);
+    let renamed_executable_path = macos_dir.join(executable_name);
+    fs::rename(&original_executable_path, &renamed_executable_path).with_context(|| {
+        format!(
+            "failed to rename macOS trace launch executable {} to {}",
+            original_executable_path.display(),
+            renamed_executable_path.display()
+        )
+    })?;
+    info_plist.insert(
+        "CFBundleExecutable".to_owned(),
+        Value::String(executable_name.to_owned()),
+    );
+    Value::Dictionary(info_plist)
+        .to_file_xml(&info_plist_path)
+        .with_context(|| format!("failed to write {}", info_plist_path.display()))?;
+    Ok(renamed_executable_path)
+}
+
+fn macos_trace_launch_executable_name(value: &str) -> String {
+    let sanitized = value
+        .chars()
+        .map(|character| match character {
+            'a'..='z' | 'A'..='Z' | '0'..='9' => character,
+            _ => '_',
+        })
+        .collect::<String>();
+    let trimmed = sanitized.trim_matches('_');
+    if trimmed.is_empty() {
+        "OrbitTraceLaunch".to_owned()
+    } else {
+        format!("OrbitTrace{trimmed}")
+    }
+}
+
 fn launch_device_console_process(
     selected_xcode: Option<&SelectedXcode>,
     device: &PhysicalDevice,
@@ -625,6 +817,23 @@ fn launch_device_console_process(
     process_name: &str,
     verbose: bool,
 ) -> Result<()> {
+    let (mut relay, debug) = spawn_device_console_launch_session(
+        selected_xcode,
+        device,
+        bundle_id_or_path,
+        process_name,
+        verbose,
+    )?;
+    wait_for_device_console_process(&mut relay, &debug)
+}
+
+fn spawn_device_console_launch_session(
+    selected_xcode: Option<&SelectedXcode>,
+    device: &PhysicalDevice,
+    bundle_id_or_path: &str,
+    process_name: &str,
+    verbose: bool,
+) -> Result<(DeviceConsoleRelay, String)> {
     let mut launch = xcrun_command(selected_xcode);
     launch.args([
         "devicectl",
@@ -639,8 +848,12 @@ fn launch_device_console_process(
     apply_device_console_environment(&mut launch);
     launch.arg(bundle_id_or_path);
     let debug = debug_command(&launch);
-    let mut relay = DeviceConsoleRelay::start(&mut launch, process_name, verbose)
+    let relay = DeviceConsoleRelay::start(&mut launch, process_name, verbose)
         .with_context(|| format!("failed to execute `{debug}`"))?;
+    Ok((relay, debug))
+}
+
+fn wait_for_device_console_process(relay: &mut DeviceConsoleRelay, debug: &str) -> Result<()> {
     let status = relay.wait()?;
     if !status.success() {
         bail!("`{debug}` failed with {status}");
@@ -2044,8 +2257,8 @@ mod tests {
         find_running_process_for_installation, lldb_expect_attach_script,
         lldb_expect_macos_launch_script, lldb_expect_macos_run_script,
         lldb_expect_simulator_attach_script, macos_debug_wrapper_script, macos_executable_path,
-        macos_xcode_log_redirect_env, select_physical_device_from_candidates,
-        simulator_run_wrapper_script,
+        macos_trace_launch_executable_name, macos_xcode_log_redirect_env,
+        select_physical_device_from_candidates, simulator_run_wrapper_script,
     };
     use crate::apple::build::receipt::BuildReceiptInput;
     use crate::apple::simulator::SimulatorDevice;
@@ -2069,6 +2282,18 @@ mod tests {
                 udid: udid.to_owned(),
             },
         }
+    }
+
+    #[test]
+    fn builds_trace_launch_executable_name() {
+        assert_eq!(
+            macos_trace_launch_executable_name("1775304762 ExampleMacApp.app"),
+            "OrbitTrace1775304762_ExampleMacApp_app"
+        );
+        assert_eq!(
+            macos_trace_launch_executable_name("%%%"),
+            "OrbitTraceLaunch"
+        );
     }
 
     fn fake_selected_xcode() -> (TempDir, SelectedXcode) {

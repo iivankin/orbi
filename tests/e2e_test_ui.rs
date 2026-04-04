@@ -3,6 +3,8 @@ mod support;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use serde_json::json;
+
 use support::{
     base_command, create_build_xcrun_mock, create_home, create_idb_mock,
     create_ui_testing_workspace, read_log, run_and_capture, write_executable,
@@ -101,6 +103,84 @@ fn orbit_test_runs_ui_flows_for_maestro_manifest_tests() {
 }
 
 #[test]
+fn orbit_test_ui_trace_fails_on_ios_simulator() {
+    let temp = tempdir().unwrap();
+    let home = create_home(temp.path());
+    let mock_bin = temp.path().join("mock-bin");
+    let log_path = temp.path().join("mock.log");
+    fs::create_dir_all(&mock_bin).unwrap();
+    let workspace = create_ui_testing_workspace(temp.path());
+
+    let mut command = base_command(&workspace, &home, &mock_bin, &log_path);
+    command.args([
+        "--non-interactive",
+        "test",
+        "--ui",
+        "--platform",
+        "ios",
+        "--trace",
+        "memory",
+    ]);
+    let output = run_and_capture(&mut command);
+    assert!(!output.status.success());
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("simulator profiling is currently unavailable"));
+    assert!(stderr.contains("xctrace/InstrumentsCLI simulator path is unstable"));
+
+    let log = read_log(&log_path);
+    assert!(!log.contains("xcrun simctl install"));
+    assert!(!log.contains("idb launch"));
+    assert!(!log.contains("xcrun xctrace record"));
+}
+
+#[test]
+fn orbit_test_ui_trace_fails_early_on_macos_when_flow_suite_relaunches_the_app() {
+    let temp = tempdir().unwrap();
+    let home = create_home(temp.path());
+    let mock_bin = temp.path().join("mock-bin");
+    let log_path = temp.path().join("mock.log");
+    fs::create_dir_all(&mock_bin).unwrap();
+    let workspace = create_ui_testing_workspace(temp.path());
+    set_manifest_platforms(
+        workspace.join("orbit.json").as_path(),
+        json!({
+            "macos": "15.0"
+        }),
+    );
+    fs::write(
+        workspace.join("Tests/UI/advanced.yaml"),
+        "---\n- launchApp\n- assertVisible: Continue\n",
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("Tests/UI/login.yaml"),
+        "---\n- launchApp\n- assertVisible: Continue\n",
+    )
+    .unwrap();
+
+    let mut command = base_command(&workspace, &home, &mock_bin, &log_path);
+    command.args([
+        "--non-interactive",
+        "test",
+        "--ui",
+        "--platform",
+        "macos",
+        "--trace",
+        "cpu",
+    ]);
+    let output = run_and_capture(&mut command);
+    assert!(!output.status.success());
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("only one `launchApp`"));
+
+    let log = read_log(&log_path);
+    assert!(!log.contains("xcrun "));
+    assert!(!log.contains("swift "));
+}
+
+#[test]
 fn orbit_test_ui_fails_early_with_install_hint_when_idb_is_missing() {
     let temp = tempdir().unwrap();
     let home = create_home(temp.path());
@@ -180,6 +260,13 @@ fn latest_ui_report_path(root: &Path) -> PathBuf {
         .collect::<Vec<_>>();
     runs.sort();
     runs.pop().unwrap().join("report.json")
+}
+
+fn set_manifest_platforms(path: &Path, platforms: serde_json::Value) {
+    let mut manifest: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+    manifest["platforms"] = platforms;
+    fs::write(path, serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
 }
 
 fn create_runtime_installing_xcrun_mock(mock_bin: &Path, runtime_ready_flag: &Path) {

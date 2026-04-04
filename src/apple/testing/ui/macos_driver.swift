@@ -66,6 +66,20 @@ struct DoctorStatus {
     }
 }
 
+enum ApplicationTarget {
+    case bundleID(String)
+    case pid(pid_t)
+
+    var description: String {
+        switch self {
+        case .bundleID(let bundleID):
+            return bundleID
+        case .pid(let pid):
+            return "pid \(pid)"
+        }
+    }
+}
+
 private let childAttributes = [
     kAXChildrenAttribute as String,
     kAXVisibleChildrenAttribute as String,
@@ -141,23 +155,41 @@ func repeatedFlags(_ name: String, in arguments: [String]) throws -> [String] {
     return values
 }
 
+func requireApplicationTarget(in arguments: [String]) throws -> ApplicationTarget {
+    if let pidValue = try optionalIntFlag("--pid", in: arguments) {
+        return .pid(pid_t(pidValue))
+    }
+    if let bundleID = try optionalFlag("--bundle-id", in: arguments) {
+        return .bundleID(bundleID)
+    }
+    throw DriverError.usage("expected either --pid or --bundle-id")
+}
+
 func ensureAccessibilityPermission() throws {
     guard AXIsProcessTrusted() else {
         throw DriverError.accessibilityPermission
     }
 }
 
-func runningApplication(bundleID: String) throws -> NSRunningApplication {
-    let applications = NSRunningApplication.runningApplications(withBundleIdentifier: bundleID)
-        .filter { !$0.isTerminated }
-    guard let application = applications.first else {
-        throw DriverError.appNotRunning(bundleID)
+func runningApplication(target: ApplicationTarget) throws -> NSRunningApplication {
+    switch target {
+    case .bundleID(let bundleID):
+        let applications = NSRunningApplication.runningApplications(withBundleIdentifier: bundleID)
+            .filter { !$0.isTerminated }
+        guard let application = applications.first else {
+            throw DriverError.appNotRunning(bundleID)
+        }
+        return application
+    case .pid(let pid):
+        guard let application = NSRunningApplication(processIdentifier: pid), !application.isTerminated else {
+            throw DriverError.appNotRunning("pid \(pid)")
+        }
+        return application
     }
-    return application
 }
 
-func applicationElement(bundleID: String) throws -> (NSRunningApplication, AXUIElement) {
-    let application = try runningApplication(bundleID: bundleID)
+func applicationElement(target: ApplicationTarget) throws -> (NSRunningApplication, AXUIElement) {
+    let application = try runningApplication(target: target)
     return (application, AXUIElementCreateApplication(application.processIdentifier))
 }
 
@@ -173,8 +205,8 @@ func frame(for element: AXUIElement) -> CGRect? {
     )
 }
 
-func focusedWindowFrame(bundleID: String) -> CGRect? {
-    guard let (_, application) = try? applicationElement(bundleID: bundleID),
+func focusedWindowFrame(target: ApplicationTarget) -> CGRect? {
+    guard let (_, application) = try? applicationElement(target: target),
           let focusedWindow = attributeValue(
             application,
             attribute: kAXFocusedWindowAttribute as String
@@ -194,8 +226,8 @@ func intersectionArea(_ lhs: CGRect, _ rhs: CGRect) -> CGFloat {
     return intersection.width * intersection.height
 }
 
-func windowCaptureInfo(bundleID: String) throws -> WindowCaptureInfo {
-    let application = try runningApplication(bundleID: bundleID)
+func windowCaptureInfo(target: ApplicationTarget) throws -> WindowCaptureInfo {
+    let application = try runningApplication(target: target)
     guard let windows = CGWindowListCopyWindowInfo(
         [.optionOnScreenOnly, .excludeDesktopElements],
         kCGNullWindowID
@@ -225,7 +257,7 @@ func windowCaptureInfo(bundleID: String) throws -> WindowCaptureInfo {
         return WindowCaptureInfo(windowNumber: windowNumber, frame: frame)
     }
 
-    if let focusedFrame = focusedWindowFrame(bundleID: bundleID),
+    if let focusedFrame = focusedWindowFrame(target: target),
        let focusedWindow = candidateWindows.max(by: { lhs, rhs in
            intersectionArea(lhs.frame, focusedFrame) < intersectionArea(rhs.frame, focusedFrame)
        }),
@@ -239,7 +271,7 @@ func windowCaptureInfo(bundleID: String) throws -> WindowCaptureInfo {
     }
 
     guard let bestWindow else {
-        throw DriverError.helper("could not find a visible macOS window for `\(bundleID)`")
+        throw DriverError.helper("could not find a visible macOS window for `\(target.description)`")
     }
     return bestWindow
 }
@@ -848,8 +880,8 @@ func menuBarElement(for application: AXUIElement) -> AXUIElement? {
     }
 }
 
-func bringApplicationToFront(bundleID: String) throws {
-    let application = try runningApplication(bundleID: bundleID)
+func bringApplicationToFront(target: ApplicationTarget) throws {
+    let application = try runningApplication(target: target)
 
     // Keyboard shortcuts must target the actual AUT, not whichever desktop app currently owns
     // the active menu bar. Under Codex, a plain `activateAllWindows` is sometimes too weak and
@@ -858,25 +890,34 @@ func bringApplicationToFront(bundleID: String) throws {
 
     let deadline = Date().addingTimeInterval(2.0)
     while Date() < deadline {
-        if NSWorkspace.shared.frontmostApplication?.bundleIdentifier == bundleID {
-            return
+        if let frontmost = NSWorkspace.shared.frontmostApplication {
+            switch target {
+            case .bundleID(let bundleID):
+                if frontmost.bundleIdentifier == bundleID {
+                    return
+                }
+            case .pid(let pid):
+                if frontmost.processIdentifier == pid {
+                    return
+                }
+            }
         }
         usleep(50_000)
     }
 }
 
-func selectMenuItem(bundleID: String, path: [String]) throws {
+func selectMenuItem(target: ApplicationTarget, path: [String]) throws {
     let labels = path.map(normalizedMenuLabel).filter { !$0.isEmpty }
     guard !labels.isEmpty else {
         throw DriverError.helper("`selectMenuItem` requires at least one menu label")
     }
 
-    try bringApplicationToFront(bundleID: bundleID)
+    try bringApplicationToFront(target: target)
     usleep(150_000)
 
-    let (_, applicationElementRef) = try applicationElement(bundleID: bundleID)
+    let (_, applicationElementRef) = try applicationElement(target: target)
     guard let menuBar = menuBarElement(for: applicationElementRef) else {
-        throw DriverError.helper("failed to resolve the menu bar for `\(bundleID)`")
+        throw DriverError.helper("failed to resolve the menu bar for `\(target.description)`")
     }
 
     var container = menuBar
@@ -894,8 +935,8 @@ func selectMenuItem(bundleID: String, path: [String]) throws {
     }
 }
 
-func writeWindowScreenshot(bundleID: String, outputPath: String) throws {
-    let captureInfo = try windowCaptureInfo(bundleID: bundleID)
+func writeWindowScreenshot(target: ApplicationTarget, outputPath: String) throws {
+    let captureInfo = try windowCaptureInfo(target: target)
     guard #available(macOS 14.0, *) else {
         throw DriverError.helper("macOS window screenshots require macOS 14.0 or newer")
     }
@@ -923,8 +964,14 @@ func writeWindowScreenshot(bundleID: String, outputPath: String) throws {
     let targetWindow = shareableContent.windows.first { window in
         window.windowID == CGWindowID(captureInfo.windowNumber)
     } ?? shareableContent.windows.first { window in
-        window.owningApplication?.bundleIdentifier == bundleID
-            && intersectionArea(window.frame, captureInfo.frame) > 0
+        switch target {
+        case .bundleID(let bundleID):
+            return window.owningApplication?.bundleIdentifier == bundleID
+                && intersectionArea(window.frame, captureInfo.frame) > 0
+        case .pid(let pid):
+            return window.owningApplication?.processID == pid
+                && intersectionArea(window.frame, captureInfo.frame) > 0
+        }
     }
     guard let targetWindow else {
         throw DriverError.helper("failed to resolve the macOS window for screenshot capture")
@@ -985,13 +1032,13 @@ func run() throws {
 
     switch command {
     case "describe-all":
-        let bundleID = try requireFlag("--bundle-id", in: arguments)
-        let (_, element) = try applicationElement(bundleID: bundleID)
+        let target = try requireApplicationTarget(in: arguments)
+        let (_, element) = try applicationElement(target: target)
         try outputJSON(collectSnapshots(from: element))
 
     case "window-info":
-        let bundleID = try requireFlag("--bundle-id", in: arguments)
-        try outputJSON(windowCaptureInfo(bundleID: bundleID).dictionary)
+        let target = try requireApplicationTarget(in: arguments)
+        try outputJSON(windowCaptureInfo(target: target).dictionary)
 
     case "describe-point":
         let x = try requireDoubleFlag("--x", in: arguments)
@@ -1000,8 +1047,8 @@ func run() throws {
         try outputJSON(serialize(element).dictionary)
 
     case "focus":
-        let bundleID = try requireFlag("--bundle-id", in: arguments)
-        try bringApplicationToFront(bundleID: bundleID)
+        let target = try requireApplicationTarget(in: arguments)
+        try bringApplicationToFront(target: target)
 
     case "tap":
         let x = try requireDoubleFlag("--x", in: arguments)
@@ -1068,12 +1115,12 @@ func run() throws {
         try setValueAtPoint(CGPoint(x: x, y: y), text: text)
 
     case "key":
-        let bundleID = try requireFlag("--bundle-id", in: arguments)
+        let target = try requireApplicationTarget(in: arguments)
         let keyCode = try requireIntFlag("--keycode", in: arguments)
         let durationMs = try optionalIntFlag("--duration-ms", in: arguments)
         let modifiers = try keyboardModifiers(from: arguments)
-        try bringApplicationToFront(bundleID: bundleID)
-        let application = try runningApplication(bundleID: bundleID)
+        try bringApplicationToFront(target: target)
+        let application = try runningApplication(target: target)
         try pressKeyCode(
             keyCode: keyCode,
             durationMs: durationMs,
@@ -1082,14 +1129,14 @@ func run() throws {
         )
 
     case "menu-item":
-        let bundleID = try requireFlag("--bundle-id", in: arguments)
+        let target = try requireApplicationTarget(in: arguments)
         let items = try repeatedFlags("--item", in: arguments)
-        try selectMenuItem(bundleID: bundleID, path: items)
+        try selectMenuItem(target: target, path: items)
 
     case "screenshot-window":
-        let bundleID = try requireFlag("--bundle-id", in: arguments)
+        let target = try requireApplicationTarget(in: arguments)
         let outputPath = try requireFlag("--output", in: arguments)
-        try writeWindowScreenshot(bundleID: bundleID, outputPath: outputPath)
+        try writeWindowScreenshot(target: target, outputPath: outputPath)
 
     default:
         throw DriverError.usage("unsupported command `\(command)`")

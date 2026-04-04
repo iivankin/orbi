@@ -23,7 +23,10 @@ pub use self::cleanup::{
 use self::device_selection::{CurrentProfileLookup, resolve_profile_device_ids};
 use self::entitlements::load_plist_dictionary;
 pub use self::entitlements::target_is_app_clip;
-use self::entitlements::{host_app_for_app_clip, materialize_signing_entitlements};
+use self::entitlements::{
+    host_app_for_app_clip, materialize_macos_debug_trace_entitlements,
+    materialize_signing_entitlements,
+};
 use self::local_state::{
     CertificateOrigin, ManagedCertificate, ManagedProfile, SigningIdentity, SigningState,
     certificate_has_local_signing_material, delete_certificate_files, delete_file_if_exists,
@@ -226,6 +229,20 @@ pub fn sign_bundle(
         command.args(["--entitlements"]);
         command.arg(entitlements);
     }
+    command.arg(bundle_path);
+    crate::util::run_command(&mut command)
+}
+
+pub fn prepare_macos_bundle_for_debug_tracing(
+    project: &ProjectContext,
+    target: &TargetManifest,
+    bundle_path: &Path,
+) -> Result<()> {
+    let entitlements_path =
+        materialize_macos_debug_trace_entitlements(project, target, bundle_path)?;
+    let mut command = Command::new("codesign");
+    command.args(["--force", "--sign", "-", "--entitlements"]);
+    command.arg(&entitlements_path);
     command.arg(bundle_path);
     crate::util::run_command(&mut command)
 }

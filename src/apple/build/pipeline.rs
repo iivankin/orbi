@@ -15,11 +15,11 @@ use std::process::Command;
 
 use self::artifacts::{export_artifact, remove_existing_path};
 use self::compile::{CompileOutputMode, CompileOutputOptions, compile_target, embed_dependencies};
-pub(crate) use self::runtime::macos_executable_path;
 use self::runtime::{
     debug_on_device, debug_on_macos, debug_on_simulator, run_on_device, run_on_macos,
     run_on_simulator, select_physical_device, validate_run_platform,
 };
+pub(crate) use self::runtime::{macos_executable_path, prepare_macos_trace_launch_executable};
 use super::default_icon;
 use crate::apple::build::receipt::{BuildReceipt, BuildReceiptInput, write_receipt};
 use crate::apple::build::toolchain::{DestinationKind, Toolchain};
@@ -79,6 +79,12 @@ struct ArchitectureBuild {
 pub struct BuildOutcome {
     pub receipt: BuildReceipt,
     pub receipt_path: PathBuf,
+}
+
+#[derive(Clone, Copy)]
+enum BuildOutputMode {
+    UserFacing,
+    Silent,
 }
 
 fn build_progress_step<T, F, G>(
@@ -148,7 +154,7 @@ pub fn build_artifact(project: &ProjectContext, args: &BuildArgs) -> Result<()> 
         crate::apple::auth::ensure_project_authenticated(project)?;
     }
 
-    let outcome = build_project(project, &request)?;
+    let outcome = build_project(project, &request, BuildOutputMode::UserFacing)?;
     crate::util::print_success(format!(
         "Built {} for {}.",
         outcome.receipt.target,
@@ -174,6 +180,33 @@ pub fn build_for_testing_destination(
     platform: ApplePlatform,
     destination: DestinationKind,
 ) -> Result<BuildOutcome> {
+    build_for_testing_destination_with_output(
+        project,
+        platform,
+        destination,
+        BuildOutputMode::UserFacing,
+    )
+}
+
+pub fn build_for_testing_destination_silent(
+    project: &ProjectContext,
+    platform: ApplePlatform,
+    destination: DestinationKind,
+) -> Result<BuildOutcome> {
+    build_for_testing_destination_with_output(
+        project,
+        platform,
+        destination,
+        BuildOutputMode::Silent,
+    )
+}
+
+fn build_for_testing_destination_with_output(
+    project: &ProjectContext,
+    platform: ApplePlatform,
+    destination: DestinationKind,
+    output_mode: BuildOutputMode,
+) -> Result<BuildOutcome> {
     let target = build_target_for_platform(project, platform)?;
     let profile = profile_for_run();
     let request = BuildRequest {
@@ -187,7 +220,7 @@ pub fn build_for_testing_destination(
     if request_requires_signing(&request) {
         crate::apple::auth::ensure_project_authenticated(project)?;
     }
-    build_project(project, &request)
+    build_project(project, &request, output_mode)
 }
 
 pub fn prepare_for_ide(
@@ -251,6 +284,9 @@ pub fn run_on_destination(project: &ProjectContext, args: &RunArgs) -> Result<()
         args.device,
         profile.distribution,
     )?;
+    if args.trace.is_some() && args.debug {
+        bail!("`orbit run --trace` does not support `--debug`");
+    }
     if args.device_id.is_some() && destination != DestinationKind::Device {
         bail!("--device-id can only be used together with a physical-device run");
     }
@@ -278,7 +314,7 @@ pub fn run_on_destination(project: &ProjectContext, args: &RunArgs) -> Result<()
         crate::apple::auth::ensure_project_authenticated(project)?;
     }
 
-    let outcome = build_project(project, &request)?;
+    let outcome = build_project(project, &request, BuildOutputMode::UserFacing)?;
     crate::util::print_success(format!(
         "Built {} for {}.",
         outcome.receipt.target,
@@ -303,9 +339,9 @@ pub fn run_on_destination(project: &ProjectContext, args: &RunArgs) -> Result<()
         outcome.receipt.destination.as_str(),
         args.debug,
     ) {
-        (ApplePlatform::Macos, _, false) => run_on_macos(project, &outcome.receipt),
+        (ApplePlatform::Macos, _, false) => run_on_macos(project, &outcome.receipt, args.trace),
         (ApplePlatform::Macos, _, true) => debug_on_macos(project, &outcome.receipt),
-        (_, "simulator", false) => run_on_simulator(project, &outcome.receipt),
+        (_, "simulator", false) => run_on_simulator(project, &outcome.receipt, args.trace),
         (_, "simulator", true) => debug_on_simulator(project, &outcome.receipt),
         (_, "device", false) => run_on_device(
             project,
@@ -313,6 +349,7 @@ pub fn run_on_destination(project: &ProjectContext, args: &RunArgs) -> Result<()
                 .as_ref()
                 .context("device run requested without a selected physical device")?,
             &outcome.receipt,
+            args.trace,
         ),
         (_, "device", true) => debug_on_device(
             project,
@@ -360,7 +397,11 @@ fn ide_prepare_targets<'a>(
     Ok(ordered_targets)
 }
 
-fn build_project(project: &ProjectContext, request: &BuildRequest) -> Result<BuildOutcome> {
+fn build_project(
+    project: &ProjectContext,
+    request: &BuildRequest,
+    output_mode: BuildOutputMode,
+) -> Result<BuildOutcome> {
     let root_target = project
         .resolved_manifest
         .resolve_target(Some(&request.target_name))?;
@@ -404,6 +445,7 @@ fn build_project(project: &ProjectContext, request: &BuildRequest) -> Result<Bui
             &ordered_targets,
             &build_root,
             profile,
+            output_mode,
         )?
     } else {
         let toolchain = Toolchain::resolve(
@@ -421,7 +463,7 @@ fn build_project(project: &ProjectContext, request: &BuildRequest) -> Result<Bui
             profile,
             CompileOutputOptions {
                 index_store_path: None,
-                mode: CompileOutputMode::UserFacing,
+                mode: compile_output_mode(output_mode),
                 log_prefix: None,
             },
         )?
@@ -567,6 +609,7 @@ fn build_universal_macos_target_graph(
     ordered_targets: &[&TargetManifest],
     build_root: &Path,
     profile: &ProfileManifest,
+    output_mode: BuildOutputMode,
 ) -> Result<HashMap<String, BuiltTarget>> {
     let arch_root = build_root.join("arch");
     ensure_dir(&arch_root)?;
@@ -574,7 +617,9 @@ fn build_universal_macos_target_graph(
     let architectures = ["arm64", "x86_64"];
     let mut architecture_builds = Vec::with_capacity(architectures.len());
     for architecture in architectures {
-        println!("universal macOS slice `{architecture}`:");
+        if matches!(output_mode, BuildOutputMode::UserFacing) {
+            println!("universal macOS slice `{architecture}`:");
+        }
         let toolchain = Toolchain::resolve_for_architecture(
             request.platform,
             platform_manifest.deployment_target.as_str(),
@@ -593,14 +638,16 @@ fn build_universal_macos_target_graph(
             profile,
             CompileOutputOptions {
                 index_store_path: None,
-                mode: CompileOutputMode::UserFacing,
+                mode: compile_output_mode(output_mode),
                 log_prefix: Some(architecture),
             },
         )?;
-        crate::util::print_success(format!(
-            "Built universal macOS slice `{architecture}` for {} target(s).",
-            built_targets.len()
-        ));
+        if matches!(output_mode, BuildOutputMode::UserFacing) {
+            crate::util::print_success(format!(
+                "Built universal macOS slice `{architecture}` for {} target(s).",
+                built_targets.len()
+            ));
+        }
         architecture_builds.push(ArchitectureBuild {
             toolchain,
             build_root: arch_build_root,
@@ -616,11 +663,20 @@ fn build_universal_macos_target_graph(
         .context("missing secondary architecture build")?;
     let merged_targets =
         merge_universal_macos_targets(project, ordered_targets, primary, secondary, build_root)?;
-    crate::util::print_success(format!(
-        "Merged universal macOS slices for {} target(s).",
-        merged_targets.len()
-    ));
+    if matches!(output_mode, BuildOutputMode::UserFacing) {
+        crate::util::print_success(format!(
+            "Merged universal macOS slices for {} target(s).",
+            merged_targets.len()
+        ));
+    }
     Ok(merged_targets)
+}
+
+fn compile_output_mode(output_mode: BuildOutputMode) -> CompileOutputMode {
+    match output_mode {
+        BuildOutputMode::UserFacing => CompileOutputMode::UserFacing,
+        BuildOutputMode::Silent => CompileOutputMode::Silent,
+    }
 }
 
 fn merge_universal_macos_targets(

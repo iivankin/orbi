@@ -41,7 +41,20 @@ pub fn run_tests(project: &ProjectContext, args: &TestArgs) -> Result<()> {
     validate_swift_testing_layout(project, root_target, unit_tests)?;
 
     let package = materialize_swift_testing_package(project, root_target, unit_tests)?;
-    run_swift_testing_package(&package)?;
+    if let Some(kind) = args.trace {
+        let trace = crate::profile::start_optional_launched_command_trace(
+            &project.root,
+            project.selected_xcode.as_ref(),
+            project.app.interactive,
+            Some(kind),
+            &swift_testing_command(&package),
+            None,
+        )?
+        .expect("trace kind should produce a launched trace");
+        crate::profile::wait_for_launched_trace_exit(trace.0, trace.1)?;
+    } else {
+        run_swift_testing_package(&package)?;
+    }
     print_success(format!(
         "Swift Testing passed for `{}` using {} test source root(s).",
         root_target.name,
@@ -384,21 +397,28 @@ fn render_string_list(values: &[String]) -> String {
 }
 
 fn run_swift_testing_package(package: &GeneratedSwiftTestingPackage) -> Result<()> {
-    let mut command = Command::new("swift");
-    command
-        .arg("test")
-        .arg("--disable-keychain")
-        .arg("--package-path")
-        .arg(&package.package_root)
-        .arg("--scratch-path")
-        .arg(&package.scratch_path)
-        .arg("--cache-path")
-        .arg(&package.cache_path)
-        .arg("--enable-swift-testing")
-        .arg("--disable-xctest")
-        .arg("--attachments-path")
-        .arg(&package.attachments_path);
+    let command_line = swift_testing_command(package);
+    let mut command = Command::new(&command_line[0]);
+    command.args(&command_line[1..]);
     run_command(&mut command)
+}
+
+fn swift_testing_command(package: &GeneratedSwiftTestingPackage) -> Vec<String> {
+    vec![
+        "swift".to_owned(),
+        "test".to_owned(),
+        "--disable-keychain".to_owned(),
+        "--package-path".to_owned(),
+        package.package_root.display().to_string(),
+        "--scratch-path".to_owned(),
+        package.scratch_path.display().to_string(),
+        "--cache-path".to_owned(),
+        package.cache_path.display().to_string(),
+        "--enable-swift-testing".to_owned(),
+        "--disable-xctest".to_owned(),
+        "--attachments-path".to_owned(),
+        package.attachments_path.display().to_string(),
+    ]
 }
 
 fn collect_declared_sources(
