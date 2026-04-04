@@ -7,7 +7,7 @@ use serde_json::Value as JsonValue;
 use support::{
     base_command, create_api_key, create_build_xcrun_mock, create_ditto_mock, create_home,
     create_lldb_attach_mock, create_passthrough_mock, create_security_mock,
-    create_signing_workspace, create_watch_workspace, create_watch_xcrun_mock,
+    create_signing_workspace, create_sw_vers_mock, create_watch_workspace, create_watch_xcrun_mock,
     create_xcodebuild_mock, run_and_capture, spawn_asc_mock, write_executable,
 };
 
@@ -23,6 +23,8 @@ fn signed_build_runs_before_build_and_after_sign_hooks() {
     fs::create_dir_all(&mock_bin).unwrap();
 
     create_build_xcrun_mock(&mock_bin, &sdk_root);
+    create_xcodebuild_mock(&mock_bin);
+    create_sw_vers_mock(&mock_bin);
     create_security_mock(&mock_bin, &security_db);
     create_passthrough_mock(&mock_bin, "codesign");
     create_ditto_mock(&mock_bin);
@@ -109,6 +111,7 @@ fn run_executes_before_run_hook_after_build_context_is_available() {
 
     create_watch_xcrun_mock(&mock_bin, &sdk_root);
     create_xcodebuild_mock(&mock_bin);
+    create_sw_vers_mock(&mock_bin);
     create_lldb_attach_mock(&developer_dir);
     create_passthrough_mock(&mock_bin, "open");
     fs::create_dir_all(workspace.join("scripts")).unwrap();

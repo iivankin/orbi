@@ -135,6 +135,32 @@ exit 1
     );
 }
 
+pub fn create_sw_vers_mock(mock_bin: &Path) {
+    write_executable(
+        &mock_bin.join("sw_vers"),
+        r#"#!/bin/sh
+set -eu
+echo "sw_vers $@" >> "$MOCK_LOG"
+if [ "$#" -ne 1 ]; then
+  echo "unexpected sw_vers command: $@" >&2
+  exit 1
+fi
+case "$1" in
+  -productVersion)
+    printf '%s\n' "15.0"
+    ;;
+  -buildVersion)
+    printf '%s\n' "24A335"
+    ;;
+  *)
+    echo "unexpected sw_vers command: $@" >&2
+    exit 1
+    ;;
+esac
+"#,
+    );
+}
+
 pub fn create_build_xcrun_mock(mock_bin: &Path, sdk_root: &Path) {
     create_xcrun_mock(mock_bin, sdk_root, XcrunMockKind::Build);
 }
