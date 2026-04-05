@@ -387,9 +387,7 @@ impl ResolvedManifest {
                 .with_context(|| format!("unknown target `{name}`"));
         }
 
-        self.targets
-            .iter()
-            .find(|target| matches!(target.kind, TargetKind::App))
+        preferred_default_app_target(self)
             .or_else(|| self.targets.first())
             .context("manifest did not contain any targets")
     }
@@ -498,4 +496,82 @@ fn target_is_app_clip(manifest: &ResolvedManifest, target: &TargetManifest) -> b
                 .map(|target| format!("{}.", target.bundle_id))
                 .unwrap_or_default(),
         )
+}
+
+fn preferred_default_app_target(manifest: &ResolvedManifest) -> Option<&TargetManifest> {
+    manifest
+        .targets
+        .iter()
+        .find(|target| target.kind == TargetKind::App && !target_is_app_clip(manifest, target))
+        .or_else(|| {
+            manifest
+                .targets
+                .iter()
+                .find(|target| target.kind == TargetKind::App)
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+
+    use super::{
+        ApplePlatform, HooksManifest, IosTargetManifest, PlatformManifest, QualityManifest,
+        ResolvedManifest, TargetKind, TargetManifest, TestsManifest,
+    };
+
+    fn app_target(name: &str, bundle_id: &str, dependencies: &[&str]) -> TargetManifest {
+        TargetManifest {
+            name: name.to_owned(),
+            kind: TargetKind::App,
+            bundle_id: bundle_id.to_owned(),
+            display_name: None,
+            build_number: None,
+            platforms: vec![ApplePlatform::Ios],
+            sources: vec![PathBuf::from("Sources/App")],
+            resources: Vec::new(),
+            dependencies: dependencies
+                .iter()
+                .map(|entry| (*entry).to_owned())
+                .collect(),
+            frameworks: Vec::new(),
+            weak_frameworks: Vec::new(),
+            system_libraries: Vec::new(),
+            xcframeworks: Vec::new(),
+            swift_packages: Vec::new(),
+            info_plist: BTreeMap::new(),
+            ios: Some(IosTargetManifest::default()),
+            entitlements: None,
+            push: None,
+            extension: None,
+        }
+    }
+
+    #[test]
+    fn resolve_target_prefers_host_app_over_app_clip() {
+        let manifest = ResolvedManifest {
+            name: "ExampleApp".to_owned(),
+            version: "1.0.0".to_owned(),
+            xcode: None,
+            team_id: None,
+            provider_id: None,
+            hooks: HooksManifest::default(),
+            tests: TestsManifest::default(),
+            quality: QualityManifest::default(),
+            platforms: BTreeMap::from([(
+                ApplePlatform::Ios,
+                PlatformManifest {
+                    deployment_target: "17.0".to_owned(),
+                    universal_binary: false,
+                },
+            )]),
+            targets: vec![
+                app_target("AppClip", "com.example.app.clip", &[]),
+                app_target("ExampleApp", "com.example.app", &["AppClip"]),
+            ],
+        };
+
+        assert_eq!(manifest.resolve_target(None).unwrap().name, "ExampleApp");
+    }
 }
