@@ -95,12 +95,6 @@ pub struct ProvisioningProfile {
     pub device_ids: Vec<String>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ProvisioningCapabilityPatch {
-    pub remote_id: Option<String>,
-    pub update: CapabilityUpdate,
-}
-
 #[derive(Debug, Clone, Deserialize)]
 struct BundleIdAttributes {
     pub name: String,
@@ -115,6 +109,8 @@ struct BundleIdAttributes {
 
 #[derive(Debug, Clone, Deserialize)]
 struct BundleIdCapabilityAttributes {
+    #[serde(rename = "capabilityType", default)]
+    pub capability_type: Option<String>,
     #[serde(default)]
     pub enabled: Option<bool>,
     #[serde(default)]
@@ -180,34 +176,15 @@ impl ProvisioningClient {
         }))
     }
 
-    pub fn ensure_bundle_id(
-        &mut self,
-        name: &str,
-        identifier: &str,
-    ) -> Result<ProvisioningBundleId> {
+    pub fn ensure_bundle_id(&mut self, identifier: &str) -> Result<ProvisioningBundleId> {
         if let Some(bundle_id) = self.find_bundle_id(identifier)? {
             return Ok(bundle_id);
         }
-        self.create_bundle_id(name, identifier)
+        self.create_bundle_id(identifier)
     }
 
-    pub fn create_bundle_id(
-        &mut self,
-        name: &str,
-        identifier: &str,
-    ) -> Result<ProvisioningBundleId> {
-        let request = json!({
-            "data": {
-                "type": "bundleIds",
-                "attributes": {
-                    "name": name,
-                    "identifier": identifier,
-                    "seedId": &self.team_id,
-                    "bundleType": "bundle",
-                    "hasExclusiveManagedCapabilities": false,
-                }
-            }
-        });
+    pub fn create_bundle_id(&mut self, identifier: &str) -> Result<ProvisioningBundleId> {
+        let request = build_bundle_id_create_request(&self.team_id, identifier);
         let _: JsonApiDocument<BundleIdAttributes> =
             self.request_json(Method::POST, "bundleIds", &[], Some(request))?;
         self.find_bundle_id(identifier)?.with_context(|| {
@@ -566,6 +543,33 @@ impl ProvisioningClient {
         )
     }
 
+    pub fn create_bundle_capability(
+        &mut self,
+        bundle_id_id: &str,
+        update: &CapabilityUpdate,
+    ) -> Result<()> {
+        let request = build_bundle_capability_create_request(bundle_id_id, update)?;
+        let _: serde_json::Value =
+            self.request_json(Method::POST, "bundleIdCapabilities", &[], Some(request))?;
+        Ok(())
+    }
+
+    pub fn update_bundle_capability(
+        &mut self,
+        capability_id: &str,
+        bundle_id_id: &str,
+        update: &CapabilityUpdate,
+    ) -> Result<()> {
+        let request = build_bundle_capability_update_request(capability_id, bundle_id_id, update)?;
+        let _: serde_json::Value = self.request_json(
+            Method::PATCH,
+            &format!("bundleIdCapabilities/{capability_id}"),
+            &[],
+            Some(request),
+        )?;
+        Ok(())
+    }
+
     pub fn delete_bundle_id(&mut self, bundle_id_id: &str) -> Result<()> {
         self.request_empty(
             Method::DELETE,
@@ -582,48 +586,6 @@ impl ProvisioningClient {
             &[],
             None,
         )
-    }
-
-    pub fn update_bundle_capabilities(
-        &mut self,
-        bundle_id: &ProvisioningBundleId,
-        updates: &[ProvisioningCapabilityPatch],
-    ) -> Result<()> {
-        if updates.is_empty() {
-            return Ok(());
-        }
-
-        let relationships = updates
-            .iter()
-            .map(build_capability_relationship)
-            .collect::<Result<Vec<_>>>()?;
-        let request = json!({
-            "data": {
-                "id": &bundle_id.id,
-                "type": "bundleIds",
-                "attributes": {
-                    "teamId": &self.team_id,
-                    "name": &bundle_id.name,
-                    "identifier": &bundle_id.identifier,
-                    "seedId": &bundle_id.seed_id,
-                    "bundleType": &bundle_id.bundle_type,
-                    "hasExclusiveManagedCapabilities": bundle_id.has_exclusive_managed_capabilities,
-                },
-                "relationships": {
-                    "bundleIdCapabilities": {
-                        "data": relationships,
-                    }
-                }
-            }
-        });
-
-        let _: serde_json::Value = self.request_json(
-            Method::PATCH,
-            &format!("bundleIds/{}", bundle_id.id),
-            &[],
-            Some(request),
-        )?;
-        Ok(())
     }
 
     fn request_json<T>(
@@ -744,6 +706,7 @@ fn parse_remote_capability(resource: IncludedResource) -> Result<RemoteCapabilit
     let capability_type = relationship_one_id(&resource, "capability").unwrap_or_default();
     let attributes: BundleIdCapabilityAttributes = serde_json::from_value(resource.attributes)
         .context("failed to parse Developer Services bundle capability attributes")?;
+    let capability_type = attributes.capability_type.unwrap_or(capability_type);
     Ok(RemoteCapability {
         id: resource.id,
         capability_type,
@@ -800,31 +763,86 @@ fn relationship_many_ids(
     }
 }
 
-fn build_capability_relationship(
-    update: &ProvisioningCapabilityPatch,
+pub(crate) fn developer_services_bundle_id_name(identifier: &str) -> String {
+    // Xcode's DeveloperAPIBundleID.create(...) replaces dots with spaces when
+    // serializing an explicit App ID create request for Developer Services.
+    identifier.replace('.', " ")
+}
+
+fn build_bundle_id_create_request(team_id: &str, identifier: &str) -> serde_json::Value {
+    json!({
+        "data": {
+            "type": "bundleIds",
+            "attributes": {
+                "name": developer_services_bundle_id_name(identifier),
+                "identifier": identifier,
+                "bundleType": "bundle",
+                "teamId": team_id,
+                "seedId": team_id,
+                "hasExclusiveManagedCapabilities": false,
+            }
+        }
+    })
+}
+
+fn build_bundle_capability_document(
+    capability_id: Option<&str>,
+    bundle_id_id: Option<&str>,
+    update: &CapabilityUpdate,
 ) -> Result<serde_json::Value> {
-    let mut relationships = capability_relationships(&update.update.relationships);
+    let mut relationships = capability_relationships(&update.relationships);
     relationships.insert(
         "capability".to_owned(),
         json!({
             "data": {
-                "id": update.update.capability_type,
+                "id": update.capability_type,
                 "type": "capabilities",
             }
         }),
     );
+    if let Some(bundle_id_id) = bundle_id_id {
+        relationships.insert(
+            "bundleId".to_owned(),
+            json!({
+                "data": {
+                    "id": bundle_id_id,
+                    "type": "bundleIds",
+                }
+            }),
+        );
+    }
     let mut value = json!({
         "attributes": {
-            "enabled": update.update.option != "OFF",
-            "settings": capability_settings(&update.update)?,
+            "capabilityType": update.capability_type,
+            "enabled": update.option != "OFF",
+            "settings": capability_settings(update)?,
         },
         "relationships": relationships,
         "type": "bundleIdCapabilities",
     });
-    if let Some(remote_id) = &update.remote_id {
-        value["id"] = json!(remote_id);
+    if let Some(capability_id) = capability_id {
+        value["id"] = json!(capability_id);
     }
     Ok(value)
+}
+
+fn build_bundle_capability_create_request(
+    bundle_id_id: &str,
+    update: &CapabilityUpdate,
+) -> Result<serde_json::Value> {
+    Ok(json!({
+        "data": build_bundle_capability_document(None, Some(bundle_id_id), update)?,
+    }))
+}
+
+fn build_bundle_capability_update_request(
+    capability_id: &str,
+    bundle_id_id: &str,
+    update: &CapabilityUpdate,
+) -> Result<serde_json::Value> {
+    Ok(json!({
+        "data": build_bundle_capability_document(Some(capability_id), Some(bundle_id_id), update)?,
+    }))
 }
 
 fn capability_settings(update: &CapabilityUpdate) -> Result<Vec<serde_json::Value>> {
@@ -957,8 +975,12 @@ fn build_profile_create_request(
 mod tests {
     use serde_json::json;
 
-    use super::{build_profile_create_request, parse_provisioning_profiles};
+    use super::{
+        build_bundle_capability_create_request, build_bundle_capability_update_request,
+        build_bundle_id_create_request, build_profile_create_request, parse_provisioning_profiles,
+    };
     use crate::apple::asc_api::JsonApiListDocument;
+    use crate::apple::capabilities::{CapabilityRelationships, CapabilityUpdate};
 
     #[test]
     fn parses_profile_bundle_identifier_from_included_bundle_id() {
@@ -1050,6 +1072,146 @@ mod tests {
                                 {
                                     "id": "DEVICE123",
                                     "type": "devices",
+                                }
+                            ],
+                        },
+                    }
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn bundle_id_create_request_matches_xcode_shape() {
+        let request = build_bundle_id_create_request("TEAM123", "sh.accord.desktop");
+
+        assert_eq!(
+            request,
+            json!({
+                "data": {
+                    "type": "bundleIds",
+                    "attributes": {
+                        "name": "sh accord desktop",
+                        "identifier": "sh.accord.desktop",
+                        "bundleType": "bundle",
+                        "teamId": "TEAM123",
+                        "seedId": "TEAM123",
+                        "hasExclusiveManagedCapabilities": false,
+                    }
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn bundle_capability_create_request_includes_bundle_relationships() {
+        let request = build_bundle_capability_create_request(
+            "BUNDLE123",
+            &CapabilityUpdate {
+                capability_type: "APP_GROUPS".to_owned(),
+                option: "ON".to_owned(),
+                relationships: CapabilityRelationships {
+                    app_groups: Some(vec!["GROUP123".to_owned()]),
+                    merchant_ids: None,
+                    cloud_containers: None,
+                },
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            request,
+            json!({
+                "data": {
+                    "type": "bundleIdCapabilities",
+                    "attributes": {
+                        "capabilityType": "APP_GROUPS",
+                        "enabled": true,
+                        "settings": [],
+                    },
+                    "relationships": {
+                        "appGroups": {
+                            "data": [
+                                {
+                                    "id": "GROUP123",
+                                    "type": "appGroups",
+                                }
+                            ],
+                        },
+                        "bundleId": {
+                            "data": {
+                                "id": "BUNDLE123",
+                                "type": "bundleIds",
+                            }
+                        },
+                        "capability": {
+                            "data": {
+                                "id": "APP_GROUPS",
+                                "type": "capabilities",
+                            }
+                        },
+                    }
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn bundle_capability_update_request_includes_settings_without_bundle_id() {
+        let request = build_bundle_capability_update_request(
+            "CAP123",
+            "BUNDLE123",
+            &CapabilityUpdate {
+                capability_type: "ICLOUD".to_owned(),
+                option: "XCODE_6".to_owned(),
+                relationships: CapabilityRelationships {
+                    app_groups: None,
+                    merchant_ids: None,
+                    cloud_containers: Some(vec!["CLOUD123".to_owned()]),
+                },
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            request,
+            json!({
+                "data": {
+                    "id": "CAP123",
+                    "type": "bundleIdCapabilities",
+                    "attributes": {
+                        "capabilityType": "ICLOUD",
+                        "enabled": true,
+                        "settings": [
+                            {
+                                "key": "ICLOUD_VERSION",
+                                "options": [
+                                    {
+                                        "key": "XCODE_6",
+                                        "enabled": true,
+                                    }
+                                ]
+                            }
+                        ],
+                    },
+                    "relationships": {
+                        "capability": {
+                            "data": {
+                                "id": "ICLOUD",
+                                "type": "capabilities",
+                            }
+                        },
+                        "bundleId": {
+                            "data": {
+                                "id": "BUNDLE123",
+                                "type": "bundleIds",
+                            }
+                        },
+                        "cloudContainers": {
+                            "data": [
+                                {
+                                    "id": "CLOUD123",
+                                    "type": "cloudContainers",
                                 }
                             ],
                         },

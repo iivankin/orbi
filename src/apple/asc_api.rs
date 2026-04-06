@@ -103,7 +103,7 @@ pub struct BundleIdCapabilityAttributes {
     #[serde(rename = "capabilityType")]
     pub capability_type: String,
     #[serde(default)]
-    pub settings: Vec<CapabilitySetting>,
+    pub settings: Option<Vec<CapabilitySetting>>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -654,6 +654,7 @@ fn parse_remote_capability(resource: IncludedResource) -> Result<RemoteCapabilit
         enabled: None,
         settings: attributes
             .settings
+            .unwrap_or_default()
             .into_iter()
             .map(|setting| RemoteCapabilitySetting {
                 key: setting.key,
@@ -744,4 +745,28 @@ fn handle_empty_response(response: Response) -> Result<()> {
         bail!("{message}");
     }
     bail!("App Store Connect request failed with {status}: {body}");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{IncludedResource, remote_capabilities_from_included};
+
+    #[test]
+    fn remote_capabilities_accept_null_settings_from_asc() {
+        let included = vec![IncludedResource {
+            id: "CAPABILITY_ID".to_owned(),
+            resource_type: "bundleIdCapabilities".to_owned(),
+            attributes: serde_json::json!({
+                "capabilityType": "PUSH_NOTIFICATIONS",
+                "settings": null,
+            }),
+            relationships: Default::default(),
+        }];
+
+        let capabilities = remote_capabilities_from_included(&included).unwrap();
+
+        assert_eq!(capabilities.len(), 1);
+        assert_eq!(capabilities[0].capability_type, "PUSH_NOTIFICATIONS");
+        assert!(capabilities[0].settings.is_empty());
+    }
 }

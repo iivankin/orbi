@@ -20,8 +20,15 @@ pub use self::command_fixtures::{
 pub use self::crypto::{create_api_key, create_p12};
 #[allow(unused_imports)]
 pub use self::live::{
-    LiveAppleConfig, LiveCleanupGuard, create_live_workspace, create_live_workspace_with_manifest,
-    live_command, remote_capabilities_for_bundle_id, require_live_apple_config,
+    LiveAppleConfig, LiveAscConfig, LiveCleanupGuard, create_live_workspace,
+    create_live_workspace_with_manifest, live_asc_command, live_command,
+    live_command_without_team_state, remote_app_groups_for_identifier,
+    remote_asc_certificates_for_type, remote_capabilities_for_bundle_id,
+    remote_certificates_for_type, remote_cloud_containers_for_identifier,
+    remote_devices_for_platform, remote_merchant_ids_for_identifier, remote_profiles_for_bundle_id,
+    require_live_apple_config, require_live_asc_config, wait_for_remote_app_group_count,
+    wait_for_remote_capability_state, wait_for_remote_cloud_container_count,
+    wait_for_remote_merchant_id_count, wait_for_remote_profile_count,
 };
 pub use self::tool_mocks::{
     create_build_xcrun_mock, create_codesign_mock, create_ditto_mock, create_idb_mock,

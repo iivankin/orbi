@@ -153,24 +153,21 @@ pub(super) fn write_info_plist(
                 "MinimumOSVersion".to_owned(),
                 Value::String(toolchain.deployment_target.clone()),
             );
-            let mut extension = extension_plist(
-                target
-                    .extension
-                    .as_ref()
-                    .context("extension configuration missing")?,
+            let extension = target
+                .extension
+                .as_ref()
+                .context("extension configuration missing")?;
+            apply_info_plist_overrides(&mut plist, &extension.info_plist_extra)?;
+            apply_extension_plist(
+                &mut plist,
+                extension,
+                matches!(target.kind, TargetKind::WatchExtension)
+                    .then(|| {
+                        parent_bundle_id(project, &target.name, TargetKind::WatchApp)
+                            .context("watch extension must be hosted by a watch app target")
+                    })
+                    .transpose()?,
             )?;
-            if matches!(target.kind, TargetKind::WatchExtension) {
-                let watch_bundle_id = parent_bundle_id(project, &target.name, TargetKind::WatchApp)
-                    .context("watch extension must be hosted by a watch app target")?;
-                merge_extension_attributes(
-                    &mut extension,
-                    Dictionary::from_iter([(
-                        "WKAppBundleIdentifier".to_owned(),
-                        Value::String(watch_bundle_id),
-                    )]),
-                );
-            }
-            plist.insert("NSExtension".to_owned(), Value::Dictionary(extension));
         }
         TargetKind::Framework => {
             plist.insert(
@@ -367,15 +364,71 @@ pub(super) fn extension_plist(config: &ExtensionManifest) -> Result<Dictionary> 
     for (key, value) in &config.extra {
         extension.insert(key.clone(), json_to_plist(value)?);
     }
-    extension.insert(
-        "NSExtensionPointIdentifier".to_owned(),
-        Value::String(config.point_identifier.clone()),
-    );
-    extension.insert(
-        "NSExtensionPrincipalClass".to_owned(),
-        Value::String(config.principal_class.clone()),
-    );
+    match config.runtime {
+        crate::manifest::ExtensionRuntime::NsExtension => {
+            extension.insert(
+                "NSExtensionPointIdentifier".to_owned(),
+                Value::String(config.point_identifier.clone()),
+            );
+            match &config.entry {
+                crate::manifest::ExtensionEntry::None => {}
+                crate::manifest::ExtensionEntry::PrincipalClass(class_name) => {
+                    extension.insert(
+                        "NSExtensionPrincipalClass".to_owned(),
+                        Value::String(class_name.clone()),
+                    );
+                }
+                crate::manifest::ExtensionEntry::MainStoryboard(storyboard) => {
+                    extension.insert(
+                        "NSExtensionMainStoryboard".to_owned(),
+                        Value::String(storyboard.clone()),
+                    );
+                }
+            }
+        }
+        crate::manifest::ExtensionRuntime::ExtensionKit => {
+            extension.insert(
+                "EXExtensionPointIdentifier".to_owned(),
+                Value::String(config.point_identifier.clone()),
+            );
+            if let crate::manifest::ExtensionEntry::PrincipalClass(class_name) = &config.entry {
+                extension.insert(
+                    "EXPrincipalClass".to_owned(),
+                    Value::String(class_name.clone()),
+                );
+            }
+        }
+    }
     Ok(extension)
+}
+
+fn apply_extension_plist(
+    plist: &mut Dictionary,
+    config: &ExtensionManifest,
+    watch_bundle_id: Option<String>,
+) -> Result<()> {
+    let mut extension = extension_plist(config)?;
+    match config.runtime {
+        crate::manifest::ExtensionRuntime::NsExtension => {
+            if let Some(watch_bundle_id) = watch_bundle_id {
+                merge_extension_attributes(
+                    &mut extension,
+                    Dictionary::from_iter([(
+                        "WKAppBundleIdentifier".to_owned(),
+                        Value::String(watch_bundle_id),
+                    )]),
+                );
+            }
+            plist.insert("NSExtension".to_owned(), Value::Dictionary(extension));
+        }
+        crate::manifest::ExtensionRuntime::ExtensionKit => {
+            plist.insert(
+                "EXAppExtensionAttributes".to_owned(),
+                Value::Dictionary(extension),
+            );
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn json_to_plist(value: &serde_json::Value) -> Result<Value> {

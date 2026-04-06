@@ -287,22 +287,350 @@ pub struct ExtensionConfig {
     pub entitlements: EntitlementsManifest,
     #[serde(default)]
     pub entry: Option<EntryConfig>,
+    #[serde(default)]
+    pub action: Option<ActionExtensionConfig>,
+    #[serde(default)]
+    pub account_authentication_modification: Option<AccountAuthenticationModificationConfig>,
+    #[serde(default)]
+    pub broadcast_upload: Option<BroadcastUploadConfig>,
+    #[serde(default)]
+    pub core_spotlight_delegate: Option<CoreSpotlightDelegateConfig>,
+    #[serde(default)]
+    pub file_provider: Option<FileProviderConfig>,
+    #[serde(default)]
+    pub file_provider_ui: Option<FileProviderUiConfig>,
+    #[serde(default)]
+    pub intents: Option<IntentsConfig>,
+    #[serde(default)]
+    pub keyboard: Option<KeyboardConfig>,
+    #[serde(default)]
+    pub message_filter: Option<MessageFilterConfig>,
+    #[serde(default)]
+    pub notification_content: Option<NotificationContentConfig>,
+    #[serde(default)]
+    pub persistent_token: Option<PersistentTokenConfig>,
+    #[serde(default)]
+    pub photo_project: Option<PhotoProjectConfig>,
+    #[serde(default)]
+    pub quick_look_preview: Option<QuickLookPreviewConfig>,
+    #[serde(default)]
+    pub spotlight_import: Option<SpotlightImportConfig>,
+    #[serde(default)]
+    pub thumbnail: Option<ThumbnailConfig>,
+    #[serde(default)]
+    pub unwanted_communication_reporting: Option<UnwantedCommunicationReportingConfig>,
+    #[serde(default)]
+    pub accessory_setup: Option<AccessorySetupConfig>,
+    #[serde(default)]
+    pub accessory_data_transport: Option<AccessoryDataTransportConfig>,
+    #[serde(default)]
+    pub background_resource_upload: Option<BackgroundResourceUploadConfig>,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum ExtensionKind {
     PacketTunnel,
+    AppProxy,
+    FilterControl,
+    FilterData,
+    DnsProxy,
+    AccountAuthenticationModification,
     Widget,
     Share,
     Safari,
     SafariWeb,
+    QuickLookPreview,
+    SpotlightImport,
+    Thumbnail,
+    CoreSpotlightDelegate,
+    PersistentToken,
+    XcodeSourceEditor,
+    Mail,
+    BroadcastUpload,
+    BroadcastSetupUi,
+    VirtualConferenceProvider,
+    NotificationService,
+    NotificationContent,
+    PhotoEditing,
+    PhotoProject,
+    AuthenticationServices,
+    ActionUi,
+    ActionService,
+    ContentBlocker,
+    ClasskitContextProvider,
+    FileProvider,
+    FileProviderUi,
+    FinderSync,
+    AutofillCredentialProvider,
+    CallDirectory,
+    MessageFilter,
+    UnwantedCommunicationReporting,
+    Intents,
+    IntentsUi,
+    Matter,
+    LocationPushService,
+    PrintService,
+    Messages,
+    AudioUnit,
+    AudioUnitUi,
+    TvTopShelf,
+    CustomKeyboard,
+    SmartCardToken,
+    DeviceActivityMonitor,
+    ShieldAction,
+    ShieldConfiguration,
+    AppIntents,
+    BackgroundDelivery,
+    BackgroundResourceUpload,
+    BackgroundDownload,
+    MediaDeviceDiscovery,
+    ContactProvider,
+    TranslationProvider,
+    AppMigration,
+    Capture,
+    HotspotEvaluationProvider,
+    HotspotAuthenticationProvider,
+    AccessorySetup,
+    AccessoryDataTransport,
+    DeviceActivityReport,
+    UrlFilterNetwork,
+    LiveCallerIdLookup,
+    IdentityDocumentProvider,
+    FileSystem,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EntryConfig {
-    pub class: String,
+    #[serde(default)]
+    pub class: Option<String>,
+    #[serde(default)]
+    pub storyboard: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ActionExtensionConfig {
+    pub activation_rule: JsonValue,
+    #[serde(default)]
+    pub javascript_preprocessing_file: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AccountAuthenticationModificationConfig {
+    #[serde(default = "default_true")]
+    pub supports_upgrade_to_sign_in_with_apple: bool,
+    #[serde(default = "default_true")]
+    pub supports_strong_password_change: bool,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BroadcastUploadConfig {
+    #[serde(default)]
+    pub process_mode: BroadcastUploadProcessMode,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CoreSpotlightDelegateConfig {
+    #[serde(default)]
+    pub label: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum BroadcastUploadProcessMode {
+    #[default]
+    SampleBuffer,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileProviderConfig {
+    pub document_group: String,
+    #[serde(default = "default_true")]
+    pub supports_enumeration: bool,
+    #[serde(default)]
+    pub actions: Vec<FileProviderActionConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileProviderUiConfig {
+    #[serde(default)]
+    pub actions: Vec<FileProviderActionConfig>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IntentsConfig {
+    #[serde(default)]
+    pub supported: Vec<String>,
+    #[serde(default)]
+    pub restricted_while_locked: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KeyboardConfig {
+    #[serde(default = "default_keyboard_primary_language")]
+    pub primary_language: String,
+    #[serde(default)]
+    pub ascii_capable: bool,
+    #[serde(default)]
+    pub prefers_right_to_left: bool,
+    #[serde(default)]
+    pub requests_open_access: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileProviderActionConfig {
+    pub identifier: String,
+    pub name: String,
+    pub activation_rule: JsonValue,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MessageFilterConfig {
+    #[serde(default)]
+    pub network_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NotificationContentConfig {
+    pub categories: Vec<String>,
+    #[serde(default)]
+    pub initial_content_size_ratio: Option<f64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PersistentTokenConfig {
+    pub driver_class: String,
+    #[serde(default)]
+    pub class_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PhotoProjectConfig {
+    #[serde(default = "default_true")]
+    pub defines_project_types: bool,
+    #[serde(default = "default_photo_project_categories")]
+    pub categories: Vec<PhotoProjectCategory>,
+    #[serde(default)]
+    pub document_type_identifier: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum PhotoProjectCategory {
+    Book,
+    Calendar,
+    Card,
+    Prints,
+    Slideshow,
+    Walldecor,
+    Other,
+    Undefined,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QuickLookPreviewConfig {
+    #[serde(default)]
+    pub content_types: Vec<String>,
+    #[serde(default)]
+    pub searchable_items: bool,
+    #[serde(default)]
+    pub data_based: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SpotlightImportConfig {
+    #[serde(default)]
+    pub label: Option<String>,
+    #[serde(default)]
+    pub content_types: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ThumbnailConfig {
+    #[serde(default)]
+    pub content_types: Vec<String>,
+    #[serde(default)]
+    pub minimum_dimension: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UnwantedCommunicationReportingConfig {
+    #[serde(default)]
+    pub sms_report_destination: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AccessorySetupConfig {
+    #[serde(default)]
+    pub bluetooth_services: Vec<String>,
+    #[serde(default)]
+    pub exported_types: Vec<ExportedTypeDeclarationConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AccessoryDataTransportConfig {
+    #[serde(default)]
+    pub bluetooth_services: Vec<String>,
+    #[serde(default = "default_accessory_setup_supports")]
+    pub supports: Vec<AccessorySetupSupport>,
+    #[serde(default)]
+    pub exported_types: Vec<ExportedTypeDeclarationConfig>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "PascalCase")]
+pub enum AccessorySetupSupport {
+    Bluetooth,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExportedTypeDeclarationConfig {
+    pub identifier: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub conforms_to: Vec<String>,
+    #[serde(default)]
+    pub symbol_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackgroundResourceUploadConfig {
+    pub url_base: String,
+}
+
+fn default_photo_project_categories() -> Vec<PhotoProjectCategory> {
+    vec![PhotoProjectCategory::Other]
+}
+
+fn default_keyboard_primary_language() -> String {
+    "en-US".to_owned()
+}
+
+fn default_accessory_setup_supports() -> Vec<AccessorySetupSupport> {
+    vec![AccessorySetupSupport::Bluetooth]
 }
 
 #[derive(Debug, Clone, Deserialize)]

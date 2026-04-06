@@ -68,10 +68,112 @@ case "$cmd" in
       exit 0
     fi
     ;;
-  create-keychain|unlock-keychain|set-keychain-settings|import|set-key-partition-list)
+  create-keychain|unlock-keychain|set-keychain-settings|set-key-partition-list)
+    ;;
+  import)
+    p12=""
+    keychain=""
+    password=""
+    cert_path=""
+    cert_format=""
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        -k) keychain="$2"; shift 2 ;;
+        -P) password="$2"; shift 2 ;;
+        -T) shift 2 ;;
+        *)
+          if [ -z "$p12" ]; then
+            p12="$1"
+          fi
+          shift
+          ;;
+      esac
+    done
+    mkdir -p "$(dirname "$db")"
+    touch "$db"
+    der_path="${{p12%.*}}.cer"
+    pem_path="${{p12%.*}}.pem"
+    if [ -f "$der_path" ]; then
+      cert_path="$der_path"
+      cert_format="DER"
+    elif [ -f "$pem_path" ]; then
+      cert_path="$pem_path"
+      cert_format="PEM"
+    fi
+    if [ -n "$cert_path" ]; then
+      if [ "$cert_format" = "DER" ]; then
+        hash="$(openssl x509 -inform DER -in "$cert_path" -noout -fingerprint -sha1 | sed 's/.*=//; s/://g')"
+        name="$(openssl x509 -inform DER -in "$cert_path" -noout -subject | sed -E 's/^subject= *//; s/.*CN *= *//')"
+      else
+        hash="$(openssl x509 -in "$cert_path" -noout -fingerprint -sha1 | sed 's/.*=//; s/://g')"
+        name="$(openssl x509 -in "$cert_path" -noout -subject | sed -E 's/^subject= *//; s/.*CN *= *//')"
+      fi
+    else
+      cert_tmp="$(mktemp)"
+      if openssl pkcs12 -in "$p12" -clcerts -nokeys -passin "pass:$password" -out "$cert_tmp" >/dev/null 2>&1; then
+        hash="$(openssl x509 -in "$cert_tmp" -noout -fingerprint -sha1 | sed 's/.*=//; s/://g')"
+        name="$(openssl x509 -in "$cert_tmp" -noout -subject | sed -E 's/^subject= *//; s/.*CN *= *//')"
+        rm -f "$cert_tmp"
+      else
+        rm -f "$cert_tmp"
+        hash="$(printf '%s' "$p12" | shasum | awk '{{print toupper(substr($1, 1, 40))}}')"
+        name="Imported Identity"
+      fi
+    fi
+    tmp="$db.tmp"
+    grep -v "^import|$keychain|$hash|" "$db" > "$tmp" || true
+    printf '%s|%s|%s|%s|%s|%s|%s|%s\n' "import" "$keychain" "$hash" "$name" "$cert_path" "$cert_format" "$p12" "$password" >> "$tmp"
+    mv "$tmp" "$db"
     ;;
   find-identity)
-    printf '  1) 04B011F1ABF0F7B8DDF99CD8BC88D5366AC8CC4D "Imported Identity"\n'
+    keychain=""
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        -p|-s) shift 2 ;;
+        -v) shift ;;
+        *)
+          keychain="$1"
+          shift
+          ;;
+      esac
+    done
+    touch "$db"
+    awk -F'|' -v kc="$keychain" '
+      $1 == "import" && (kc == "" || $2 == kc) {{
+        count += 1
+        printf "  %d) %s \"%s\"\n", count, $3, $4
+      }}
+    ' "$db"
+    ;;
+  find-certificate)
+    keychain=""
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        -a|-Z|-p) shift ;;
+        *)
+          keychain="$1"
+          shift
+          ;;
+      esac
+    done
+    touch "$db"
+    awk -F'|' -v kc="$keychain" '
+      $1 == "import" && (kc == "" || $2 == kc) {{
+        printf "%s|%s|%s|%s|%s\n", $3, $5, $6, $7, $8
+      }}
+    ' "$db" | while IFS='|' read -r hash cert_path cert_format p12 password; do
+      [ -n "$hash" ] || continue
+      printf 'SHA-1 hash: %s\n' "$hash"
+      if [ -n "$cert_path" ] && [ -f "$cert_path" ]; then
+        if [ "$cert_format" = "DER" ]; then
+          openssl x509 -inform DER -in "$cert_path" -outform PEM 2>/dev/null
+        else
+          openssl x509 -in "$cert_path" -outform PEM 2>/dev/null
+        fi
+      else
+        openssl pkcs12 -in "$p12" -clcerts -nokeys -passin "pass:$password" 2>/dev/null
+      fi
+    done
     ;;
   *)
     echo "unexpected security command: $cmd" >&2

@@ -56,7 +56,7 @@ pub fn prepare_signing(
             |bundle_id: &ProvisioningBundleId| {
                 format!("Host bundle identifier ready: {}.", bundle_id.identifier)
             },
-            || ensure_bundle_id_with_developer_services(&mut provisioning, project, host_target),
+            || ensure_bundle_id_with_developer_services(&mut provisioning, host_target),
         )?;
     }
 
@@ -71,7 +71,7 @@ pub fn prepare_signing(
                 target.name, bundle_id.identifier
             )
         },
-        || ensure_bundle_id_with_developer_services(&mut provisioning, project, target),
+        || ensure_bundle_id_with_developer_services(&mut provisioning, target),
     )?;
     let _ = signing_progress_step(
         format!("Syncing capabilities for `{}`", bundle_id.identifier),

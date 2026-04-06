@@ -18,6 +18,7 @@ pub(crate) struct SwiftcInvocation {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct SwiftTargetCompilePlan<'a> {
     pub target_kind: TargetKind,
+    pub use_nsextension_main: bool,
     pub module_name: &'a str,
     pub product_path: &'a Path,
     pub module_output_path: Option<&'a Path>,
@@ -83,10 +84,7 @@ pub(crate) fn target_swiftc_invocation(
     }
     args.push("-o".into());
     args.push(plan.product_path.as_os_str().to_os_string());
-    if matches!(
-        plan.target_kind,
-        TargetKind::AppExtension | TargetKind::WatchExtension | TargetKind::WidgetExtension
-    ) {
+    if plan.use_nsextension_main {
         // Extension bundles do not define `main`; the system loader enters through NSExtensionMain.
         args.push("-Xlinker".into());
         args.push("-e".into());
@@ -248,6 +246,7 @@ mod tests {
             &ProfileManifest::new(BuildConfiguration::Debug, DistributionKind::Development),
             SwiftTargetCompilePlan {
                 target_kind: TargetKind::AppExtension,
+                use_nsextension_main: true,
                 module_name: "ShareExtension",
                 product_path: "/tmp/ShareExtension.appex/ShareExtension".as_ref(),
                 module_output_path: None,
@@ -290,6 +289,64 @@ mod tests {
         assert!(args.windows(2).any(|pair| pair == ["-Xlinker", "-e"]));
         assert!(args.contains(&"/tmp/bridge.o".to_owned()));
         assert!(args.contains(&"/tmp/Sources/Extension.swift".to_owned()));
+    }
+
+    #[test]
+    fn target_invocation_omits_nsextension_main_for_widget_runtime_without_entry() {
+        let invocation = target_swiftc_invocation(
+            &fixture_toolchain(),
+            &ProfileManifest::new(BuildConfiguration::Debug, DistributionKind::Development),
+            SwiftTargetCompilePlan {
+                target_kind: TargetKind::WidgetExtension,
+                use_nsextension_main: false,
+                module_name: "WidgetExtension",
+                product_path: "/tmp/WidgetExtension.appex/WidgetExtension".as_ref(),
+                module_output_path: None,
+                swift_sources: &["/tmp/Sources/Widget.swift".into()],
+                package_outputs: &[],
+                external_link_inputs: &ExternalLinkInputs::default(),
+                object_files: &[],
+                index_store_path: None,
+            },
+        )
+        .unwrap();
+
+        let args = invocation
+            .args
+            .iter()
+            .map(|value| value.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(!args.windows(2).any(|pair| pair == ["-Xlinker", "-e"]));
+        assert!(!args.iter().any(|arg| arg == "_NSExtensionMain"));
+    }
+
+    #[test]
+    fn target_invocation_omits_nsextension_main_for_extensionkit_runtime() {
+        let invocation = target_swiftc_invocation(
+            &fixture_toolchain(),
+            &ProfileManifest::new(BuildConfiguration::Debug, DistributionKind::Development),
+            SwiftTargetCompilePlan {
+                target_kind: TargetKind::AppExtension,
+                use_nsextension_main: false,
+                module_name: "AppIntentsExtension",
+                product_path: "/tmp/AppIntentsExtension.appex/AppIntentsExtension".as_ref(),
+                module_output_path: None,
+                swift_sources: &["/tmp/Sources/AppIntents.swift".into()],
+                package_outputs: &[],
+                external_link_inputs: &ExternalLinkInputs::default(),
+                object_files: &[],
+                index_store_path: None,
+            },
+        )
+        .unwrap();
+
+        let args = invocation
+            .args
+            .iter()
+            .map(|value| value.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(!args.windows(2).any(|pair| pair == ["-Xlinker", "-e"]));
+        assert!(!args.iter().any(|arg| arg == "_NSExtensionMain"));
     }
 
     #[test]

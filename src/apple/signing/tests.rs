@@ -5,7 +5,9 @@ use serde_json::json;
 use tempfile::TempDir;
 
 use super::capability_sync::{
-    asc_capability_settings, plan_asc_capability_mutations, validate_push_setup_with_api_key,
+    DeveloperServicesCapabilityMutation, asc_capability_settings, plan_asc_capability_mutations,
+    plan_developer_services_capability_mutations, should_skip_capability_sync,
+    validate_push_setup_with_api_key,
 };
 use super::cleanup::{ProjectEntitlementIdentifiers, project_entitlement_identifiers};
 use super::device_selection::{
@@ -15,11 +17,13 @@ use super::device_selection::{
 use super::{
     ASC_OPTION_APPLE_ID_PRIMARY_CONSENT, ASC_OPTION_DATA_PROTECTION_COMPLETE,
     ASC_OPTION_PUSH_BROADCAST, CertificateOrigin, ManagedCertificate, ManagedProfile,
-    ProfileManifest, SigningState, clean_local_signing_state, load_state,
+    ProfileManifest, SigningState, clean_local_signing_state, identifier_name, load_state,
     materialize_signing_entitlements, profile_covers_requested_ids, resolve_local_team_id_if_known,
     save_state, target_is_app_clip, team_signing_paths,
 };
-use crate::apple::capabilities::{CapabilityRelationships, CapabilityUpdate, RemoteCapability};
+use crate::apple::capabilities::{
+    CapabilityRelationships, CapabilitySyncOptions, CapabilityUpdate, RemoteCapability,
+};
 use crate::apple::device::CachedDevice;
 use crate::context::{AppContext, GlobalPaths, ProjectContext, ProjectPaths};
 use crate::manifest::{
@@ -116,6 +120,14 @@ fn test_project() -> (TempDir, ProjectContext) {
         },
     };
     (temp, project)
+}
+
+#[test]
+fn developer_services_identifier_names_normalize_portal_identifiers() {
+    assert_eq!(
+        identifier_name("App Group", "group.dev.orbit.demo"),
+        "App Group group dev orbit demo"
+    );
 }
 
 #[test]
@@ -625,6 +637,104 @@ fn api_key_capability_mutations_build_expected_settings() {
     assert_eq!(
         mutations[1].settings[0].options[0].key,
         "COMPLETE_PROTECTION"
+    );
+}
+
+#[test]
+fn developer_services_capability_mutations_choose_resource_operations() {
+    let remote = vec![
+        RemoteCapability {
+            id: "CAP-APP-GROUPS".to_owned(),
+            capability_type: "APP_GROUPS".to_owned(),
+            enabled: Some(true),
+            settings: Vec::new(),
+        },
+        RemoteCapability {
+            id: "CAP-APPLE-PAY".to_owned(),
+            capability_type: "APPLE_PAY".to_owned(),
+            enabled: Some(true),
+            settings: Vec::new(),
+        },
+        RemoteCapability {
+            id: "CAP-ASSOCIATED".to_owned(),
+            capability_type: "ASSOCIATED_DOMAINS".to_owned(),
+            enabled: Some(true),
+            settings: Vec::new(),
+        },
+    ];
+    let updates = vec![
+        CapabilityUpdate {
+            capability_type: "APP_GROUPS".to_owned(),
+            option: "ON".to_owned(),
+            relationships: CapabilityRelationships {
+                app_groups: Some(vec!["GROUP123".to_owned()]),
+                merchant_ids: None,
+                cloud_containers: None,
+            },
+        },
+        CapabilityUpdate {
+            capability_type: "ICLOUD".to_owned(),
+            option: "XCODE_6".to_owned(),
+            relationships: CapabilityRelationships {
+                app_groups: None,
+                merchant_ids: None,
+                cloud_containers: Some(vec!["CLOUD123".to_owned()]),
+            },
+        },
+        CapabilityUpdate {
+            capability_type: "APPLE_PAY".to_owned(),
+            option: "OFF".to_owned(),
+            relationships: CapabilityRelationships::default(),
+        },
+        CapabilityUpdate {
+            capability_type: "ASSOCIATED_DOMAINS".to_owned(),
+            option: "OFF".to_owned(),
+            relationships: CapabilityRelationships::default(),
+        },
+    ];
+
+    let mutations = plan_developer_services_capability_mutations(&updates, &remote);
+    assert_eq!(mutations.len(), 4);
+    assert!(matches!(
+        &mutations[0],
+        DeveloperServicesCapabilityMutation::Update { remote_id, update }
+            if remote_id == "CAP-APP-GROUPS"
+                && update.capability_type == "APP_GROUPS"
+                && update.relationships.app_groups.as_deref() == Some(&["GROUP123".to_owned()])
+    ));
+    assert!(matches!(
+        &mutations[1],
+        DeveloperServicesCapabilityMutation::Create(update)
+            if update.capability_type == "ICLOUD"
+                && update.relationships.cloud_containers.as_deref() == Some(&["CLOUD123".to_owned()])
+    ));
+    assert!(matches!(
+        &mutations[2],
+        DeveloperServicesCapabilityMutation::Delete { remote_id }
+            if remote_id == "CAP-APPLE-PAY"
+    ));
+    assert!(matches!(
+        &mutations[3],
+        DeveloperServicesCapabilityMutation::Delete { remote_id }
+            if remote_id == "CAP-ASSOCIATED"
+    ));
+}
+
+#[test]
+fn capability_sync_is_not_skipped_when_remote_capabilities_need_disabling() {
+    let (_temp, project) = test_project();
+    let target = &project.resolved_manifest.targets[0];
+    let options = CapabilitySyncOptions::default();
+    let remote = vec![RemoteCapability {
+        id: "CAP-ASSOCIATED".to_owned(),
+        capability_type: "ASSOCIATED_DOMAINS".to_owned(),
+        enabled: Some(true),
+        settings: Vec::new(),
+    }];
+
+    assert!(
+        !should_skip_capability_sync(target, &options, &remote),
+        "expected remote capabilities to force a sync even when the target no longer declares entitlements"
     );
 }
 

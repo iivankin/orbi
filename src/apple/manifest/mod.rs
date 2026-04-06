@@ -298,9 +298,41 @@ pub struct PushManifest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExtensionManifest {
     pub point_identifier: String,
-    pub principal_class: String,
+    pub runtime: ExtensionRuntime,
+    #[serde(default)]
+    pub entry: ExtensionEntry,
+    #[serde(default)]
+    pub info_plist_extra: BTreeMap<String, JsonValue>,
     #[serde(default, flatten)]
     pub extra: BTreeMap<String, JsonValue>,
+}
+
+impl ExtensionManifest {
+    pub fn uses_nsextension_main(&self) -> bool {
+        self.runtime == ExtensionRuntime::NsExtension && self.entry.uses_nsextension_main()
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ExtensionRuntime {
+    NsExtension,
+    ExtensionKit,
+}
+
+#[derive(Debug, Clone, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ExtensionEntry {
+    #[default]
+    None,
+    PrincipalClass(String),
+    MainStoryboard(String),
+}
+
+impl ExtensionEntry {
+    pub fn uses_nsextension_main(&self) -> bool {
+        !matches!(self, Self::None)
+    }
 }
 
 impl ResolvedManifest {

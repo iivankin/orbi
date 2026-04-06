@@ -1182,6 +1182,446 @@
     "entryConfig": {
       "type": "object",
       "additionalProperties": false,
+      "properties": {
+        "class": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Objective-C runtime entry class."
+        },
+        "storyboard": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Main storyboard name for storyboard-backed extension entry points."
+        }
+      },
+      "allOf": [
+        {
+          "anyOf": [
+            {
+              "required": [
+                "class"
+              ]
+            },
+            {
+              "required": [
+                "storyboard"
+              ]
+            }
+          ]
+        },
+        {
+          "not": {
+            "required": [
+              "class",
+              "storyboard"
+            ]
+          }
+        }
+      ]
+    },
+    "actionExtensionConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "activation_rule"
+      ],
+      "properties": {
+        "activation_rule": {
+          "$ref": "#/$defs/plistValue",
+          "description": "NSExtension activation rule, for example `TRUEPREDICATE` or a predicate dictionary."
+        },
+        "javascript_preprocessing_file": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Optional JavaScript preprocessing file name without the `.js` suffix."
+        }
+      }
+    },
+    "accountAuthenticationModificationConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "default": {},
+      "properties": {
+        "supports_upgrade_to_sign_in_with_apple": {
+          "type": "boolean",
+          "default": true
+        },
+        "supports_strong_password_change": {
+          "type": "boolean",
+          "default": true
+        }
+      }
+    },
+    "broadcastUploadProcessMode": {
+      "type": "string",
+      "enum": [
+        "sample-buffer"
+      ]
+    },
+    "broadcastUploadConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "default": {},
+      "properties": {
+        "process_mode": {
+          "$ref": "#/$defs/broadcastUploadProcessMode",
+          "default": "sample-buffer",
+          "description": "ReplayKit broadcast upload process mode."
+        }
+      }
+    },
+    "coreSpotlightDelegateConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "default": {},
+      "properties": {
+        "label": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "fileProviderActionConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "identifier",
+        "name",
+        "activation_rule"
+      ],
+      "properties": {
+        "identifier": {
+          "type": "string",
+          "minLength": 1
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "activation_rule": {
+          "$ref": "#/$defs/plistValue"
+        }
+      }
+    },
+    "fileProviderConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "document_group"
+      ],
+      "properties": {
+        "document_group": {
+          "type": "string",
+          "minLength": 1,
+          "description": "App Group identifier used as `NSExtensionFileProviderDocumentGroup`."
+        },
+        "supports_enumeration": {
+          "type": "boolean",
+          "default": true
+        },
+        "actions": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/fileProviderActionConfig"
+          }
+        }
+      }
+    },
+    "fileProviderUiConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "default": {},
+      "properties": {
+        "actions": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/fileProviderActionConfig"
+          }
+        }
+      }
+    },
+    "intentsConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "default": {},
+      "properties": {
+        "supported": {
+          "$ref": "#/$defs/stringArray"
+        },
+        "restricted_while_locked": {
+          "$ref": "#/$defs/stringArray"
+        }
+      }
+    },
+    "keyboardConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "default": {},
+      "properties": {
+        "primary_language": {
+          "type": "string",
+          "default": "en-US",
+          "minLength": 1
+        },
+        "ascii_capable": {
+          "type": "boolean",
+          "default": false
+        },
+        "prefers_right_to_left": {
+          "type": "boolean",
+          "default": false
+        },
+        "requests_open_access": {
+          "type": "boolean",
+          "default": false
+        }
+      }
+    },
+    "messageFilterConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "default": {},
+      "properties": {
+        "network_url": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Optional server endpoint used by the message filter extension."
+        }
+      }
+    },
+    "notificationContentConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "categories"
+      ],
+      "properties": {
+        "categories": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "initial_content_size_ratio": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "description": "Initial size ratio used by notification content UI."
+        }
+      }
+    },
+    "persistentTokenConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "driver_class"
+      ],
+      "properties": {
+        "driver_class": {
+          "type": "string",
+          "minLength": 1
+        },
+        "class_id": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "photoProjectCategory": {
+      "type": "string",
+      "enum": [
+        "book",
+        "calendar",
+        "card",
+        "prints",
+        "slideshow",
+        "walldecor",
+        "other",
+        "undefined"
+      ]
+    },
+    "photoProjectConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "default": {},
+      "properties": {
+        "defines_project_types": {
+          "type": "boolean",
+          "default": true
+        },
+        "categories": {
+          "type": "array",
+          "default": [
+            "other"
+          ],
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/photoProjectCategory"
+          }
+        },
+        "document_type_identifier": {
+          "type": "string",
+          "minLength": 1,
+          "description": "UTType identifier added to `CFBundleDocumentTypes` for the photo project extension."
+        }
+      }
+    },
+    "quickLookPreviewConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "default": {},
+      "properties": {
+        "content_types": {
+          "$ref": "#/$defs/stringArray"
+        },
+        "searchable_items": {
+          "type": "boolean",
+          "default": false
+        },
+        "data_based": {
+          "type": "boolean",
+          "default": false
+        }
+      }
+    },
+    "spotlightImportConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "default": {},
+      "properties": {
+        "label": {
+          "type": "string",
+          "minLength": 1
+        },
+        "content_types": {
+          "$ref": "#/$defs/stringArray"
+        }
+      }
+    },
+    "thumbnailConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "default": {},
+      "properties": {
+        "content_types": {
+          "$ref": "#/$defs/stringArray"
+        },
+        "minimum_dimension": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 0
+        }
+      }
+    },
+    "unwantedCommunicationReportingConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "default": {},
+      "properties": {
+        "sms_report_destination": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "accessorySetupSupport": {
+      "type": "string",
+      "enum": [
+        "Bluetooth"
+      ]
+    },
+    "exportedTypeDeclarationConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "identifier",
+        "conforms_to"
+      ],
+      "properties": {
+        "identifier": {
+          "type": "string",
+          "minLength": 1
+        },
+        "description": {
+          "type": "string",
+          "minLength": 1
+        },
+        "conforms_to": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "symbol_name": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "accessorySetupConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "default": {},
+      "properties": {
+        "bluetooth_services": {
+          "$ref": "#/$defs/stringArray"
+        },
+        "exported_types": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/exportedTypeDeclarationConfig"
+          }
+        }
+      }
+    },
+    "accessoryDataTransportConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "default": {},
+      "properties": {
+        "bluetooth_services": {
+          "$ref": "#/$defs/stringArray"
+        },
+        "supports": {
+          "type": "array",
+          "default": [
+            "Bluetooth"
+          ],
+          "items": {
+            "$ref": "#/$defs/accessorySetupSupport"
+          }
+        },
+        "exported_types": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/exportedTypeDeclarationConfig"
+          }
+        }
+      }
+    },
+    "backgroundResourceUploadConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "url_base"
+      ],
+      "properties": {
+        "url_base": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "principalClassEntryConfig": {
+      "type": "object",
+      "additionalProperties": false,
       "required": [
         "class"
       ],
@@ -1198,18 +1638,81 @@
       "additionalProperties": false,
       "required": [
         "kind",
-        "sources",
-        "entry"
+        "sources"
       ],
       "properties": {
         "kind": {
           "type": "string",
+          "description": "Closed Orbit extension kind DSL aligned with Xcode application extension templates.",
           "enum": [
             "packet-tunnel",
+            "app-proxy",
+            "filter-control",
+            "filter-data",
+            "dns-proxy",
+            "account-authentication-modification",
             "widget",
             "share",
             "safari",
-            "safari-web"
+            "safari-web",
+            "quick-look-preview",
+            "spotlight-import",
+            "thumbnail",
+            "core-spotlight-delegate",
+            "persistent-token",
+            "xcode-source-editor",
+            "mail",
+            "broadcast-upload",
+            "broadcast-setup-ui",
+            "virtual-conference-provider",
+            "notification-service",
+            "notification-content",
+            "photo-editing",
+            "photo-project",
+            "authentication-services",
+            "action-ui",
+            "action-service",
+            "content-blocker",
+            "classkit-context-provider",
+            "file-provider",
+            "file-provider-ui",
+            "finder-sync",
+            "autofill-credential-provider",
+            "call-directory",
+            "message-filter",
+            "unwanted-communication-reporting",
+            "intents",
+            "intents-ui",
+            "matter",
+            "location-push-service",
+            "print-service",
+            "messages",
+            "audio-unit",
+            "audio-unit-ui",
+            "tv-top-shelf",
+            "custom-keyboard",
+            "smart-card-token",
+            "device-activity-monitor",
+            "shield-action",
+            "shield-configuration",
+            "app-intents",
+            "background-delivery",
+            "background-resource-upload",
+            "background-download",
+            "media-device-discovery",
+            "contact-provider",
+            "translation-provider",
+            "app-migration",
+            "capture",
+            "hotspot-evaluation-provider",
+            "hotspot-authentication-provider",
+            "accessory-setup",
+            "accessory-data-transport",
+            "device-activity-report",
+            "url-filter-network",
+            "live-caller-id-lookup",
+            "identity-document-provider",
+            "file-system"
           ]
         },
         "platforms": {
@@ -1236,6 +1739,63 @@
         },
         "entry": {
           "$ref": "#/$defs/entryConfig"
+        },
+        "action": {
+          "$ref": "#/$defs/actionExtensionConfig"
+        },
+        "account_authentication_modification": {
+          "$ref": "#/$defs/accountAuthenticationModificationConfig"
+        },
+        "broadcast_upload": {
+          "$ref": "#/$defs/broadcastUploadConfig"
+        },
+        "core_spotlight_delegate": {
+          "$ref": "#/$defs/coreSpotlightDelegateConfig"
+        },
+        "file_provider": {
+          "$ref": "#/$defs/fileProviderConfig"
+        },
+        "file_provider_ui": {
+          "$ref": "#/$defs/fileProviderUiConfig"
+        },
+        "intents": {
+          "$ref": "#/$defs/intentsConfig"
+        },
+        "keyboard": {
+          "$ref": "#/$defs/keyboardConfig"
+        },
+        "message_filter": {
+          "$ref": "#/$defs/messageFilterConfig"
+        },
+        "notification_content": {
+          "$ref": "#/$defs/notificationContentConfig"
+        },
+        "persistent_token": {
+          "$ref": "#/$defs/persistentTokenConfig"
+        },
+        "photo_project": {
+          "$ref": "#/$defs/photoProjectConfig"
+        },
+        "quick_look_preview": {
+          "$ref": "#/$defs/quickLookPreviewConfig"
+        },
+        "spotlight_import": {
+          "$ref": "#/$defs/spotlightImportConfig"
+        },
+        "thumbnail": {
+          "$ref": "#/$defs/thumbnailConfig"
+        },
+        "unwanted_communication_reporting": {
+          "$ref": "#/$defs/unwantedCommunicationReportingConfig"
+        },
+        "accessory_setup": {
+          "$ref": "#/$defs/accessorySetupConfig"
+        },
+        "accessory_data_transport": {
+          "$ref": "#/$defs/accessoryDataTransportConfig"
+        },
+        "background_resource_upload": {
+          "$ref": "#/$defs/backgroundResourceUploadConfig"
         }
       }
     },
@@ -1290,7 +1850,7 @@
           "$ref": "#/$defs/entitlementsManifest"
         },
         "entry": {
-          "$ref": "#/$defs/entryConfig"
+          "$ref": "#/$defs/principalClassEntryConfig"
         }
       }
     },

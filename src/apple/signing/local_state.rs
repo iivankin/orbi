@@ -617,6 +617,33 @@ fn ensure_keychain_in_search_list(keychain_path: &str) -> Result<()> {
     run_command(&mut update)
 }
 
+fn select_identity_hash(
+    identities: &HashMap<String, String>,
+    certificate_serials: &HashMap<String, String>,
+    target_serial: &str,
+    expected_common_name: Option<&str>,
+) -> Option<String> {
+    if let Some((hash, _)) = certificate_serials.iter().find(|(hash, serial)| {
+        identities.contains_key(*hash) && serial.eq_ignore_ascii_case(target_serial)
+    }) {
+        return Some(hash.clone());
+    }
+
+    if let Some(expected_common_name) = expected_common_name
+        && let Some((hash, _)) = identities
+            .iter()
+            .find(|(_, name)| name.as_str() == expected_common_name)
+    {
+        return Some(hash.clone());
+    }
+
+    if identities.len() == 1 {
+        return identities.keys().next().cloned();
+    }
+
+    None
+}
+
 pub(super) fn resolve_signing_identity(
     project: &ProjectContext,
     certificate: &ManagedCertificate,
@@ -700,25 +727,37 @@ pub(super) fn resolve_signing_identity(
 
     let expected_common_name = read_der_certificate_common_name(&certificate.certificate_der_path)?
         .or_else(|| certificate.display_name.clone());
+    let mut identities = HashMap::new();
     for policy in ["codesigning", "basic"] {
-        let identities = keychain_identities(keychain_str, policy)?;
-        if let Some(expected_common_name) = expected_common_name.as_ref()
-            && let Some((hash, _)) = identities
-                .iter()
-                .find(|(_, name)| name == expected_common_name)
-        {
-            return Ok(SigningIdentity {
-                hash: hash.clone(),
-                keychain_path: keychain_path.clone(),
-            });
+        for (hash, name) in keychain_identities(keychain_str, policy)? {
+            identities.entry(hash).or_insert(name);
         }
+    }
 
-        if let [identity] = identities.as_slice() {
-            return Ok(SigningIdentity {
-                hash: identity.0.clone(),
-                keychain_path: keychain_path.clone(),
-            });
+    let mut certificate_serials = HashMap::new();
+    for (hash, pem) in keychain_certificate_records(keychain_str)? {
+        if !identities.contains_key(&hash) {
+            continue;
         }
+        let temp = NamedTempFile::new()?;
+        fs::write(temp.path(), pem.as_bytes())
+            .with_context(|| format!("failed to write {}", temp.path().display()))?;
+        let serial = read_certificate_serial_pem(temp.path())?;
+        certificate_serials.insert(hash, serial);
+    }
+
+    // Match by serial first so package signing does not accidentally reuse the app
+    // codesigning identity when both certificates are present in the Orbit keychain.
+    if let Some(hash) = select_identity_hash(
+        &identities,
+        &certificate_serials,
+        &certificate.serial_number,
+        expected_common_name.as_deref(),
+    ) {
+        return Ok(SigningIdentity {
+            hash,
+            keychain_path: keychain_path.clone(),
+        });
     }
 
     bail!(
@@ -754,7 +793,9 @@ fn pkcs12_legacy_flag_is_unsupported(stdout: &str, stderr: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::pkcs12_legacy_flag_is_unsupported;
+    use std::collections::HashMap;
+
+    use super::{pkcs12_legacy_flag_is_unsupported, select_identity_hash};
 
     #[test]
     fn detects_libressl_rejecting_legacy_flag() {
@@ -778,5 +819,67 @@ mod tests {
             "",
             "pkcs12: Can't open input file missing.p12\n"
         ));
+    }
+
+    #[test]
+    fn selects_identity_by_serial_before_single_policy_fallback() {
+        let identities = HashMap::from([
+            (
+                "APP_HASH".to_owned(),
+                "Developer ID Application: Example Corp (TEAMID)".to_owned(),
+            ),
+            (
+                "INSTALLER_HASH".to_owned(),
+                "Developer ID Installer: Example Corp (TEAMID)".to_owned(),
+            ),
+        ]);
+        let certificate_serials = HashMap::from([
+            ("APP_HASH".to_owned(), "AAA111".to_owned()),
+            ("INSTALLER_HASH".to_owned(), "BBB222".to_owned()),
+        ]);
+
+        let selected = select_identity_hash(
+            &identities,
+            &certificate_serials,
+            "bbb222",
+            Some("Developer ID Installer: Example Corp (TEAMID)"),
+        );
+
+        assert_eq!(selected.as_deref(), Some("INSTALLER_HASH"));
+    }
+
+    #[test]
+    fn falls_back_to_expected_common_name_when_serials_are_missing() {
+        let identities = HashMap::from([
+            (
+                "INSTALLER_HASH".to_owned(),
+                "Developer ID Installer: Example Corp (TEAMID)".to_owned(),
+            ),
+            (
+                "APP_HASH".to_owned(),
+                "Developer ID Application: Example Corp (TEAMID)".to_owned(),
+            ),
+        ]);
+
+        let selected = select_identity_hash(
+            &identities,
+            &HashMap::new(),
+            "unused",
+            Some("Developer ID Installer: Example Corp (TEAMID)"),
+        );
+
+        assert_eq!(selected.as_deref(), Some("INSTALLER_HASH"));
+    }
+
+    #[test]
+    fn falls_back_to_single_identity_only_after_other_matches_fail() {
+        let identities = HashMap::from([(
+            "ONLY_HASH".to_owned(),
+            "Developer ID Application: Example Corp (TEAMID)".to_owned(),
+        )]);
+
+        let selected = select_identity_hash(&identities, &HashMap::new(), "unused", None);
+
+        assert_eq!(selected.as_deref(), Some("ONLY_HASH"));
     }
 }

@@ -110,6 +110,75 @@ Orbit nests related targets inside the app manifest:
 - `watch`
 - `app_clip`
 
+For `extensions.*.kind`, Orbit uses a closed enum-style DSL aligned with Xcode
+application extension templates.
+
+- Principal-class kinds such as `packet-tunnel`, `finder-sync`,
+  `notification-service`, and `photo-project` require `entry.class`.
+- Storyboard-backed kinds such as `share`, `action-ui`,
+  `notification-content`, `messages`, `file-provider-ui`, and
+  `account-authentication-modification` default to `MainInterface`; set
+  `entry.storyboard` only when you need a different storyboard name.
+- `widget` and ExtensionKit kinds such as `app-intents`,
+  `contact-provider`, `translation-provider`, `background-download`, and
+  `file-system` omit `entry` entirely.
+- The DSL intentionally covers concrete Xcode application extension templates.
+  Placeholder `Generic Extension` and sticker-pack product types stay outside
+  the ordinary `extensions` shape.
+
+Some extension kinds also expose first-class DSL blocks for the
+template-specific `Info.plist` keys Xcode usually injects:
+
+- `action` for `share`, `action-ui`, `action-service`, and
+  `broadcast-setup-ui`
+- `account_authentication_modification`
+- `core_spotlight_delegate`
+- `broadcast_upload`
+- `file_provider`
+- `file_provider_ui`
+- `intents`
+- `keyboard`
+- `message_filter`
+- `notification_content`
+- `persistent_token`
+- `photo_project`
+- `quick_look_preview`
+- `spotlight_import`
+- `thumbnail`
+- `unwanted_communication_reporting`
+- `accessory_setup`
+- `accessory_data_transport`
+- `background_resource_upload`
+
+Example:
+
+```json
+"extensions": {
+  "provider": {
+    "kind": "file-provider",
+    "sources": ["Sources/FileProviderExtension"],
+    "entry": {
+      "class": "FileProviderExtension"
+    },
+    "entitlements": {
+      "app_groups": ["group.dev.orbit.files"]
+    },
+    "file_provider": {
+      "document_group": "group.dev.orbit.files",
+      "supports_enumeration": true
+    }
+  },
+  "notification": {
+    "kind": "notification-content",
+    "sources": ["Sources/NotificationContentExtension"],
+    "notification_content": {
+      "categories": ["comment"],
+      "initial_content_size_ratio": 1.0
+    }
+  }
+}
+```
+
 Use those only when they are part of the same product identity. If they are
 standalone products, give them their own manifest.
 

@@ -19,11 +19,11 @@ use crate::apple::build::external::{
     XcframeworkLibrary, ordered_package_targets, select_xcframework_library,
 };
 use crate::context::{AppContext, GlobalPaths, ProjectContext, ProjectPaths};
+use crate::manifest::{ExtensionEntry, ExtensionRuntime, ManifestSchema, ResolvedManifest};
 #[cfg(target_os = "macos")]
 use crate::manifest::{
     IosDeviceFamily, IosInterfaceOrientation, IosSupportedOrientationsManifest, IosTargetManifest,
 };
-use crate::manifest::{ManifestSchema, ResolvedManifest};
 
 fn fixture(path: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(path)
@@ -153,6 +153,58 @@ fn writes_ios_app_defaults_without_scene_manifest_inference() {
     assert_eq!(
         std::fs::read_to_string(bundle_root.join("PkgInfo")).unwrap(),
         "APPL????"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn writes_extension_top_level_info_plist_extra() {
+    let (temp, project) = project_for_fixture("examples/ios-app-extension/orbit.json");
+    let mut target = project
+        .resolved_manifest
+        .resolve_target(Some("TunnelExtension"))
+        .unwrap()
+        .clone();
+    target.extension.as_mut().unwrap().info_plist_extra.insert(
+        "CFBundleDocumentTypes".to_owned(),
+        json!([{
+            "CFBundleTypeRole": "Editor",
+            "LSItemContentTypes": ["dev.orbit.examples.extensionapp.tunnel-document"]
+        }]),
+    );
+    let bundle_root = temp.path().join("TunnelExtension.appex");
+    std::fs::create_dir_all(&bundle_root).unwrap();
+    let toolchain = Toolchain {
+        platform: ApplePlatform::Ios,
+        destination: DestinationKind::Device,
+        sdk_name: "iphoneos".to_owned(),
+        sdk_path: PathBuf::from("/tmp/iphoneos.sdk"),
+        deployment_target: "18.0".to_owned(),
+        architecture: "arm64".to_owned(),
+        target_triple: "arm64-apple-ios18.0".to_owned(),
+        selected_xcode: None,
+    };
+
+    write_info_plist(&project, &toolchain, &target, &bundle_root).unwrap();
+
+    let plist = Value::from_file(bundle_root.join("Info.plist")).unwrap();
+    let dict = plist.as_dictionary().unwrap();
+    assert_eq!(
+        dict.get("CFBundleDocumentTypes"),
+        Some(&Value::Array(vec![Value::Dictionary(
+            Dictionary::from_iter([
+                (
+                    "CFBundleTypeRole".to_owned(),
+                    Value::String("Editor".to_owned()),
+                ),
+                (
+                    "LSItemContentTypes".to_owned(),
+                    Value::Array(vec![Value::String(
+                        "dev.orbit.examples.extensionapp.tunnel-document".to_owned(),
+                    )]),
+                ),
+            ])
+        )]))
     );
 }
 
@@ -501,8 +553,10 @@ fn embeds_app_clips_into_appclips_directory() {
 #[test]
 fn preserves_extra_extension_entries() {
     let extension = ExtensionManifest {
+        runtime: ExtensionRuntime::NsExtension,
+        entry: ExtensionEntry::None,
         point_identifier: "com.apple.widgetkit-extension".to_owned(),
-        principal_class: "WidgetPrincipal".to_owned(),
+        info_plist_extra: BTreeMap::new(),
         extra: BTreeMap::from([(
             "NSExtensionAttributes".to_owned(),
             json!({
@@ -538,6 +592,33 @@ fn preserves_extra_extension_entries() {
             .unwrap(),
         "dev.orbit.examples.watch.watchkitapp"
     );
+}
+
+#[test]
+fn serializes_extensionkit_entries_into_ex_app_extension_attributes() {
+    let extension = ExtensionManifest {
+        runtime: ExtensionRuntime::ExtensionKit,
+        entry: ExtensionEntry::PrincipalClass("AppIntentsExtension".to_owned()),
+        point_identifier: "com.apple.appintents-extension".to_owned(),
+        info_plist_extra: BTreeMap::new(),
+        extra: BTreeMap::new(),
+    };
+
+    let plist = extension_plist(&extension).unwrap();
+
+    assert_eq!(
+        plist
+            .get("EXExtensionPointIdentifier")
+            .and_then(plist::Value::as_string),
+        Some("com.apple.appintents-extension")
+    );
+    assert_eq!(
+        plist
+            .get("EXPrincipalClass")
+            .and_then(plist::Value::as_string),
+        Some("AppIntentsExtension")
+    );
+    assert!(plist.get("NSExtensionPointIdentifier").is_none());
 }
 
 #[test]

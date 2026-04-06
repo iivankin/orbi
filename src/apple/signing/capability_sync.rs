@@ -2,7 +2,18 @@ use std::collections::HashMap;
 
 use super::cleanup::collect_identifier_values;
 use super::*;
-use crate::apple::provisioning::ProvisioningCapabilityPatch;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum DeveloperServicesCapabilityMutation {
+    Create(CapabilityUpdate),
+    Update {
+        remote_id: String,
+        update: CapabilityUpdate,
+    },
+    Delete {
+        remote_id: String,
+    },
+}
 
 fn entitlement_dictionary_for_capability_sync(
     project: &ProjectContext,
@@ -32,6 +43,16 @@ fn capability_sync_options_for_target(target: &TargetManifest) -> CapabilitySync
             .as_ref()
             .is_some_and(|push| push.broadcast_for_live_activities),
     }
+}
+
+pub(super) fn should_skip_capability_sync(
+    target: &TargetManifest,
+    capability_sync_options: &CapabilitySyncOptions,
+    remote_capabilities: &[RemoteCapability],
+) -> bool {
+    target.entitlements.is_none()
+        && !capability_sync_options.uses_push_notifications
+        && remote_capabilities.is_empty()
 }
 
 pub(super) fn validate_push_setup_with_api_key(target: &TargetManifest) -> CapabilitySyncOptions {
@@ -75,9 +96,6 @@ pub(super) fn sync_capabilities_with_api_key(
     bundle_id: &Resource<BundleIdAttributes>,
 ) -> Result<CapabilitySyncOutcome> {
     let capability_sync_options = validate_push_setup_with_api_key(target);
-    if target.entitlements.is_none() && !capability_sync_options.uses_push_notifications {
-        return Ok(CapabilitySyncOutcome::Skipped);
-    }
     let remote_bundle = client
         .find_bundle_id(&bundle_id.attributes.identifier)?
         .with_context(|| {
@@ -87,6 +105,9 @@ pub(super) fn sync_capabilities_with_api_key(
             )
         })?;
     let remote_capabilities = remote_capabilities_from_included(&remote_bundle.included)?;
+    if should_skip_capability_sync(target, &capability_sync_options, &remote_capabilities) {
+        return Ok(CapabilitySyncOutcome::Skipped);
+    }
     let plan = capability_sync_plan_for_target(
         project,
         target,
@@ -240,13 +261,9 @@ pub(super) fn asc_capability_settings(update: &CapabilityUpdate) -> Result<Vec<C
 
 pub(super) fn ensure_bundle_id_with_developer_services(
     provisioning: &mut ProvisioningClient,
-    project: &ProjectContext,
     target: &TargetManifest,
 ) -> Result<ProvisioningBundleId> {
-    provisioning.ensure_bundle_id(
-        &orbit_managed_app_name(&project.resolved_manifest.name),
-        &target.bundle_id,
-    )
+    provisioning.ensure_bundle_id(&target.bundle_id)
 }
 
 pub(super) fn sync_capabilities(
@@ -256,7 +273,7 @@ pub(super) fn sync_capabilities(
     bundle_id: &ProvisioningBundleId,
 ) -> Result<CapabilitySyncOutcome> {
     let capability_sync_options = capability_sync_options_for_target(target);
-    if target.entitlements.is_none() && !capability_sync_options.uses_push_notifications {
+    if should_skip_capability_sync(target, &capability_sync_options, &bundle_id.capabilities) {
         return Ok(CapabilitySyncOutcome::Skipped);
     }
     let plan = capability_sync_plan_for_target(
@@ -291,52 +308,76 @@ pub(super) fn sync_capabilities(
         .updates
         .iter()
         .map(|update| {
-            let remote_id = bundle_id
-                .capabilities
-                .iter()
-                .find(|candidate| candidate.capability_type == update.capability_type)
-                .map(|candidate| candidate.id.clone());
-            Ok(ProvisioningCapabilityPatch {
-                remote_id,
-                update: CapabilityUpdate {
-                    capability_type: update.capability_type.clone(),
-                    option: update.option.clone(),
-                    relationships: CapabilityRelationships {
-                        app_groups: map_relationship_ids(
-                            update.relationships.app_groups.as_deref(),
-                            &app_group_ids,
-                        )?,
-                        merchant_ids: map_relationship_ids(
-                            update.relationships.merchant_ids.as_deref(),
-                            &merchant_ids,
-                        )?,
-                        cloud_containers: map_relationship_ids(
-                            update.relationships.cloud_containers.as_deref(),
-                            &cloud_container_ids,
-                        )?,
-                    },
+            Ok(CapabilityUpdate {
+                capability_type: update.capability_type.clone(),
+                option: update.option.clone(),
+                relationships: CapabilityRelationships {
+                    app_groups: map_relationship_ids(
+                        update.relationships.app_groups.as_deref(),
+                        &app_group_ids,
+                    )?,
+                    merchant_ids: map_relationship_ids(
+                        update.relationships.merchant_ids.as_deref(),
+                        &merchant_ids,
+                    )?,
+                    cloud_containers: map_relationship_ids(
+                        update.relationships.cloud_containers.as_deref(),
+                        &cloud_container_ids,
+                    )?,
                 },
             })
         })
         .collect::<Result<Vec<_>>>()?;
-    let (deletes, upserts): (Vec<_>, Vec<_>) = updates
-        .into_iter()
-        .partition(|update| update.update.option == ASC_OPTION_OFF);
-    for delete in deletes {
-        if delete.update.capability_type == "ASSOCIATED_DOMAINS" {
-            // Xcode does not emit a matching disable mutation when users remove
-            // Associated Domains in Signing & Capabilities, so keep the remote
-            // capability untouched to stay aligned with Apple tooling.
+    // Xcode applies Developer Services capability changes as per-resource
+    // bundleIdCapabilities mutations, so keep Orbit on that transport too.
+    let mutations = plan_developer_services_capability_mutations(&updates, &bundle_id.capabilities);
+    if mutations.is_empty() {
+        return Ok(CapabilitySyncOutcome::NoUpdates);
+    }
+    let applied_count = mutations.len();
+    for mutation in mutations {
+        match mutation {
+            DeveloperServicesCapabilityMutation::Create(update) => {
+                provisioning.create_bundle_capability(&bundle_id.id, &update)?;
+            }
+            DeveloperServicesCapabilityMutation::Update { remote_id, update } => {
+                provisioning.update_bundle_capability(&remote_id, &bundle_id.id, &update)?;
+            }
+            DeveloperServicesCapabilityMutation::Delete { remote_id } => {
+                provisioning.delete_bundle_capability(&remote_id)?;
+            }
+        }
+    }
+    Ok(CapabilitySyncOutcome::Updated(applied_count))
+}
+
+pub(super) fn plan_developer_services_capability_mutations(
+    updates: &[CapabilityUpdate],
+    remote_capabilities: &[RemoteCapability],
+) -> Vec<DeveloperServicesCapabilityMutation> {
+    let mut mutations = Vec::new();
+    for update in updates {
+        let remote_id = remote_capabilities
+            .iter()
+            .find(|candidate| candidate.capability_type == update.capability_type)
+            .map(|candidate| candidate.id.clone());
+        if update.option == ASC_OPTION_OFF {
+            if let Some(remote_id) = remote_id {
+                mutations.push(DeveloperServicesCapabilityMutation::Delete { remote_id });
+            }
             continue;
         }
-        if let Some(remote_id) = delete.remote_id.as_deref() {
-            provisioning.delete_bundle_capability(remote_id)?;
-        }
+
+        let mutation = match remote_id {
+            Some(remote_id) => DeveloperServicesCapabilityMutation::Update {
+                remote_id,
+                update: update.clone(),
+            },
+            None => DeveloperServicesCapabilityMutation::Create(update.clone()),
+        };
+        mutations.push(mutation);
     }
-    if !upserts.is_empty() {
-        provisioning.update_bundle_capabilities(bundle_id, &upserts)?;
-    }
-    Ok(CapabilitySyncOutcome::Updated(plan.updates.len()))
+    mutations
 }
 
 fn resolve_app_group_ids(

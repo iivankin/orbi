@@ -249,7 +249,7 @@ impl DeveloperServicesClient {
         team_id: Option<&str>,
         body: Option<serde_json::Value>,
     ) -> Result<Response> {
-        let url = format!("{DEVELOPER_SERVICES_V2_BASE_URL}/services/v1/{path}");
+        let url = format!("{}/services/v1/{path}", json_base_url_for_path(path));
         let mut headers = self.json_headers()?;
 
         let (actual_method, payload) = if matches!(method, &Method::GET | &Method::DELETE) {
@@ -345,6 +345,11 @@ impl DeveloperServicesClient {
     }
 }
 
+fn json_base_url_for_path(path: &str) -> &'static str {
+    let _ = path;
+    DEVELOPER_SERVICES_V2_BASE_URL
+}
+
 struct DeveloperServicesResponse {
     status: reqwest::StatusCode,
     headers: HeaderMap,
@@ -398,6 +403,34 @@ fn push_query_pair(encoded: &mut String, key: &str, value: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bundle_capabilities_use_developer_services_v2_host() {
+        assert_eq!(
+            json_base_url_for_path("bundleIdCapabilities/CAP123"),
+            DEVELOPER_SERVICES_V2_BASE_URL
+        );
+    }
+
+    #[test]
+    fn app_groups_use_developer_services_v2_host() {
+        assert_eq!(
+            json_base_url_for_path("appGroups"),
+            DEVELOPER_SERVICES_V2_BASE_URL
+        );
+    }
+
+    #[test]
+    fn other_resources_keep_developer_services_v2_host() {
+        assert_eq!(
+            json_base_url_for_path("bundleIds"),
+            DEVELOPER_SERVICES_V2_BASE_URL
+        );
+        assert_eq!(
+            json_base_url_for_path("profiles/ABC123"),
+            DEVELOPER_SERVICES_V2_BASE_URL
+        );
+    }
 
     #[test]
     fn download_authorization_success_response_requires_result_code_zero() {

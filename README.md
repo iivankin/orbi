@@ -291,8 +291,11 @@ Rules:
 
 - The object key is the extension's stable local id.
 - Orbit can use that key as the default bundle id suffix.
-- `kind` is Orbit vocabulary, not a raw Apple plist key.
-- `entry.class` is the extension entry class when that extension type needs one.
+- `kind` is a closed Orbit DSL that maps to concrete Xcode application extension templates.
+- Principal-class kinds such as `packet-tunnel`, `finder-sync`, `notification-service`, and `photo-project` require `entry.class`.
+- Storyboard-backed kinds such as `share`, `action-ui`, `notification-content`, `messages`, `file-provider-ui`, and `account-authentication-modification` default to `entry.storyboard = "MainInterface"` and only need `entry` if you want a different storyboard name.
+- `widget` and ExtensionKit kinds such as `app-intents`, `contact-provider`, `translation-provider`, `background-download`, and `file-system` omit `entry` entirely.
+- The closed DSL covers concrete Xcode application extension templates. Placeholder `Generic Extension` and special sticker-pack product types are not modeled as ordinary `extensions`.
 
 Examples of things that belong in `extensions`:
 
@@ -300,6 +303,100 @@ Examples of things that belong in `extensions`:
 - widgets
 - share extensions
 - Safari extensions
+
+Examples:
+
+```json
+"extensions": {
+  "tunnel": {
+    "kind": "packet-tunnel",
+    "sources": ["Sources/TunnelExtension"],
+    "entry": {
+      "class": "PacketTunnelProvider"
+    }
+  },
+  "share": {
+    "kind": "share",
+    "sources": ["Sources/ShareExtension"]
+  },
+  "widget": {
+    "kind": "widget",
+    "sources": ["Sources/WidgetExtension"]
+  },
+  "intents": {
+    "kind": "app-intents",
+    "sources": ["Sources/AppIntentsExtension"]
+  }
+}
+```
+
+Several extension kinds also expose first-class config blocks for the
+template-specific `Info.plist` keys that Xcode normally synthesizes:
+
+- `action` for `share`, `action-ui`, `action-service`, and
+  `broadcast-setup-ui`
+- `account_authentication_modification` for
+  `account-authentication-modification`
+- `core_spotlight_delegate` for `core-spotlight-delegate`
+- `broadcast_upload` for `broadcast-upload`
+- `file_provider` for `file-provider`
+- `file_provider_ui` for `file-provider-ui`
+- `intents` for `intents` and `intents-ui`
+- `keyboard` for `custom-keyboard`
+- `message_filter` for `message-filter`
+- `notification_content` for `notification-content`
+- `persistent_token` for `persistent-token`
+- `photo_project` for `photo-project`
+- `quick_look_preview` for `quick-look-preview`
+- `spotlight_import` for `spotlight-import`
+- `thumbnail` for `thumbnail`
+- `unwanted_communication_reporting` for
+  `unwanted-communication-reporting`
+- `accessory_setup` for `accessory-setup`
+- `accessory_data_transport` for `accessory-data-transport`
+- `background_resource_upload` for `background-resource-upload`
+
+Examples:
+
+```json
+"extensions": {
+  "provider": {
+    "kind": "file-provider",
+    "sources": ["Sources/FileProviderExtension"],
+    "entry": {
+      "class": "FileProviderExtension"
+    },
+    "entitlements": {
+      "app_groups": ["group.dev.orbit.files"]
+    },
+    "file_provider": {
+      "document_group": "group.dev.orbit.files",
+      "supports_enumeration": true
+    }
+  },
+  "provider-ui": {
+    "kind": "file-provider-ui",
+    "sources": ["Sources/FileProviderUIExtension"],
+    "file_provider_ui": {
+      "actions": [
+        {
+          "identifier": "dev.orbit.files.share",
+          "name": "Share",
+          "activation_rule": "TRUEPREDICATE"
+        }
+      ]
+    }
+  },
+  "notification": {
+    "kind": "notification-content",
+    "sources": ["Sources/NotificationContentExtension"],
+    "notification_content": {
+      "categories": ["comment", "follow"],
+      "initial_content_size_ratio": 1.0
+    }
+  }
+}
+```
 
 ### Watch
 

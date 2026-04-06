@@ -1,14 +1,15 @@
 use std::collections::HashSet;
 
+use anyhow::Error;
 use anyhow::Result;
 
 use super::{
     CapabilityRelationships, CapabilityUpdate, ProjectContext, ProvisioningClient,
     delete_certificate_files, delete_file_if_exists, delete_p12_password, identifier_name,
-    load_state, orbit_managed_app_name, resolve_local_team_id, resolve_local_team_id_if_known,
-    save_state,
+    load_state, resolve_local_team_id, resolve_local_team_id_if_known, save_state,
 };
 use crate::apple::capabilities::capability_sync_plan_from_entitlements;
+use crate::apple::provisioning::developer_services_bundle_id_name;
 
 #[derive(Debug, Clone, Default)]
 pub struct LocalSigningCleanSummary {
@@ -81,7 +82,6 @@ pub fn clean_remote_signing_state(project: &ProjectContext) -> Result<RemoteSign
     let mut provisioning = ProvisioningClient::authenticate(&project.app, team_id.clone())?;
     let state = load_state(project, &team_id)?;
     let bundle_ids = project_bundle_ids(project);
-    let orbit_app_name = orbit_managed_app_name(&project.resolved_manifest.name);
     let mut summary = RemoteSigningCleanSummary::default();
 
     let stored_project_profile_ids = state
@@ -96,7 +96,7 @@ pub fn clean_remote_signing_state(project: &ProjectContext) -> Result<RemoteSign
         &stored_project_profile_ids,
         &mut summary,
     )?;
-    remove_orbit_managed_bundle_ids(&mut provisioning, project, &orbit_app_name, &mut summary)?;
+    remove_orbit_managed_bundle_ids(&mut provisioning, project, &mut summary)?;
 
     let ProjectEntitlementIdentifiers {
         app_groups,
@@ -135,12 +135,11 @@ fn remove_orbit_managed_profiles(
 fn remove_orbit_managed_bundle_ids(
     provisioning: &mut ProvisioningClient,
     project: &ProjectContext,
-    orbit_app_name: &str,
     summary: &mut RemoteSigningCleanSummary,
 ) -> Result<()> {
     for target in &project.resolved_manifest.targets {
         if let Some(bundle_id) = provisioning.find_bundle_id(&target.bundle_id)?
-            && bundle_id.name == orbit_app_name
+            && bundle_id.name == developer_services_bundle_id_name(&target.bundle_id)
         {
             provisioning.delete_bundle_id(&bundle_id.id)?;
             summary.removed_apps += 1;
@@ -196,11 +195,30 @@ fn remove_orbit_managed_cloud_containers(
             container.identifier == identifier
                 && container.name == identifier_name("iCloud Container", &identifier)
         }) {
-            provisioning.delete_cloud_container(&container.id)?;
+            if let Err(error) = provisioning.delete_cloud_container(&container.id) {
+                if cloud_container_delete_is_forbidden(&error) {
+                    // Live Apple account runs currently get a DS 403 here even after the
+                    // bundle ID and capabilities are gone. Xcode's private framework shows
+                    // explicit create/list flows for registered identifiers, but no dedicated
+                    // cloud-container removal path we can mirror yet. Do not fail `clean --all`
+                    // on this backend restriction.
+                    continue;
+                }
+                return Err(error);
+            }
             summary.removed_cloud_containers += 1;
         }
     }
     Ok(())
+}
+
+fn cloud_container_delete_is_forbidden(error: &Error) -> bool {
+    let message = error.to_string();
+    message.contains("cloudContainers/")
+        && message.contains("403 Forbidden")
+        && (message.contains("FORBIDDEN_ERROR")
+            || message.contains("forbidden for security reasons")
+            || message.contains("API key in use does not allow this request"))
 }
 
 fn project_bundle_ids(project: &ProjectContext) -> HashSet<String> {
@@ -266,4 +284,21 @@ fn sorted_strings(values: HashSet<String>) -> Vec<String> {
     let mut values = values.into_iter().collect::<Vec<_>>();
     values.sort();
     values
+}
+
+#[cfg(test)]
+mod tests {
+    use anyhow::anyhow;
+
+    use super::cloud_container_delete_is_forbidden;
+
+    #[test]
+    fn detects_forbidden_cloud_container_delete_errors() {
+        assert!(cloud_container_delete_is_forbidden(&anyhow!(
+            "developer services request `cloudContainers/ABC123` failed with 403 Forbidden: {{\"errors\":[{{\"code\":\"FORBIDDEN_ERROR\",\"detail\":\"The API key in use does not allow this request\"}}]}}"
+        )));
+        assert!(!cloud_container_delete_is_forbidden(&anyhow!(
+            "developer services request `merchantIds/ABC123` failed with 403 Forbidden"
+        )));
+    }
 }

@@ -251,7 +251,19 @@ pub fn prepare_macos_bundle_for_debug_tracing(
 }
 
 fn identifier_name(prefix: &str, identifier: &str) -> String {
-    format!("{prefix} {identifier}")
+    // Developer Services rejects human-readable names that keep portal identifiers
+    // verbatim with dots; match Xcode's habit of normalizing punctuation to spaces.
+    let normalized_identifier = identifier
+        .chars()
+        .map(|character| match character {
+            'a'..='z' | 'A'..='Z' | '0'..='9' => character,
+            _ => ' ',
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!("{prefix} {normalized_identifier}")
 }
 
 fn orbit_managed_app_name(name: &str) -> String {
