@@ -7,7 +7,6 @@ use anyhow::{Context, Result, bail};
 
 use crate::apple;
 use crate::context::AppContext;
-use crate::manifest::installed_schema_path;
 use crate::util::{print_success, prompt_input, prompt_select, resolve_path};
 
 use self::naming::{bundle_id_suffix, looks_like_bundle_id, suggested_product_name};
@@ -41,8 +40,8 @@ pub fn execute(app: &AppContext, requested_manifest: Option<&Path>) -> Result<()
     let project_root = manifest_path
         .parent()
         .context("manifest path did not contain a parent directory")?;
-    let answers = collect_init_answers(project_root)?;
-    let schema_reference = installed_schema_reference(app, answers.ecosystem);
+    let answers = collect_init_answers(app, project_root)?;
+    let schema_reference = published_schema_reference(answers.ecosystem);
     let plan = scaffold_plan(&answers, &schema_reference);
 
     create_scaffold(project_root, &manifest_path, &plan)?;
@@ -65,7 +64,7 @@ fn init_manifest_path(app: &AppContext, requested_manifest: Option<&Path>) -> Pa
     )
 }
 
-fn collect_init_answers(project_root: &Path) -> Result<InitAnswers> {
+fn collect_init_answers(app: &AppContext, project_root: &Path) -> Result<InitAnswers> {
     let ecosystem = prompt_ecosystem()?;
     let default_name = suggested_product_name(project_root);
     let name = prompt_non_empty("Product name", Some(default_name.as_str()))?;
@@ -77,12 +76,14 @@ fn collect_init_answers(project_root: &Path) -> Result<InitAnswers> {
         "Enter a reverse-DNS bundle ID like `dev.orbit.exampleapp`.",
     )?;
     let template = prompt_template(ecosystem)?;
+    let team_id = prompt_team_id(app, ecosystem)?;
 
     Ok(InitAnswers {
         ecosystem,
         name,
         bundle_id,
         template,
+        team_id,
     })
 }
 
@@ -105,14 +106,18 @@ fn prompt_template(ecosystem: InitEcosystem) -> Result<InitTemplate> {
     Ok(choices[index].kind)
 }
 
+fn prompt_team_id(app: &AppContext, ecosystem: InitEcosystem) -> Result<Option<String>> {
+    match ecosystem {
+        InitEcosystem::Apple => Ok(Some(apple::auth::select_team_id_for_init(app)?)),
+    }
+}
+
 fn render_template_label(choice: &TemplateChoice) -> String {
     format!("{}: {}", choice.label, choice.description)
 }
 
-fn installed_schema_reference(app: &AppContext, ecosystem: InitEcosystem) -> String {
-    installed_schema_path(&app.global_paths.schema_dir, ecosystem.manifest_schema())
-        .display()
-        .to_string()
+fn published_schema_reference(ecosystem: InitEcosystem) -> String {
+    ecosystem.manifest_schema().as_str().to_owned()
 }
 
 fn prompt_non_empty(prompt: &str, default: Option<&str>) -> Result<String> {

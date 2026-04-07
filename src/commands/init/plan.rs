@@ -139,6 +139,7 @@ pub(super) struct InitAnswers {
     pub(super) name: String,
     pub(super) bundle_id: String,
     pub(super) template: InitTemplate,
+    pub(super) team_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -287,26 +288,28 @@ fn app_template_plan(
 
 fn watch_companion_plan(answers: &InitAnswers, schema_reference: &str) -> ScaffoldPlan {
     let swift_name = swift_type_name(&answers.name);
-    ScaffoldPlan {
-        manifest: json!({
-            "$schema": schema_reference,
-            "name": answers.name,
-            "bundle_id": answers.bundle_id,
-            "version": DEFAULT_VERSION,
-            "build": DEFAULT_BUILD,
-            "platforms": platform_manifest(&IOS_WATCH_PLATFORMS),
-            "sources": [DEFAULT_SOURCE_DIR],
-            "resources": [DEFAULT_RESOURCES_DIR],
-            "watch": {
-                "sources": [DEFAULT_WATCH_APP_SOURCE_DIR],
-                "extension": {
-                    "sources": [DEFAULT_WATCH_EXTENSION_SOURCE_DIR],
-                    "entry": {
-                        "class": "WatchExtensionDelegate"
-                    }
+    let mut manifest = json!({
+        "$schema": schema_reference,
+        "name": answers.name,
+        "bundle_id": answers.bundle_id,
+        "version": DEFAULT_VERSION,
+        "build": DEFAULT_BUILD,
+        "platforms": platform_manifest(&IOS_WATCH_PLATFORMS),
+        "sources": [DEFAULT_SOURCE_DIR],
+        "resources": [DEFAULT_RESOURCES_DIR],
+        "watch": {
+            "sources": [DEFAULT_WATCH_APP_SOURCE_DIR],
+            "extension": {
+                "sources": [DEFAULT_WATCH_EXTENSION_SOURCE_DIR],
+                "entry": {
+                    "class": "WatchExtensionDelegate"
                 }
             }
-        }),
+        }
+    });
+    insert_optional_team_id(&mut manifest, answers.team_id.as_deref());
+    ScaffoldPlan {
+        manifest,
         directories: [
             DEFAULT_SOURCE_DIR,
             DEFAULT_RESOURCES_DIR,
@@ -358,7 +361,7 @@ fn app_manifest(
     schema_reference: &str,
     platforms: &[ManifestPlatform],
 ) -> JsonValue {
-    json!({
+    let mut manifest = json!({
         "$schema": schema_reference,
         "name": answers.name,
         "bundle_id": answers.bundle_id,
@@ -367,7 +370,9 @@ fn app_manifest(
         "platforms": platform_manifest(platforms),
         "sources": [DEFAULT_SOURCE_DIR],
         "resources": [DEFAULT_RESOURCES_DIR]
-    })
+    });
+    insert_optional_team_id(&mut manifest, answers.team_id.as_deref());
+    manifest
 }
 
 fn platform_manifest(platforms: &[ManifestPlatform]) -> JsonValue {
@@ -396,6 +401,16 @@ fn generated_file(path: &str, contents: String) -> GeneratedFile {
         path: PathBuf::from(path),
         contents,
     }
+}
+
+fn insert_optional_team_id(manifest: &mut JsonValue, team_id: Option<&str>) {
+    let Some(team_id) = team_id else {
+        return;
+    };
+    let Some(object) = manifest.as_object_mut() else {
+        return;
+    };
+    object.insert("team_id".to_owned(), JsonValue::String(team_id.to_owned()));
 }
 
 fn ensure_gitignore_entry(project_root: &Path, entry: &str) -> Result<()> {
@@ -481,6 +496,7 @@ mod tests {
                 name: "Example App".to_owned(),
                 bundle_id: "dev.orbit.exampleapp".to_owned(),
                 template: InitTemplate::Ios,
+                team_id: None,
             },
             schema_path,
         );
@@ -525,6 +541,7 @@ mod tests {
                 name: "Example App".to_owned(),
                 bundle_id: "dev.orbit.exampleapp".to_owned(),
                 template: InitTemplate::IosWatchCompanion,
+                team_id: None,
             },
             schema_path,
         );
@@ -569,6 +586,7 @@ mod tests {
                 name: "Example App".to_owned(),
                 bundle_id: "dev.orbit.exampleapp".to_owned(),
                 template: InitTemplate::AppleMultiplatform,
+                team_id: None,
             },
             "/tmp/.orbit/schemas/apple-app.v1.json",
         );
@@ -596,5 +614,22 @@ mod tests {
         let gitignore =
             std::fs::read_to_string(manifest_path.parent().unwrap().join(".gitignore")).unwrap();
         assert_eq!(gitignore, ".bsp/\n.orbit/\n");
+    }
+
+    #[test]
+    fn ios_template_includes_selected_team_id() {
+        let schema_path = "https://orbitstorage.dev/schemas/apple-app.v1-orbit-0.1.0.json";
+        let plan = scaffold_plan(
+            &InitAnswers {
+                ecosystem: InitEcosystem::Apple,
+                name: "Example App".to_owned(),
+                bundle_id: "dev.orbit.exampleapp".to_owned(),
+                template: InitTemplate::Ios,
+                team_id: Some("TEAM123456".to_owned()),
+            },
+            schema_path,
+        );
+
+        assert_eq!(plan.manifest["team_id"], "TEAM123456");
     }
 }

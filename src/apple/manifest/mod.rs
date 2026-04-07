@@ -9,7 +9,11 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
-pub const SCHEMA_URL: &str = "https://orbit.dev/schemas/apple-app.v1.json";
+pub const SCHEMA_URL: &str = concat!(
+    "https://orbitstorage.dev/schemas/apple-app.v1-orbit-",
+    env!("CARGO_PKG_VERSION"),
+    ".json"
+);
 pub const SCHEMA_FILENAME: &str = "apple-app.v1.json";
 
 pub use authoring::{

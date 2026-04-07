@@ -20,7 +20,7 @@ Minimal app:
 
 ```json
 {
-  "$schema": "/Users/your-user/.orbit/schemas/apple-app.v1.json",
+  "$schema": "https://orbitstorage.dev/schemas/apple-app.v1-orbit-0.1.0.json",
   "name": "ExampleApp",
   "bundle_id": "dev.orbit.examples.app",
   "version": "1.0.0",
@@ -37,7 +37,7 @@ More complete app:
 
 ```json
 {
-  "$schema": "/Users/your-user/.orbit/schemas/apple-app.v1.json",
+  "$schema": "https://orbitstorage.dev/schemas/apple-app.v1-orbit-0.1.0.json",
   "name": "Orbit VPN",
   "display_name": "Orbit",
   "bundle_id": "dev.orbit.vpn",
@@ -101,7 +101,7 @@ More complete app:
 }
 ```
 
-Orbit manifests should point at `~/.orbit/schemas/`. Install them with `./scripts/install-schemas.sh`, then use `orbit init` to write that local absolute schema path into new manifests. Set `ORBIT_SCHEMA_DIR` before running the script if you need a different install location.
+New manifests created by `orbit init` point at a version-pinned published schema on `https://orbitstorage.dev/schemas/`. Install local copies with `./scripts/install-schemas.sh` if you want editor or offline validation against `~/.orbit/schemas/`; set `ORBIT_SCHEMA_DIR` before running the script if you need a different install location.
 
 ## Field Guide
 

@@ -47,7 +47,10 @@ impl ManifestSchema {
 
     fn matches(self, schema: &str) -> bool {
         match self {
-            Self::AppleAppV1 => schema_file_name(schema) == crate::apple::manifest::SCHEMA_FILENAME,
+            Self::AppleAppV1 => schema_matches_file_name(
+                schema_file_name(schema),
+                crate::apple::manifest::SCHEMA_FILENAME,
+            ),
         }
     }
 }
@@ -77,7 +80,7 @@ pub fn detect_schema_with_env(path: &Path, env: Option<&str>) -> Result<Manifest
         );
     }
     bail!(
-        "unsupported manifest schema `{}`; expected a schema path or URL ending with `{}`",
+        "unsupported manifest schema `{}`; expected a local schema path ending with `{}` or a version-pinned published Orbit schema URL from `https://orbitstorage.dev/schemas/`",
         probe.schema,
         crate::apple::manifest::SCHEMA_FILENAME
     )
@@ -85,6 +88,25 @@ pub fn detect_schema_with_env(path: &Path, env: Option<&str>) -> Result<Manifest
 
 fn schema_file_name(schema: &str) -> &str {
     schema.rsplit(['/', '\\']).next().unwrap_or(schema)
+}
+
+fn schema_matches_file_name(schema_name: &str, local_file_name: &str) -> bool {
+    if schema_name == local_file_name {
+        return true;
+    }
+
+    let Some(local_stem) = local_file_name.strip_suffix(".json") else {
+        return false;
+    };
+    let Some(version_suffix) = schema_name
+        .strip_prefix(local_stem)
+        .and_then(|value| value.strip_prefix("-orbit-"))
+        .and_then(|value| value.strip_suffix(".json"))
+    else {
+        return false;
+    };
+
+    !version_suffix.is_empty()
 }
 
 pub fn read_manifest_value(path: &Path, env: Option<&str>) -> Result<JsonValue> {
@@ -153,10 +175,6 @@ fn merge_manifest_value(base: &mut JsonValue, overlay: JsonValue) {
     }
 }
 
-pub fn installed_schema_path(schema_dir: &Path, schema: ManifestSchema) -> PathBuf {
-    schema_dir.join(schema.file_name())
-}
-
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -165,7 +183,8 @@ mod tests {
     use serde_json::json;
     use tempfile::tempdir;
 
-    use super::{overlay_manifest_path, read_manifest_value};
+    use super::{detect_schema, overlay_manifest_path, read_manifest_value};
+    use crate::manifest::ManifestSchema;
 
     #[test]
     fn reads_base_manifest_without_env_overlay() {
@@ -194,7 +213,7 @@ mod tests {
         fs::write(
             &manifest_path,
             serde_json::to_vec_pretty(&json!({
-                "$schema": "https://orbit.dev/schemas/apple-app.v1.json",
+                "$schema": crate::apple::manifest::SCHEMA_URL,
                 "name": "Base",
                 "platforms": {
                     "ios": "18.0",
@@ -254,6 +273,32 @@ mod tests {
         assert_eq!(
             overlay_manifest_path(&manifest_path, "prod").unwrap(),
             PathBuf::from("/tmp/project/orbit.prod.json")
+        );
+    }
+
+    #[test]
+    fn detects_version_pinned_published_schema_url() {
+        let temp = tempdir().unwrap();
+        let manifest_path = temp.path().join("orbit.json");
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&json!({
+                "$schema": "https://orbitstorage.dev/schemas/apple-app.v1-orbit-9.9.9.json",
+                "name": "Example",
+                "bundle_id": "dev.orbit.examples.example",
+                "version": "1.0.0",
+                "build": 1,
+                "platforms": {
+                    "ios": "18.0"
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            detect_schema(&manifest_path).unwrap(),
+            ManifestSchema::AppleAppV1
         );
     }
 }

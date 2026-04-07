@@ -158,6 +158,38 @@ pub fn resolve_user_auth_metadata(app: &AppContext) -> Result<Option<UserAuth>> 
     Ok(state.user)
 }
 
+pub fn select_team_id_for_init(app: &AppContext) -> Result<String> {
+    if let Some(team_id) = env_string("ORBIT_APPLE_TEAM_ID") {
+        if looks_like_apple_team_id(&team_id) {
+            return Ok(team_id);
+        }
+        bail!("ORBIT_APPLE_TEAM_ID must be a valid Apple team id like `TEAM123456`");
+    }
+
+    let request = EnsureUserAuthRequest {
+        prompt_for_missing: true,
+        ..Default::default()
+    };
+    let user = ensure_user_identity(app, &request)?;
+    let developer_services = auth_progress_step(
+        "Apple auth: Refreshing GrandSlam and Developer Services session",
+        |_| "Apple auth: Refreshed GrandSlam and Developer Services session.".to_owned(),
+        || DeveloperServicesClient::authenticate(app),
+    )?;
+    let teams = auth_progress_step(
+        "Apple auth: Loading Apple Developer teams",
+        |teams: &Vec<DeveloperServicesTeam>| {
+            format!(
+                "Apple auth: Loaded {} Apple Developer team(s).",
+                teams.len()
+            )
+        },
+        || developer_services.list_teams(),
+    )?;
+    let selected_team = select_developer_services_team(app, &user, &request, teams)?;
+    Ok(selected_team.team_id)
+}
+
 pub(crate) fn ensure_user_identity(
     app: &AppContext,
     request: &EnsureUserAuthRequest,

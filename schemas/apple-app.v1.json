@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://orbit.dev/schemas/apple-app.v1.json",
+  "$id": "https://orbitstorage.dev/schemas/apple-app.v1-orbit-0.1.0.json",
   "title": "Orbit Apple App Manifest v1",
   "description": "Authoring schema for app-centric Orbit Apple manifests.",
   "type": "object",
@@ -16,7 +16,7 @@
   "properties": {
     "$schema": {
       "type": "string",
-      "description": "Schema identifier used by Orbit backend dispatch and editor validation. This can be the published URL or a local path ending with `apple-app.v1.json`."
+      "description": "Schema identifier used by Orbit backend dispatch and editor validation. This can be a version-pinned published URL from `https://orbitstorage.dev/schemas/` or a local path ending with `apple-app.v1.json`."
     },
     "name": {
       "type": "string",
