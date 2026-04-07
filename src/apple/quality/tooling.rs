@@ -222,6 +222,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     use std::sync::{Mutex, OnceLock};
 
+    #[cfg(target_os = "macos")]
     use super::*;
     #[cfg(target_os = "macos")]
     use crate::context::{AppContext, GlobalPaths};
