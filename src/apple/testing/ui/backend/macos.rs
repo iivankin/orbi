@@ -1402,7 +1402,7 @@ mod tests {
         fs::write(
             &helper_path,
             format!(
-                "#!/bin/zsh\nprintf '%s\\n' \"$@\" > {}\n",
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\n",
                 args_path.display()
             ),
         )

@@ -472,7 +472,7 @@ mod tests {
     use std::fs;
     use std::process::Command;
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use tempfile::tempdir;
 
@@ -483,6 +483,7 @@ mod tests {
     fn interrupted_trace_wait_returns_written_output_even_if_child_exits_non_zero() {
         let temp = tempdir().unwrap();
         let output_path = temp.path().join("capture.sample.txt");
+        let ready_path = temp.path().join("writer.ready");
         let script_path = temp.path().join("writer.py");
         fs::write(
             &script_path,
@@ -494,6 +495,7 @@ def handler(signum, frame):
 
 signal.signal(signal.SIGINT, handler)
 signal.signal(signal.SIGTERM, handler)
+pathlib.Path(r"{}").write_text("ready")
 end = time.time() + 0.4
 while time.time() < end:
     try:
@@ -503,12 +505,17 @@ while time.time() < end:
 pathlib.Path(r"{}").write_text("sample")
 raise SystemExit(130)
 "#,
+                ready_path.display(),
                 output_path.display()
             ),
         )
         .unwrap();
 
-        let child = Command::new("python3").arg(&script_path).spawn().unwrap();
+        let child = Command::new("python3")
+            .arg("-S")
+            .arg(&script_path)
+            .spawn()
+            .unwrap();
         let recording = TraceRecording {
             output_path: output_path.clone(),
             selected_xcode: None,
@@ -518,8 +525,16 @@ raise SystemExit(130)
         };
 
         let (interrupt_tx, interrupt_rx) = std::sync::mpsc::channel();
+        let interrupt_ready_path = ready_path.clone();
         thread::spawn(move || {
-            thread::sleep(Duration::from_millis(150));
+            let started = Instant::now();
+            while started.elapsed() < Duration::from_secs(2) {
+                if interrupt_ready_path.exists() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            thread::sleep(Duration::from_millis(50));
             let _ = interrupt_tx.send(());
         });
 
