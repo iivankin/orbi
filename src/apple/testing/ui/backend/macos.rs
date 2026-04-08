@@ -7,8 +7,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use serde_json::Value as JsonValue;
-use tempfile::{Builder as TempfileBuilder, TempDir, tempdir};
+use tempfile::{TempDir, tempdir};
 
+use super::super::matching::find_visible_element_by_selector;
 use super::super::{
     UiCrashDeleteRequest, UiCrashQuery, UiHardwareButton, UiKeyModifier, UiKeyPress,
     UiPermissionConfig, UiPressKey, UiSelector, UiSwipeDirection, UiTravel,
@@ -534,6 +535,12 @@ impl UiBackend for MacosBackend {
         self.focus()?;
         thread::sleep(Duration::from_millis(80));
 
+        let matched_center = self
+            .describe_all()
+            .ok()
+            .and_then(|tree| find_visible_element_by_selector(&tree, selector))
+            .and_then(|element| element.frame.map(|frame| frame.center()));
+
         let mut arguments = vec!["activate-element".to_owned()];
         arguments.extend(self.target_selector_arguments()?);
         if let Some(id) = selector.id.as_ref() {
@@ -545,6 +552,13 @@ impl UiBackend for MacosBackend {
             arguments.push(text.clone());
         }
         self.run_helper(&arguments)?;
+        if let Some((x, y)) = matched_center {
+            let mut last_tap = self
+                .last_tap_point
+                .lock()
+                .map_err(|_| anyhow::anyhow!("failed to lock the macOS UI backend tap state"))?;
+            *last_tap = Some((x, y));
+        }
         Ok(true)
     }
 
@@ -637,26 +651,12 @@ impl UiBackend for MacosBackend {
     }
 
     fn input_text(&self, text: &str) -> Result<()> {
-        let last_tap = self
-            .last_tap_point
-            .lock()
-            .map_err(|_| anyhow::anyhow!("failed to lock the macOS UI backend tap state"))?
-            .to_owned();
-        if let Some((x, y)) = last_tap {
-            let result = self.run_helper(&[
-                "set-value-at-point".to_owned(),
-                "--x".to_owned(),
-                x.to_string(),
-                "--y".to_owned(),
-                y.to_string(),
-                "--text".to_owned(),
-                text.to_owned(),
-            ]);
-            if result.is_ok() {
-                return Ok(());
-            }
-        }
-        self.run_helper(&["text".to_owned(), "--text".to_owned(), text.to_owned()])
+        let target_arguments = self.target_selector_arguments()?;
+        let mut arguments = vec!["text".to_owned()];
+        arguments.extend(target_arguments);
+        arguments.push("--text".to_owned());
+        arguments.push(text.to_owned());
+        self.run_helper(&arguments)
     }
 
     fn press_button(&self, button: UiHardwareButton, _duration_ms: Option<u32>) -> Result<()> {
@@ -764,46 +764,15 @@ impl UiBackend for MacosBackend {
         if let Some(parent) = path.parent() {
             ensure_dir(parent)?;
         }
-        let window_info = self.window_capture_info()?;
-        let temporary_capture = TempfileBuilder::new()
-            .prefix("orbit-window-")
-            .suffix(".png")
-            .tempfile()
-            .context("failed to allocate a temporary macOS screenshot path")?;
-        let temp_path = temporary_capture.path().to_path_buf();
-        drop(temporary_capture);
-
-        let mut capture = Command::new("screencapture");
-        capture.args([
-            "-x",
-            temp_path
-                .to_str()
-                .context("temporary screenshot path contains invalid UTF-8")?,
-        ]);
-        capture.stdout(Stdio::null());
-        capture.stderr(Stdio::null());
-        run_command(&mut capture)?;
-
-        let mut crop = Command::new("sips");
-        crop.args([
-            "-c",
-            &(window_info.frame.height.round() as i64).to_string(),
-            &(window_info.frame.width.round() as i64).to_string(),
-            "--cropOffset",
-            &(window_info.frame.y.round() as i64).to_string(),
-            &(window_info.frame.x.round() as i64).to_string(),
-            temp_path
-                .to_str()
-                .context("temporary screenshot path contains invalid UTF-8")?,
-            "--out",
+        let mut arguments = vec![
+            "screenshot-window".to_owned(),
+            "--output".to_owned(),
             path.to_str()
-                .context("screenshot path contains invalid UTF-8")?,
-        ]);
-        crop.stdout(Stdio::null());
-        crop.stderr(Stdio::null());
-        let result = run_command(&mut crop);
-        let _ = fs::remove_file(&temp_path);
-        result
+                .context("screenshot path contains invalid UTF-8")?
+                .to_owned(),
+        ];
+        arguments.splice(1..1, self.target_selector_arguments()?);
+        self.run_helper(&arguments)
     }
 
     fn open_link(&self, url: &str) -> Result<()> {
@@ -1337,11 +1306,14 @@ fn ensure_macos_driver_binary(project: &ProjectContext) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::{
-        macos_attached_launch_wrapper, macos_lldb_launch_arguments,
+        MacosBackend, macos_attached_launch_wrapper, macos_lldb_launch_arguments,
         macos_lldb_launch_command_setup, traced_process_candidates, wait_for_launched_app_pid,
     };
+    use crate::apple::testing::ui::backend::UiBackend;
     use std::fs;
+    use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
+    use std::sync::Mutex;
     use std::thread;
     use std::time::Duration;
     use tempfile::tempdir;
@@ -1418,5 +1390,51 @@ mod tests {
         let pid = wait_for_launched_app_pid(&pid_file).unwrap();
         writer.join().unwrap();
         assert_eq!(pid, 43210);
+    }
+
+    #[test]
+    fn take_screenshot_uses_helper_window_capture_command() {
+        let temp = tempdir().unwrap();
+        let helper_path = temp.path().join("helper.sh");
+        let args_path = temp.path().join("helper-args.txt");
+        let screenshot_path = temp.path().join("artifacts").join("capture.png");
+
+        fs::write(
+            &helper_path,
+            format!(
+                "#!/bin/zsh\nprintf '%s\\n' \"$@\" > {}\n",
+                args_path.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&helper_path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&helper_path, permissions).unwrap();
+
+        let backend = MacosBackend {
+            helper_path,
+            bundle_id: "sh.orbit.desktop".to_owned(),
+            executable_path: Path::new("/tmp/Accord.app/Contents/MacOS/Accord").to_path_buf(),
+            selected_xcode: None,
+            verbose: false,
+            pinned_target_pid: Mutex::new(None),
+            launched_session: Mutex::new(None),
+            last_tap_point: Mutex::new(None),
+            active_video: None,
+        };
+
+        backend.take_screenshot(&screenshot_path).unwrap();
+
+        let arguments = fs::read_to_string(args_path).unwrap();
+        assert_eq!(
+            arguments.lines().collect::<Vec<_>>(),
+            vec![
+                "screenshot-window",
+                "--bundle-id",
+                "sh.orbit.desktop",
+                "--output",
+                screenshot_path.to_str().unwrap(),
+            ]
+        );
     }
 }

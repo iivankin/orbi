@@ -15,6 +15,7 @@ use crate::cli::ProfileKind;
 use crate::util::{command_output_allow_failure, debug_command, ensure_parent_dir, timestamp_slug};
 
 pub(crate) const SIMULATOR_PROFILING_UNAVAILABLE_MESSAGE: &str = "simulator profiling is currently unavailable because Apple's xctrace/InstrumentsCLI simulator path is unstable and can hang or emit broken traces. Use a physical device or macOS target instead.";
+const TRACE_RECORDING_FINALIZE_TIMEOUT: Duration = Duration::from_secs(90);
 
 pub(crate) struct TraceRecording {
     output_path: PathBuf,
@@ -295,7 +296,7 @@ fn finish_xctrace_recording(mut recording: TraceRecording) -> Result<PathBuf> {
     }
 
     let started = Instant::now();
-    while started.elapsed() < Duration::from_secs(30) {
+    while started.elapsed() < TRACE_RECORDING_FINALIZE_TIMEOUT {
         if let Some(status) = recording.child.try_wait()? {
             if status.success() && recording.output_path.exists() {
                 wait_for_exportable_trace(

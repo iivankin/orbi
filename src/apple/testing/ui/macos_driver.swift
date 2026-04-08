@@ -165,6 +165,16 @@ func requireApplicationTarget(in arguments: [String]) throws -> ApplicationTarge
     throw DriverError.usage("expected either --pid or --bundle-id")
 }
 
+func optionalApplicationTarget(in arguments: [String]) throws -> ApplicationTarget? {
+    if let pidValue = try optionalIntFlag("--pid", in: arguments) {
+        return .pid(pid_t(pidValue))
+    }
+    if let bundleID = try optionalFlag("--bundle-id", in: arguments) {
+        return .bundleID(bundleID)
+    }
+    return nil
+}
+
 func ensureAccessibilityPermission() throws {
     guard AXIsProcessTrusted() else {
         throw DriverError.accessibilityPermission
@@ -319,6 +329,11 @@ func frameDictionary(for element: AXUIElement) -> [String: Double]? {
           AXValueGetType(sizeValue as! AXValue) == .cgSize,
           AXValueGetValue(sizeValue as! AXValue, .cgSize, &size)
     else {
+        return nil
+    }
+
+    let components = [point.x, point.y, size.width, size.height]
+    guard components.allSatisfy(\.isFinite) else {
         return nil
     }
 
@@ -516,6 +531,27 @@ func pressElementOrAncestor(_ element: AXUIElement) throws {
         guard let current = candidate else {
             break
         }
+        let role = stringAttribute(current, attribute: kAXRoleAttribute as String)
+        if role != kAXTextFieldRole as String && role != kAXTextAreaRole as String,
+           AXUIElementPerformAction(current, kAXPressAction as CFString) == .success
+        {
+            return
+        }
+
+        if let frame = frame(for: current) {
+            try tap(
+                at: CGPoint(x: frame.midX, y: frame.midY),
+                durationMs: nil
+            )
+            usleep(80_000)
+            if role == kAXTextFieldRole as String || role == kAXTextAreaRole as String,
+               setFocusAttribute(on: current)
+            {
+                usleep(40_000)
+            }
+            return
+        }
+
         if AXUIElementPerformAction(current, kAXPressAction as CFString) == .success {
             return
         }
@@ -575,6 +611,25 @@ func setStringAttribute(_ element: AXUIElement, attribute: String, value: String
         element,
         attribute as CFString,
         value as CFTypeRef
+    ) == .success
+}
+
+func setFocusAttribute(on element: AXUIElement) -> Bool {
+    var isSettable = DarwinBoolean(false)
+    guard AXUIElementIsAttributeSettable(
+        element,
+        kAXFocusedAttribute as CFString,
+        &isSettable
+    ) == .success,
+    isSettable.boolValue
+    else {
+        return false
+    }
+
+    return AXUIElementSetAttributeValue(
+        element,
+        kAXFocusedAttribute as CFString,
+        kCFBooleanTrue
     ) == .success
 }
 
@@ -646,13 +701,6 @@ func postMouseEvent(
 }
 
 func tap(at point: CGPoint, durationMs: Int?) throws {
-    if (durationMs ?? 0) == 0,
-       let element = pressableElement(at: point),
-       AXUIElementPerformAction(element, kAXPressAction as CFString) == .success
-    {
-        return
-    }
-
     try postMouseEvent(type: .mouseMoved, point: point)
     try postMouseEvent(type: .leftMouseDown, point: point)
     if let durationMs, durationMs > 0 {
@@ -750,15 +798,27 @@ func scroll(direction: String, point: CGPoint? = nil) throws {
     event.post(tap: .cghidEventTap)
 }
 
-func inputText(_ text: String) throws {
+func inputText(_ text: String, target: ApplicationTarget?) throws {
+    var targetPID: pid_t?
+    if let target {
+        try bringApplicationToFront(target: target)
+        targetPID = try runningApplication(target: target).processIdentifier
+    }
+
     if let element = focusedElement() {
+        let role = stringAttribute(element, attribute: kAXRoleAttribute as String)
+        if role == kAXTextFieldRole as String || role == kAXTextAreaRole as String {
+            try typeTextEvents(text, targetPID: targetPID)
+            return
+        }
+
         let current = stringAttribute(element, attribute: kAXValueAttribute as String) ?? ""
         if setStringAttribute(element, attribute: kAXValueAttribute as String, value: current + text) {
             return
         }
     }
 
-    try pasteViaClipboard(text)
+    try typeTextEvents(text, targetPID: targetPID)
 }
 
 struct KeyboardModifiers {
@@ -860,7 +920,7 @@ func pressKeyCode(
     }
 }
 
-func postModifiedKeyPress(_ keyCode: CGKeyCode, flags: CGEventFlags) throws {
+func postModifiedKeyPress(_ keyCode: CGKeyCode, flags: CGEventFlags, targetPID: pid_t? = nil) throws {
     guard let keyDown = CGEvent(keyboardEventSource: nil, virtualKey: keyCode, keyDown: true),
           let keyUp = CGEvent(keyboardEventSource: nil, virtualKey: keyCode, keyDown: false)
     else {
@@ -868,16 +928,44 @@ func postModifiedKeyPress(_ keyCode: CGKeyCode, flags: CGEventFlags) throws {
     }
     keyDown.flags = flags
     keyUp.flags = flags
-    keyDown.post(tap: .cghidEventTap)
-    keyUp.post(tap: .cghidEventTap)
+    if let targetPID {
+        keyDown.postToPid(targetPID)
+        keyUp.postToPid(targetPID)
+    } else {
+        keyDown.post(tap: .cghidEventTap)
+        keyUp.post(tap: .cghidEventTap)
+    }
 }
 
-func pasteViaClipboard(_ text: String) throws {
+func postUnicodeEvent(_ text: String, keyDown: Bool, targetPID: pid_t? = nil) throws {
+    guard let event = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: keyDown) else {
+        throw DriverError.helper("failed to construct unicode keyboard event")
+    }
+
+    let utf16 = Array(text.utf16)
+    utf16.withUnsafeBufferPointer { buffer in
+        guard let baseAddress = buffer.baseAddress else { return }
+        event.keyboardSetUnicodeString(stringLength: buffer.count, unicodeString: baseAddress)
+    }
+
+    event.post(tap: .cghidEventTap)
+}
+
+func typeTextEvents(_ text: String, targetPID: pid_t? = nil) throws {
+    for character in text {
+        let scalar = String(character)
+        try postUnicodeEvent(scalar, keyDown: true, targetPID: targetPID)
+        try postUnicodeEvent(scalar, keyDown: false, targetPID: targetPID)
+        usleep(8_000)
+    }
+}
+
+func pasteViaClipboard(_ text: String, targetPID: pid_t? = nil) throws {
     let pasteboard = NSPasteboard.general
     let previousText = pasteboard.string(forType: .string)
     pasteboard.clearContents()
     pasteboard.setString(text, forType: .string)
-    try postModifiedKeyPress(CGKeyCode(9), flags: .maskCommand)
+    try postModifiedKeyPress(CGKeyCode(9), flags: .maskCommand, targetPID: targetPID)
     usleep(100_000)
     pasteboard.clearContents()
     if let previousText {
@@ -1225,7 +1313,8 @@ func run() throws {
 
     case "text":
         let text = try requireFlag("--text", in: arguments)
-        try inputText(text)
+        let target = try optionalApplicationTarget(in: arguments)
+        try inputText(text, target: target)
 
     case "set-value-at-point":
         let x = try requireDoubleFlag("--x", in: arguments)

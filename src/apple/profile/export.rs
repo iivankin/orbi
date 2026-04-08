@@ -7,6 +7,8 @@ use anyhow::{Result, bail};
 use crate::apple::xcode::{SelectedXcode, xcrun_command};
 use crate::util::{command_output_allow_failure, debug_command};
 
+const TRACE_EXPORT_TIMEOUT: Duration = Duration::from_secs(60);
+
 #[derive(Clone, Copy)]
 pub(super) enum TraceExportMode<'a> {
     Toc,
@@ -32,7 +34,7 @@ pub(super) fn capture_xctrace_export(
     let started = Instant::now();
     let mut last_error = None;
 
-    while started.elapsed() < Duration::from_secs(10) {
+    while started.elapsed() < TRACE_EXPORT_TIMEOUT {
         let mut command = xctrace_export_command_with_xcode(trace_path, selected_xcode);
         apply_trace_export_mode(&mut command, mode);
         let (success, stdout, stderr) = command_output_allow_failure(&mut command)?;
@@ -68,7 +70,7 @@ pub(super) fn wait_for_exportable_trace(
     let started = Instant::now();
     let mut last_error = None;
 
-    while started.elapsed() < Duration::from_secs(10) {
+    while started.elapsed() < TRACE_EXPORT_TIMEOUT {
         let mut command = xctrace_export_command_with_xcode(output_path, selected_xcode);
         command.arg("--toc");
         let (success, _stdout, stderr) = command_output_allow_failure(&mut command)?;
