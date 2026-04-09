@@ -1,4 +1,5 @@
 use std::env;
+use std::fs::{File, OpenOptions, TryLockError};
 use std::path::Path;
 use std::time::Instant;
 
@@ -58,6 +59,10 @@ struct PreparedUiSession {
     selected_xcode: Option<crate::apple::xcode::SelectedXcode>,
 }
 
+struct UiRunLockGuard {
+    _file: File,
+}
+
 pub fn run_ui_tests(project: &ProjectContext, args: &TestArgs) -> Result<()> {
     let ui_tests = project
         .resolved_manifest
@@ -86,6 +91,11 @@ pub fn run_ui_tests(project: &ProjectContext, args: &TestArgs) -> Result<()> {
         let status = backend::macos_doctor(project)?;
         ensure_macos_ui_test_requirements(&status)?;
     }
+    let _macos_ui_test_lock = if platform == ApplePlatform::Macos {
+        Some(acquire_macos_ui_test_lock(project)?)
+    } else {
+        None
+    };
 
     let run_id = format!("{}-{}", unix_timestamp_secs(), Uuid::new_v4());
     let run_root = project
@@ -323,6 +333,47 @@ fn ensure_macos_ui_test_requirements(status: &MacosDoctorStatus) -> Result<()> {
         "macOS UI automation is not ready.\nMissing:\n  - {}",
         missing.join("\n  - ")
     )
+}
+
+fn acquire_macos_ui_test_lock(project: &ProjectContext) -> Result<UiRunLockGuard> {
+    let lock_path = macos_ui_test_lock_path(project.app.global_paths.data_dir.as_path());
+    acquire_waiting_file_lock(
+        &lock_path,
+        "another Orbit macOS UI test run is active; waiting for the global macOS UI test lock",
+    )
+}
+
+fn macos_ui_test_lock_path(data_dir: &Path) -> std::path::PathBuf {
+    data_dir.join("locks").join("macos-ui-tests.lock")
+}
+
+fn acquire_waiting_file_lock(lock_path: &Path, wait_message: &str) -> Result<UiRunLockGuard> {
+    let lock_dir = lock_path
+        .parent()
+        .context("lock file path did not contain a parent directory")?;
+    ensure_dir(lock_dir)?;
+
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(lock_path)
+        .with_context(|| format!("failed to open {}", lock_path.display()))?;
+
+    match file.try_lock() {
+        Ok(()) => {}
+        Err(TryLockError::WouldBlock) => {
+            eprintln!("{wait_message}: {}", lock_path.display());
+            file.lock()
+                .with_context(|| format!("failed to lock {}", lock_path.display()))?;
+        }
+        Err(TryLockError::Error(error)) => {
+            return Err(error).with_context(|| format!("failed to lock {}", lock_path.display()));
+        }
+    }
+
+    Ok(UiRunLockGuard { _file: file })
 }
 
 fn prepare_ui_session(

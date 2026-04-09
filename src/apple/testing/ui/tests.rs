@@ -1,6 +1,11 @@
 use std::fs;
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::mpsc::TryRecvError;
 use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use serde_json::json;
@@ -11,8 +16,9 @@ use super::flow::select_ui_flow_paths;
 use super::{
     UiCommand, UiCrashDeleteRequest, UiCrashQuery, UiFlowRunner, UiHardwareButton, UiKeyModifier,
     UiKeyPress, UiPermissionConfig, UiSelector, UiSwipeDirection, UiTravel,
-    find_element_by_selector, find_visible_element_by_selector, find_visible_scroll_container,
-    infer_screen_frame, plan_macos_ui_trace, ui_testing_destination,
+    acquire_waiting_file_lock, find_element_by_selector, find_visible_element_by_selector,
+    find_visible_scroll_container, infer_screen_frame, macos_ui_test_lock_path,
+    plan_macos_ui_trace, ui_testing_destination,
 };
 use crate::apple::build::toolchain::DestinationKind;
 use crate::manifest::ApplePlatform;
@@ -458,4 +464,49 @@ fn flow_selector_reports_available_flows_when_no_match_exists() {
     assert!(message.contains("missing-flow"));
     assert!(message.contains("onboarding-profile.yaml"));
     assert!(message.contains("onboarding-provider-setup-profile"));
+}
+
+#[test]
+fn macos_ui_test_lock_path_uses_global_data_dir() {
+    let path = macos_ui_test_lock_path(Path::new("/tmp/orbit-data"));
+    assert_eq!(path, Path::new("/tmp/orbit-data/locks/macos-ui-tests.lock"));
+}
+
+#[test]
+fn file_lock_waits_for_existing_holder_to_exit() {
+    let temp = tempdir().unwrap();
+    let lock_path = temp.path().join("macos-ui-tests.lock");
+    let mut holder = Command::new("/usr/bin/perl")
+        .arg("-e")
+        .arg(
+            "use Fcntl qw(:flock); open my $fh, '>>', $ARGV[0] or die $!; flock($fh, LOCK_EX) or die $!; select STDOUT; $| = 1; print qq(locked\\n); scalar <STDIN>;",
+        )
+        .arg(&lock_path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let mut ready = String::new();
+    let stdout = holder.stdout.take().unwrap();
+    BufReader::new(stdout).read_line(&mut ready).unwrap();
+    assert_eq!(ready, "locked\n");
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let waiter_lock_path = lock_path.clone();
+    let waiter = thread::spawn(move || {
+        let started = Instant::now();
+        let _guard = acquire_waiting_file_lock(&waiter_lock_path, "waiting").unwrap();
+        tx.send(started.elapsed()).unwrap();
+    });
+
+    thread::sleep(Duration::from_millis(250));
+    assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+
+    holder.stdin.as_mut().unwrap().write_all(b"\n").unwrap();
+    assert!(holder.wait().unwrap().success());
+
+    let waited = rx.recv_timeout(Duration::from_secs(3)).unwrap();
+    waiter.join().unwrap();
+    assert!(waited >= Duration::from_millis(250));
 }

@@ -531,6 +531,9 @@ Run the manifest's `tests.ui` suite on macOS:
 orbit test --ui --platform macos
 ```
 
+Orbit serializes macOS UI test runs with a machine-local global lock, so concurrent
+`orbit test --ui --platform macos` invocations wait instead of overlapping.
+
 Run only a selected UI flow by its configured `name`, file stem, file name, or path:
 
 ```sh
