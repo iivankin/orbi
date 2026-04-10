@@ -18,6 +18,7 @@ pub mod ide;
 pub mod lockfile;
 pub mod logs;
 pub mod manifest;
+pub mod preview;
 pub mod profile;
 pub mod provisioning;
 pub mod quality;

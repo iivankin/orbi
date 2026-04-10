@@ -3,7 +3,7 @@ use anyhow::Result;
 use crate::apple;
 use crate::cli::{
     AppleCommand, AppleDeviceCommand, AppleSigningCommand, Cli, Command, DepsCommand, IdeCommand,
-    UiCommand,
+    PreviewCommand, UiCommand,
 };
 use crate::context::AppContext;
 
@@ -19,6 +19,10 @@ pub fn execute(app: &AppContext, cli: &Cli) -> Result<()> {
             let project = app.load_project(cli.manifest.as_deref())?;
             apple::testing::run_tests(&project, args)
         }
+        Command::Preview(preview_args) => match &preview_args.command {
+            PreviewCommand::List(args) => apple::preview::list(app, args, cli.manifest.as_deref()),
+            PreviewCommand::Shot(args) => apple::preview::shot(app, args, cli.manifest.as_deref()),
+        },
         Command::Ui(ui_args) => match &ui_args.command {
             UiCommand::ResetIdb(_) => apple::ui::reset_idb(),
             UiCommand::Doctor(args) => {

@@ -20,7 +20,7 @@ pub const CLAP_STYLING: Styles = Styles::styled()
 #[command(arg_required_else_help = true)]
 #[command(styles = CLAP_STYLING)]
 #[command(
-    after_help = "Examples:\n  orbit init\n  orbit lint\n  orbit lint --platform ios\n  orbit format\n  orbit format --write\n  orbit test\n  orbit test --trace\n  orbit test --ui --platform ios\n  orbit ui dump-tree --platform ios\n  orbit ui describe-point --platform ios --x 140 --y 142\n  orbit ui doctor --platform macos\n  orbit ui open --platform ios https://example.com\n  orbit ui crash --platform ios list\n  orbit deps update\n  orbit deps update OrbitGreeting\n  orbit ide install-build-server\n  orbit ide dump-args\n  orbit ide dump-args --platform ios --file Sources/App/App.swift\n  orbit inspect-trace .orbit/artifacts/profiles/run.trace\n  orbit run --platform ios --simulator\n  orbit run --platform ios --device --trace\n  orbit build --env stage --platform ios --distribution development\n  orbit build --platform ios --distribution development\n  orbit build --platform ios --distribution app-store --release\n  orbit submit --platform ios --wait\n  orbit clean --all\n  orbit apple device list --refresh\n  orbit apple signing export --platform ios --distribution development\n  orbit apple signing import --platform ios --distribution development --p12 ./signing.p12 --password secret"
+    after_help = "Examples:\n  orbit init\n  orbit lint\n  orbit lint --platform ios\n  orbit format\n  orbit format --write\n  orbit test\n  orbit test --trace\n  orbit test --ui --platform ios\n  orbit preview list --platform ios\n  orbit preview shot Basic --platform ios\n  orbit ui dump-tree --platform ios\n  orbit ui describe-point --platform ios --x 140 --y 142\n  orbit ui doctor --platform macos\n  orbit ui open --platform ios https://example.com\n  orbit ui crash --platform ios list\n  orbit deps update\n  orbit deps update OrbitGreeting\n  orbit ide install-build-server\n  orbit ide dump-args\n  orbit ide dump-args --platform ios --file Sources/App/App.swift\n  orbit inspect-trace .orbit/artifacts/profiles/run.trace\n  orbit run --platform ios --simulator\n  orbit run --platform ios --device --trace\n  orbit build --env stage --platform ios --distribution development\n  orbit build --platform ios --distribution development\n  orbit build --platform ios --distribution app-store --release\n  orbit submit --platform ios --wait\n  orbit clean --all\n  orbit apple device list --refresh\n  orbit apple signing export --platform ios --distribution development\n  orbit apple signing import --platform ios --distribution development --p12 ./signing.p12 --password secret"
 )]
 pub struct Cli {
     #[arg(long, global = true)]
@@ -45,6 +45,7 @@ pub enum Command {
     Lint(LintArgs),
     Format(FormatArgs),
     Test(TestArgs),
+    Preview(PreviewArgs),
     Ui(UiArgs),
     Deps(DepsArgs),
     Ide(Box<IdeArgs>),
@@ -85,6 +86,39 @@ pub struct TestArgs {
 
     #[arg(long, value_enum, num_args = 0..=1, default_missing_value = "cpu")]
     pub trace: Option<ProfileKind>,
+}
+
+#[derive(Debug, Args)]
+#[command(arg_required_else_help = true)]
+pub struct PreviewArgs {
+    #[command(subcommand)]
+    pub command: PreviewCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum PreviewCommand {
+    List(PreviewListArgs),
+    Shot(PreviewShotArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct PreviewListArgs {
+    #[arg(long, value_enum)]
+    pub platform: Option<TargetPlatform>,
+}
+
+#[derive(Debug, Args)]
+pub struct PreviewShotArgs {
+    #[arg(long, value_enum)]
+    pub platform: Option<TargetPlatform>,
+
+    pub preview: Option<String>,
+
+    #[arg(long)]
+    pub output: Option<PathBuf>,
+
+    #[arg(long, default_value_t = 750)]
+    pub delay_ms: u64,
 }
 
 #[derive(Debug, Args)]
