@@ -29,9 +29,18 @@ impl AscMockServer {
 
 struct AscMockState {
     bundle_id_created: bool,
+    bundle_platform: String,
     app_created: bool,
-    certificate_der: Option<String>,
-    certificate_serial: Option<String>,
+    certificates: Vec<MockCertificate>,
+    next_certificate_number: usize,
+}
+
+struct MockCertificate {
+    id: String,
+    certificate_type: String,
+    display_name: String,
+    certificate_der: String,
+    certificate_serial: String,
 }
 
 pub fn spawn_asc_mock(
@@ -40,6 +49,7 @@ pub fn spawn_asc_mock(
     bundle_identifier: &str,
     app_name: &str,
     preseed_bundle_id: bool,
+    preseed_app: bool,
 ) -> AscMockServer {
     let ca_root = root.join("asc-ca");
     fs::create_dir_all(&ca_root).unwrap();
@@ -52,9 +62,10 @@ pub fn spawn_asc_mock(
     let requests_clone = Arc::clone(&requests);
     let state = Arc::new(Mutex::new(AscMockState {
         bundle_id_created: preseed_bundle_id,
-        app_created: false,
-        certificate_der: None,
-        certificate_serial: None,
+        bundle_platform: "IOS".to_owned(),
+        app_created: preseed_app,
+        certificates: Vec::new(),
+        next_certificate_number: 1,
     }));
     let state_clone = Arc::clone(&state);
     let team_id = team_id.to_owned();
@@ -163,6 +174,31 @@ fn asc_response_body(
     bundle_identifier: &str,
     app_name: &str,
 ) -> Result<String, String> {
+    if first_line.contains("/bundleIdCapabilities") {
+        return Ok(serde_json::json!({ "data": [], "included": [] }).to_string());
+    }
+
+    if first_line.starts_with("DELETE /v1/certificates/") {
+        let certificate_id = first_line
+            .split_whitespace()
+            .nth(1)
+            .and_then(|path| path.rsplit('/').next())
+            .unwrap_or_default();
+        state
+            .lock()
+            .unwrap()
+            .certificates
+            .retain(|certificate| certificate.id != certificate_id);
+        return Ok(serde_json::json!({}).to_string());
+    }
+
+    if first_line.starts_with("DELETE /v1/profiles/")
+        || first_line.starts_with("DELETE /v1/bundleIds/")
+        || first_line.starts_with("PATCH /v1/devices/")
+    {
+        return Ok(serde_json::json!({}).to_string());
+    }
+
     if first_line.starts_with("GET /v1/bundleIds") {
         let state = state.lock().unwrap();
         let data = if state.bundle_id_created {
@@ -172,7 +208,7 @@ fn asc_response_body(
                 "attributes": {
                     "name": app_name,
                     "identifier": bundle_identifier,
-                    "platform": "IOS"
+                    "platform": state.bundle_platform
                 },
                 "relationships": {}
             })]
@@ -183,7 +219,19 @@ fn asc_response_body(
     }
 
     if first_line.starts_with("POST /v1/bundleIds") {
-        state.lock().unwrap().bundle_id_created = true;
+        let body = request
+            .split("\r\n\r\n")
+            .nth(1)
+            .ok_or_else(|| "missing request body".to_owned())?;
+        let json: serde_json::Value =
+            serde_json::from_str(body).map_err(|error| error.to_string())?;
+        let platform = json["data"]["attributes"]["platform"]
+            .as_str()
+            .unwrap_or("IOS")
+            .to_owned();
+        let mut state = state.lock().unwrap();
+        state.bundle_id_created = true;
+        state.bundle_platform = platform.clone();
         return Ok(serde_json::json!({
             "data": {
                 "id": "BUNDLE1",
@@ -191,7 +239,7 @@ fn asc_response_body(
                 "attributes": {
                     "name": app_name,
                     "identifier": bundle_identifier,
-                    "platform": "IOS"
+                    "platform": platform
                 },
                 "relationships": {}
             }
@@ -201,21 +249,23 @@ fn asc_response_body(
 
     if first_line.starts_with("GET /v1/certificates") {
         let state = state.lock().unwrap();
-        let data = if let Some(certificate_der) = &state.certificate_der {
-            vec![serde_json::json!({
-                "id": "CERT1",
-                "type": "certificates",
-                "attributes": {
-                    "certificateType": "IOS_DISTRIBUTION",
-                    "displayName": "Orbit Mock Distribution",
-                    "serialNumber": state.certificate_serial,
-                    "certificateContent": certificate_der
-                },
-                "relationships": {}
-            })]
-        } else {
-            Vec::new()
-        };
+        let data = state
+            .certificates
+            .iter()
+            .map(|certificate| {
+                serde_json::json!({
+                    "id": certificate.id.clone(),
+                    "type": "certificates",
+                    "attributes": {
+                        "certificateType": certificate.certificate_type.clone(),
+                        "displayName": certificate.display_name.clone(),
+                        "serialNumber": certificate.certificate_serial.clone(),
+                        "certificateContent": certificate.certificate_der.clone()
+                    },
+                    "relationships": {}
+                })
+            })
+            .collect::<Vec<_>>();
         return Ok(serde_json::json!({ "data": data, "included": [] }).to_string());
     }
 
@@ -226,6 +276,10 @@ fn asc_response_body(
             .ok_or_else(|| "missing request body".to_owned())?;
         let json: serde_json::Value =
             serde_json::from_str(body).map_err(|error| error.to_string())?;
+        let certificate_type = json["data"]["attributes"]["certificateType"]
+            .as_str()
+            .unwrap_or("IOS_DISTRIBUTION")
+            .to_owned();
         let csr_content = json["data"]["attributes"]["csrContent"]
             .as_str()
             .ok_or_else(|| "missing csrContent".to_owned())?;
@@ -233,15 +287,23 @@ fn asc_response_body(
         let certificate_serial = read_der_serial(&certificate_der)?;
         let certificate_der = base64::engine::general_purpose::STANDARD.encode(certificate_der);
         let mut state = state.lock().unwrap();
-        state.certificate_der = Some(certificate_der.clone());
-        state.certificate_serial = Some(certificate_serial.clone());
+        let certificate_id = format!("CERT{}", state.next_certificate_number);
+        state.next_certificate_number += 1;
+        let display_name = mock_certificate_display_name(&certificate_type).to_owned();
+        state.certificates.push(MockCertificate {
+            id: certificate_id.clone(),
+            certificate_type: certificate_type.clone(),
+            display_name: display_name.clone(),
+            certificate_der: certificate_der.clone(),
+            certificate_serial: certificate_serial.clone(),
+        });
         return Ok(serde_json::json!({
             "data": {
-                "id": "CERT1",
+                "id": certificate_id,
                 "type": "certificates",
                 "attributes": {
-                    "certificateType": "IOS_DISTRIBUTION",
-                    "displayName": "Orbit Mock Distribution",
+                    "certificateType": certificate_type,
+                    "displayName": display_name,
                     "serialNumber": certificate_serial,
                     "certificateContent": certificate_der
                 },
@@ -306,6 +368,20 @@ fn asc_response_body(
     }
 
     if first_line.starts_with("POST /v1/profiles") {
+        let body = request
+            .split("\r\n\r\n")
+            .nth(1)
+            .ok_or_else(|| "missing request body".to_owned())?;
+        let json: serde_json::Value =
+            serde_json::from_str(body).map_err(|error| error.to_string())?;
+        let profile_type = json["data"]["attributes"]["profileType"]
+            .as_str()
+            .unwrap_or("IOS_APP_STORE");
+        let platform = if profile_type.starts_with("MAC_") {
+            "MAC_OS"
+        } else {
+            "IOS"
+        };
         let profile_content = base64::engine::general_purpose::STANDARD
             .encode(provisioning_profile_xml(team_id, bundle_identifier).as_bytes());
         return Ok(serde_json::json!({
@@ -314,7 +390,8 @@ fn asc_response_body(
                 "type": "profiles",
                 "attributes": {
                     "name": "Orbit Mock Profile",
-                    "profileType": "IOS_APP_STORE",
+                    "platform": platform,
+                    "profileType": profile_type,
                     "profileState": "ACTIVE",
                     "profileContent": profile_content,
                     "uuid": "UUID-PROFILE-1"
@@ -362,6 +439,22 @@ fn asc_response_body(
     }
 
     Err(format!("unexpected request `{first_line}`"))
+}
+
+fn mock_certificate_display_name(certificate_type: &str) -> &'static str {
+    match certificate_type {
+        "DEVELOPMENT" => "Apple Development: Example Team",
+        "DISTRIBUTION" | "IOS_DISTRIBUTION" | "MAC_APP_DISTRIBUTION" => {
+            "Apple Distribution: Example Team"
+        }
+        "DEVELOPER_ID_APPLICATION" | "DEVELOPER_ID_APPLICATION_G2" => {
+            "Developer ID Application: Example Team"
+        }
+        "MAC_INSTALLER_DISTRIBUTION" | "DEVELOPER_ID_INSTALLER" => {
+            "Developer ID Installer: Example Team"
+        }
+        _ => "Orbit Mock Certificate",
+    }
 }
 
 fn sign_csr(

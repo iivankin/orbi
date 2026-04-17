@@ -16,7 +16,7 @@ use super::{
 };
 use crate::apple::build::external::{ExternalLinkInputs, PackageBuildOutput};
 use crate::apple::build::toolchain::Toolchain;
-use crate::apple::signing::{PackageSigningMaterial, SigningMaterial};
+use crate::apple::signing::{ArtifactSigningMaterial, SigningMaterial};
 use crate::context::ProjectContext;
 use crate::manifest::{
     ApplePlatform, DistributionKind, ExtensionManifest, IosTargetManifest, ProfileManifest,
@@ -466,17 +466,17 @@ pub(super) fn write_signing_cache(target_dir: &Path, fingerprint: &str) -> Resul
 pub(super) fn compute_artifact_fingerprint(
     distribution: DistributionKind,
     signed_bundle_fingerprint: &str,
-    package_signing: Option<&PackageSigningMaterial>,
+    artifact_signing: Option<&ArtifactSigningMaterial>,
 ) -> String {
     let mut hasher = Sha256::new();
     hasher.update(ARTIFACT_CACHE_VERSION.to_le_bytes());
     hasher.update(distribution.as_str().as_bytes());
     hasher.update(signed_bundle_fingerprint.as_bytes());
-    if let Some(package_signing) = package_signing {
-        hasher.update(package_signing.signing_identity.as_bytes());
-        hasher.update(package_signing.keychain_path.to_string_lossy().as_bytes());
+    if let Some(artifact_signing) = artifact_signing {
+        hasher.update(artifact_signing.signing_identity.as_bytes());
+        hasher.update(artifact_signing.keychain_path.to_string_lossy().as_bytes());
     } else {
-        hasher.update(b"no-package-signing");
+        hasher.update(b"no-artifact-signing");
     }
     hex_digest(hasher.finalize())
 }

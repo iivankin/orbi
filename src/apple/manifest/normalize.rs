@@ -87,8 +87,6 @@ fn normalize_manifest(
         name: app.name.clone(),
         version: app.version.clone(),
         xcode: app.xcode.clone(),
-        team_id: app.team_id.clone(),
-        provider_id: app.provider_id.clone(),
         hooks: app.hooks.clone().unwrap_or_default(),
         tests: app.tests.clone().unwrap_or_default(),
         quality: app.quality.clone(),
@@ -229,7 +227,19 @@ fn validate_root_manifest(app: &AppManifest) -> Result<()> {
         "tests.ui",
         app.tests.as_ref().and_then(|tests| tests.ui.as_deref()),
     )?;
+    validate_embedded_asc_config(app.asc.as_ref())?;
     Ok(())
+}
+
+fn validate_embedded_asc_config(config: Option<&JsonValue>) -> Result<()> {
+    let Some(config) = config else {
+        return Ok(());
+    };
+    let parsed: asc_sync::config::Config =
+        serde_json::from_value(config.clone()).context("failed to parse manifest `asc` section")?;
+    parsed
+        .validate()
+        .context("manifest `asc` section is invalid")
 }
 
 fn validate_test_target_manifest(field_name: &str, sources: Option<&[PathBuf]>) -> Result<()> {

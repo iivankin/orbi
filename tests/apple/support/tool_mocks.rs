@@ -13,25 +13,6 @@ db="{db}"
 cmd="$1"
 shift
 case "$cmd" in
-  add-generic-password)
-    account=""
-    service=""
-    password=""
-    while [ "$#" -gt 0 ]; do
-      case "$1" in
-        -a) account="$2"; shift 2 ;;
-        -s) service="$2"; shift 2 ;;
-        -w) password="$2"; shift 2 ;;
-        *) shift ;;
-      esac
-    done
-    mkdir -p "$(dirname "$db")"
-    tmp="$db.tmp"
-    touch "$db"
-    grep -v "^$service|$account|" "$db" > "$tmp" || true
-    printf '%s|%s|%s\n' "$service" "$account" "$password" >> "$tmp"
-    mv "$tmp" "$db"
-    ;;
   find-generic-password)
     account=""
     service=""
@@ -65,6 +46,7 @@ case "$cmd" in
     ;;
   list-keychains)
     if [ "$#" -ge 2 ] && [ "$1" = "-d" ] && [ "$2" = "user" ]; then
+      printf '"%s/Library/Keychains/login.keychain-db"\n' "$HOME"
       exit 0
     fi
     ;;
@@ -113,6 +95,9 @@ case "$cmd" in
       if openssl pkcs12 -in "$p12" -clcerts -nokeys -passin "pass:$password" -out "$cert_tmp" >/dev/null 2>&1; then
         hash="$(openssl x509 -in "$cert_tmp" -noout -fingerprint -sha1 | sed 's/.*=//; s/://g')"
         name="$(openssl x509 -in "$cert_tmp" -noout -subject | sed -E 's/^subject= *//; s/.*CN *= *//')"
+        cert_path="$(dirname "$db")/$hash.pem"
+        cp "$cert_tmp" "$cert_path"
+        cert_format="PEM"
         rm -f "$cert_tmp"
       else
         rm -f "$cert_tmp"
@@ -170,10 +155,11 @@ case "$cmd" in
         else
           openssl x509 -in "$cert_path" -outform PEM 2>/dev/null
         fi
-      else
+      elif [ -n "$p12" ] && [ -f "$p12" ]; then
         openssl pkcs12 -in "$p12" -clcerts -nokeys -passin "pass:$password" 2>/dev/null
       fi
     done
+    exit 0
     ;;
   *)
     echo "unexpected security command: $cmd" >&2
@@ -508,13 +494,31 @@ if [ "$#" -lt 1 ]; then
   exit 1
 fi
 bundle=""
+verify=0
 for arg in "$@"; do
+  case "$arg" in
+    -dv|--display|--verbose=*)
+      verify=1
+      ;;
+  esac
   bundle="$arg"
 done
+if [ "$verify" -eq 1 ]; then
+  if [ -d "$bundle" ]; then
+    printf 'Executable=%s/Contents/MacOS/ExampleApp\n' "$bundle" >&2
+    printf 'flags=0x10000(runtime)\n' >&2
+  fi
+  printf 'Authority=Developer ID Application: Example Team\n' >&2
+  exit 0
+fi
 if [ -d "$bundle/Contents" ]; then
   signature_root="$bundle/Contents/_CodeSignature"
-else
+elif [ -d "$bundle" ]; then
   signature_root="$bundle/_CodeSignature"
+else
+  mkdir -p "$(dirname "$bundle")"
+  printf 'signed\n' > "$bundle.signature"
+  exit 0
 fi
 mkdir -p "$signature_root"
 printf 'signed\n' > "$signature_root/CodeResources"
@@ -522,38 +526,22 @@ printf 'signed\n' > "$signature_root/CodeResources"
     );
 }
 
-pub fn create_submit_swinfo_mock(mock_bin: &Path) {
+pub fn create_hdiutil_mock(mock_bin: &Path) {
     write_executable(
-        &mock_bin.join("swinfo"),
+        &mock_bin.join("hdiutil"),
         r#"#!/bin/sh
 set -eu
-echo "swinfo $@" >> "$MOCK_LOG"
+echo "hdiutil $@" >> "$MOCK_LOG"
+if [ "$#" -lt 1 ]; then
+  echo "hdiutil mock expects an output path" >&2
+  exit 1
+fi
 out=""
-temp=""
-spi=0
-prev=""
 for arg in "$@"; do
-  if [ "$prev" = "-o" ]; then
-    out="$arg"
-  fi
-  if [ "$prev" = "-temporary" ]; then
-    temp="$arg"
-  fi
-  if [ "$prev" = "--output-spi" ]; then
-    spi=1
-  fi
-  prev="$arg"
+  out="$arg"
 done
-if [ -n "$out" ]; then
-  mkdir -p "$(dirname "$out")"
-  printf 'plist' > "$out"
-fi
-if [ -n "$temp" ]; then
-  mkdir -p "$temp"
-fi
-if [ "$spi" -eq 1 ] && [ -n "$temp" ]; then
-  printf 'zip' > "$temp/DTAppAnalyzerExtractorOutput-MOCK.zip"
-fi
+mkdir -p "$(dirname "$out")"
+printf 'dmg' > "$out"
 "#,
     );
 }

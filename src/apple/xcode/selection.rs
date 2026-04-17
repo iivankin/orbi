@@ -13,12 +13,7 @@ pub(super) fn resolve_requested_xcode_for_app(
     app: &AppContext,
     version: Option<&str>,
 ) -> Result<Option<SelectedXcode>> {
-    resolve_requested_xcode_in_roots_with_app(
-        version,
-        &installed_xcode_search_roots(),
-        app.interactive,
-        Some(app),
-    )
+    resolve_requested_xcode_in_roots(version, &installed_xcode_search_roots(), app.interactive)
 }
 
 pub(super) fn resolve_requested_xcode_with_mode(
@@ -32,15 +27,6 @@ pub(super) fn resolve_requested_xcode_in_roots(
     version: Option<&str>,
     roots: &[PathBuf],
     interactive: bool,
-) -> Result<Option<SelectedXcode>> {
-    resolve_requested_xcode_in_roots_with_app(version, roots, interactive, None)
-}
-
-fn resolve_requested_xcode_in_roots_with_app(
-    version: Option<&str>,
-    roots: &[PathBuf],
-    interactive: bool,
-    app: Option<&AppContext>,
 ) -> Result<Option<SelectedXcode>> {
     let Some(version) = version.map(str::trim).filter(|value| !value.is_empty()) else {
         return Ok(None);
@@ -76,7 +62,7 @@ fn resolve_requested_xcode_in_roots_with_app(
         .collect::<Vec<_>>();
     match prefix_matches.len() {
         1 => Ok(prefix_matches.into_iter().next()),
-        0 => resolve_missing_requested_xcode(version, &installed, roots, interactive, app),
+        0 => resolve_missing_requested_xcode(version, &installed, interactive),
         _ => {
             if interactive {
                 select_installed_xcode(
@@ -207,8 +193,7 @@ fn installed_xcode_search_roots() -> Vec<PathBuf> {
         }
     }
 
-    let mut roots = Vec::new();
-    roots.push(PathBuf::from("/Applications"));
+    let mut roots = vec![PathBuf::from("/Applications")];
     if let Some(home) = dirs::home_dir() {
         roots.push(home.join("Applications"));
     }
@@ -281,98 +266,35 @@ pub(super) fn compare_versions(left: &str, right: &str) -> std::cmp::Ordering {
 fn resolve_missing_requested_xcode(
     version: &str,
     installed: &[SelectedXcode],
-    roots: &[PathBuf],
     interactive: bool,
-    app: Option<&AppContext>,
 ) -> Result<Option<SelectedXcode>> {
-    if !interactive {
-        return Err(missing_xcode_error(version, installed, None));
+    if !interactive || installed.is_empty() {
+        return Err(missing_xcode_error(version, installed));
     }
 
-    let mut install_lookup_error = None;
-    let downloadable = if let Some(_app) = app {
-        match fetch_downloadable_xcodes(version) {
-            Ok(candidates) => {
-                if candidates.is_empty() {
-                    install_lookup_error = Some(format!(
-                        "Orbit could not find a stable downloadable Xcode release matching `{version}`."
-                    ));
-                }
-                candidates
-            }
-            Err(error) => {
-                install_lookup_error = Some(error.to_string());
-                Vec::new()
-            }
-        }
-    } else {
-        install_lookup_error = Some(
-            "Orbit can only install missing Xcodes while loading a project context.".to_owned(),
-        );
-        Vec::new()
-    };
-
-    if downloadable.is_empty() && installed.is_empty() {
-        return Err(missing_xcode_error(
-            version,
-            installed,
-            install_lookup_error.as_deref(),
-        ));
-    }
-
-    let mut actions = Vec::new();
-    let mut labels = Vec::new();
-    if !downloadable.is_empty() {
-        let install_root = preferred_xcode_install_root(roots)?;
-        for (index, candidate) in downloadable.iter().enumerate() {
-            actions.push(MissingXcodeAction::Install(index));
-            labels.push(format!(
-                "Download and install {} into {}",
+    let mut labels = installed
+        .iter()
+        .map(|candidate| {
+            format!(
+                "Use {} at {} for this run",
                 candidate.display_name(),
-                install_root.display()
-            ));
-        }
-    }
-    if !installed.is_empty() {
-        actions.push(MissingXcodeAction::SelectInstalled);
-        labels.push("Use a different installed Xcode for this run".to_owned());
-    }
-    actions.push(MissingXcodeAction::Abort);
+                candidate.app_path.display()
+            )
+        })
+        .collect::<Vec<_>>();
     labels.push("Abort".to_owned());
 
     let index = prompt_select(
         &format!(
-            "Manifest requests Xcode `{version}`, but it is not installed. What should Orbit do?"
+            "Manifest requests Xcode `{version}`, but it is not installed. Select a different installed Xcode or abort."
         ),
         &labels,
     )?;
-
-    match actions[index] {
-        MissingXcodeAction::Install(candidate_index) => {
-            let app = app.context("interactive Xcode installation requires an app context")?;
-            install_requested_xcode(app, &downloadable[candidate_index], roots)?;
-            resolve_requested_xcode_in_roots(Some(version), roots, false)
-        }
-        MissingXcodeAction::SelectInstalled => select_installed_xcode(
-            &format!(
-                "Manifest requests Xcode `{version}`. Select an installed Xcode to use for this run"
-            ),
-            installed,
-        )
-        .map(Some),
-        MissingXcodeAction::Abort => Err(missing_xcode_error(
-            version,
-            installed,
-            install_lookup_error.as_deref(),
-        )),
+    if index == installed.len() {
+        return Err(missing_xcode_error(version, installed));
     }
-}
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-enum MissingXcodeAction {
-    Install(usize),
-    SelectInstalled,
-    Abort,
+    Ok(Some(installed[index].clone()))
 }
 
 fn select_installed_xcode(prompt: &str, installed: &[SelectedXcode]) -> Result<SelectedXcode> {
@@ -390,47 +312,8 @@ fn select_installed_xcode(prompt: &str, installed: &[SelectedXcode]) -> Result<S
     Ok(installed[index].clone())
 }
 
-pub(super) fn preferred_xcode_install_root(roots: &[PathBuf]) -> Result<PathBuf> {
-    if let Some(root) = configured_xcode_install_root(roots) {
-        return Ok(root);
-    }
-    Ok(dirs::home_dir()
-        .context("failed to resolve the user home directory for Xcode installs")?
-        .join("Applications"))
-}
-
-pub(super) fn configured_xcode_install_root(roots: &[PathBuf]) -> Option<PathBuf> {
-    let override_paths = std::env::var_os("ORBIT_XCODE_SEARCH_ROOTS")?;
-    let paths = std::env::split_paths(&override_paths).collect::<Vec<_>>();
-    if paths.len() != 1 {
-        return None;
-    }
-    let root = paths.into_iter().next()?;
-    if root
-        .extension()
-        .and_then(|value| value.to_str())
-        .is_some_and(|value| value.eq_ignore_ascii_case("app"))
-    {
-        return None;
-    }
-    if roots.contains(&root) {
-        Some(root)
-    } else {
-        None
-    }
-}
-
-fn missing_xcode_error(
-    version: &str,
-    installed: &[SelectedXcode],
-    install_unavailable_reason: Option<&str>,
-) -> anyhow::Error {
-    let install_hint = install_unavailable_reason
-        .map(|reason| format!(" Orbit could not install it automatically: {reason}"))
-        .unwrap_or_else(|| {
-            " In interactive runs, Orbit can download and install the requested Xcode for you."
-                .to_owned()
-        });
+fn missing_xcode_error(version: &str, installed: &[SelectedXcode]) -> anyhow::Error {
+    let install_hint = " Install the requested Xcode.app manually and rerun Orbit.";
 
     if installed.is_empty() {
         return anyhow::anyhow!(

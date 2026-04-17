@@ -5,7 +5,8 @@ use crate::support::{
     base_command, create_api_key, create_build_xcrun_mock, create_codesign_mock, create_ditto_mock,
     create_home, create_lldb_attach_mock, create_passthrough_mock, create_security_mock,
     create_signing_workspace, create_sw_vers_mock, create_watch_workspace, create_watch_xcrun_mock,
-    create_xcodebuild_mock, run_and_capture, spawn_asc_mock, write_executable,
+    create_xcodebuild_mock, prepare_embedded_asc_state, run_and_capture, spawn_asc_mock,
+    write_executable,
 };
 use serde_json::Value as JsonValue;
 
@@ -35,7 +36,18 @@ fn signed_build_runs_before_build_and_after_sign_hooks() {
         "dev.orbit.fixture",
         "ExampleApp",
         false,
+        false,
     );
+    let api_base_url = format!("{}/v1", server.base_url);
+    prepare_embedded_asc_state(
+        &workspace,
+        &home,
+        &mock_bin,
+        &log_path,
+        &api_base_url,
+        &api_key_path,
+    );
+    server.shutdown();
 
     let hook_trace = workspace.join(".hook-trace");
     write_executable(
@@ -61,13 +73,6 @@ fn signed_build_runs_before_build_and_after_sign_hooks() {
     );
 
     let mut build = base_command(&workspace, &home, &mock_bin, &log_path);
-    build.env("ORBIT_ASC_BASE_URL", &server.base_url);
-    build.env("ORBIT_ASC_API_KEY_PATH", &api_key_path);
-    build.env("ORBIT_ASC_KEY_ID", "KEY1234567");
-    build.env(
-        "ORBIT_ASC_ISSUER_ID",
-        "00000000-0000-0000-0000-000000000000",
-    );
     build.args([
         "--non-interactive",
         "--manifest",
@@ -85,8 +90,6 @@ fn signed_build_runs_before_build_and_after_sign_hooks() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    server.shutdown();
-
     let trace = fs::read_to_string(&hook_trace).unwrap();
     let lines = trace.lines().collect::<Vec<_>>();
     assert_eq!(lines.len(), 2);

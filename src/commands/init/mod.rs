@@ -64,7 +64,7 @@ fn init_manifest_path(app: &AppContext, requested_manifest: Option<&Path>) -> Pa
     )
 }
 
-fn collect_init_answers(app: &AppContext, project_root: &Path) -> Result<InitAnswers> {
+fn collect_init_answers(_app: &AppContext, project_root: &Path) -> Result<InitAnswers> {
     let ecosystem = prompt_ecosystem()?;
     let default_name = suggested_product_name(project_root);
     let name = prompt_non_empty("Product name", Some(default_name.as_str()))?;
@@ -76,14 +76,12 @@ fn collect_init_answers(app: &AppContext, project_root: &Path) -> Result<InitAns
         "Enter a reverse-DNS bundle ID like `dev.orbit.exampleapp`.",
     )?;
     let template = prompt_template(ecosystem)?;
-    let team_id = prompt_team_id(app, ecosystem)?;
 
     Ok(InitAnswers {
         ecosystem,
         name,
         bundle_id,
         template,
-        team_id,
     })
 }
 
@@ -104,12 +102,6 @@ fn prompt_template(ecosystem: InitEcosystem) -> Result<InitTemplate> {
         .collect::<Vec<_>>();
     let index = prompt_select("Template", &labels)?;
     Ok(choices[index].kind)
-}
-
-fn prompt_team_id(app: &AppContext, ecosystem: InitEcosystem) -> Result<Option<String>> {
-    match ecosystem {
-        InitEcosystem::Apple => Ok(Some(apple::auth::select_team_id_for_init(app)?)),
-    }
 }
 
 fn render_template_label(choice: &TemplateChoice) -> String {

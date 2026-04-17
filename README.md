@@ -5,7 +5,7 @@ Orbit is a local-first Apple app build, signing, and submission CLI.
 ## Mental Model
 
 - One `orbit.json` describes one product.
-- Optional overlays live next to it as `orbit.<env>.json` and apply on top of the base manifest when you pass `--env <env>`.
+- Environment overlays live next to it as `orbit.<env>.json` and apply on top of the base manifest when you pass `--env <env>`.
 - The root object is the app itself, not an Xcode-style target graph.
 - Embedded pieces live under the app:
   - `extensions`
@@ -44,8 +44,6 @@ More complete app:
   "version": "1.2.3",
   "build": 42,
   "xcode": "26.4",
-  "team_id": "TEAM123456",
-  "provider_id": "128120286",
   "platforms": {
     "ios": "18.0",
     "macos": "15.0"
@@ -112,9 +110,7 @@ New manifests created by `orbit init` point at a version-pinned published schema
 - `bundle_id`: root bundle identifier for the app.
 - `version`: release version in Apple-friendly `x.y.z` form.
 - `build`: integer build number.
-- `xcode`: optional installed Xcode version, such as `26.4`. When set, Orbit uses that Xcode's developer directory and downloads the matching official simulator runtime if the selected Xcode is missing it. In interactive runs, if that Xcode is not installed, Orbit can prompt to download and install the matching official Xcode archive itself, or let you pick another installed Xcode for the current run. Orbit installs into `~/Applications` by default, or into the single directory from `ORBIT_XCODE_SEARCH_ROOTS` when that override is configured.
-- `team_id`: optional default Apple Developer team for this product.
-- `provider_id`: optional default App Store Connect provider for this product.
+- `xcode`: optional installed Xcode version, such as `26.4`. When set, Orbit uses that Xcode's developer directory and downloads the matching official simulator runtime if the selected Xcode is missing it. If that Xcode is not installed, Orbit asks you to install it manually or choose another installed Xcode for the current run.
 
 ### Platforms
 
@@ -642,8 +638,8 @@ orbit build --platform macos --distribution developer-id --release
 For macOS Developer ID builds, Orbit automatically verifies the produced artifact with:
 
 - `codesign -dv --verbose=4` on the app bundle
-- `pkgutil --check-signature` on the installer package
-- `spctl -a -vvv --type install` on the installer package
+- `codesign -dv --verbose=4` on the signed `.dmg`
+- `spctl -a -vvv --type open` on the signed `.dmg`
 
 Before notarization, Gatekeeper is expected to report `Unnotarized Developer ID`. Orbit treats that as the expected pre-notary state rather than a build failure.
 
@@ -677,35 +673,28 @@ Remote cleanup is intentionally conservative:
 
 ### Operational Notes
 
-- Apple ID auth now runs through GrandSlam/AuthKit and Developer Services. Orbit no longer relies on the old browser-cookie Apple login path for normal build, signing, submit, or notary flows.
+- Apple account state now flows through the embedded `asc` config and `orbit asc ...` commands. Orbit no longer exposes the old `orbit apple ...` auth or device-management path.
 - `Associated Domains` is removed from the local entitlement file when you delete it from `orbit.json`, but Orbit does not force-disable the remote App ID capability. This matches current Xcode behavior: the signed app stops carrying the entitlement, while the App ID service can remain enabled remotely.
 - Xcode-like notarization works only if the Apple team is configured for notarization. A rejected submission with status code `7000` means the account still needs Apple-side notarization setup.
-- After a successful notarization wait, Orbit automatically validates the stapled package with `xcrun stapler validate` and re-runs Gatekeeper/package-signature checks.
+- `developer-id` builds export a signed `.dmg`.
+- `mac-app-store` builds export a signed `.app` bundle.
 
-### Apple Device Management
+### ASC Utilities
 
-List devices:
+Put all App Store Connect state in the embedded `asc` section, including `asc.team_id`.
+
+Sync the embedded ASC plan and import signing materials:
 
 ```sh
-orbit apple device list --refresh
+orbit asc validate
+orbit asc plan
+orbit asc apply
+orbit asc signing import
+orbit asc signing print-build-settings
 ```
 
-Register the current machine:
+Register the current machine into the embedded ASC config:
 
 ```sh
-orbit apple device register --current-machine
-```
-
-Import devices from a file:
-
-```sh
-orbit apple device import --file ./devices.csv
-```
-
-### Signing Utilities
-
-Export signing materials:
-
-```sh
-orbit apple signing export --platform ios --output-dir ./signing
+orbit asc device add-local --current-mac --apply
 ```

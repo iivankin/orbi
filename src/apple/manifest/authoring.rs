@@ -21,10 +21,6 @@ pub struct AppManifest {
     pub build: u64,
     #[serde(default)]
     pub xcode: Option<String>,
-    #[serde(default)]
-    pub team_id: Option<String>,
-    #[serde(default)]
-    pub provider_id: Option<String>,
     pub platforms: BTreeMap<ApplePlatform, String>,
     #[serde(default)]
     pub sources: Vec<PathBuf>,
@@ -52,6 +48,8 @@ pub struct AppManifest {
     pub tests: Option<TestsManifest>,
     #[serde(default)]
     pub quality: QualityManifest,
+    #[serde(default)]
+    pub asc: Option<JsonValue>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]

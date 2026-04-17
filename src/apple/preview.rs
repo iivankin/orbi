@@ -737,8 +737,6 @@ fn generate_preview_project(
         name: format!("{} Preview", project.resolved_manifest.name),
         version: project.resolved_manifest.version.clone(),
         xcode: project.resolved_manifest.xcode.clone(),
-        team_id: None,
-        provider_id: None,
         hooks: project.resolved_manifest.hooks.clone(),
         tests: Default::default(),
         quality: Default::default(),

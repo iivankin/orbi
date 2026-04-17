@@ -4,31 +4,16 @@ use plist::Value;
 use serde_json::json;
 use tempfile::TempDir;
 
-use super::capability_sync::{
-    DeveloperServicesCapabilityMutation, asc_capability_settings, plan_asc_capability_mutations,
-    plan_developer_services_capability_mutations, should_skip_capability_sync,
-    validate_push_setup_with_api_key,
-};
-use super::cleanup::{ProjectEntitlementIdentifiers, project_entitlement_identifiers};
-use super::device_selection::{
-    current_profile_for_target, format_cached_device_label, missing_registered_devices,
-    profile_udids, same_udid_set,
-};
+use super::entitlements::materialize_signing_entitlements;
 use super::{
-    ASC_OPTION_APPLE_ID_PRIMARY_CONSENT, ASC_OPTION_DATA_PROTECTION_COMPLETE,
-    ASC_OPTION_PUSH_BROADCAST, CertificateOrigin, ManagedCertificate, ManagedProfile,
-    ProfileManifest, SigningState, clean_local_signing_state, identifier_name, load_state,
-    materialize_signing_entitlements, profile_covers_requested_ids, resolve_local_team_id_if_known,
-    save_state, target_is_app_clip, team_signing_paths,
+    CertificateOrigin, ManagedCertificate, ManagedProfile, SigningState, clean_local_signing_state,
+    identifier_name, load_state, resolve_local_team_id_if_known, save_state, target_is_app_clip,
+    team_signing_paths,
 };
-use crate::apple::capabilities::{
-    CapabilityRelationships, CapabilitySyncOptions, CapabilityUpdate, RemoteCapability,
-};
-use crate::apple::device::CachedDevice;
 use crate::context::{AppContext, GlobalPaths, ProjectContext, ProjectPaths};
 use crate::manifest::{
-    ApplePlatform, BuildConfiguration, DistributionKind, HooksManifest, ManifestSchema,
-    PlatformManifest, QualityManifest, ResolvedManifest, TargetKind, TargetManifest, TestsManifest,
+    ApplePlatform, HooksManifest, ManifestSchema, PlatformManifest, QualityManifest,
+    ResolvedManifest, TargetKind, TargetManifest, TestsManifest,
 };
 
 fn test_project() -> (TempDir, ProjectContext) {
@@ -50,8 +35,6 @@ fn test_project() -> (TempDir, ProjectContext) {
         name: "OrbitFixture".to_owned(),
         version: "0.1.0".to_owned(),
         xcode: None,
-        team_id: Some("TEAM123456".to_owned()),
-        provider_id: None,
         hooks: HooksManifest::default(),
         tests: TestsManifest::default(),
         quality: QualityManifest::default(),
@@ -88,7 +71,19 @@ fn test_project() -> (TempDir, ProjectContext) {
     std::fs::create_dir_all(&root).unwrap();
     std::fs::write(
         &manifest_path,
-        serde_json::to_vec_pretty(&manifest).unwrap(),
+        serde_json::to_vec_pretty(&json!({
+            "$schema": crate::apple::manifest::SCHEMA_URL,
+            "name": "OrbitFixture",
+            "bundle_id": "dev.orbit.fixture",
+            "version": "0.1.0",
+            "build": 1,
+            "platforms": { "ios": "18.0" },
+            "sources": ["Sources/App"],
+            "asc": {
+                "team_id": "TEAM123456"
+            }
+        }))
+        .unwrap(),
     )
     .unwrap();
 
@@ -101,9 +96,6 @@ fn test_project() -> (TempDir, ProjectContext) {
             data_dir: data_dir.clone(),
             cache_dir,
             schema_dir: data_dir.join("schemas"),
-            auth_state_path: data_dir.join("auth.json"),
-            device_cache_path: data_dir.join("devices.json"),
-            keychain_path: data_dir.join("orbit.keychain-db"),
         },
     };
     let project = ProjectContext {
@@ -124,7 +116,7 @@ fn test_project() -> (TempDir, ProjectContext) {
 }
 
 #[test]
-fn developer_services_identifier_names_normalize_portal_identifiers() {
+fn identifier_name_normalizes_portal_identifiers() {
     assert_eq!(
         identifier_name("App Group", "group.dev.orbit.demo"),
         "App Group group dev orbit demo"
@@ -229,8 +221,7 @@ fn local_cleanup_removes_only_current_project_profiles_and_unused_certs() {
 
 #[test]
 fn local_team_resolution_ignores_global_auth_team_selection() {
-    let (_temp, mut project) = test_project();
-    project.resolved_manifest.team_id = None;
+    let (_temp, project) = test_project();
     std::fs::write(
         &project.manifest_path,
         serde_json::to_vec_pretty(&json!({
@@ -245,13 +236,12 @@ fn local_team_resolution_ignores_global_auth_team_selection() {
     )
     .unwrap();
     std::fs::write(
-        &project.app.global_paths.auth_state_path,
+        project.app.global_paths.data_dir.join("auth.json"),
         serde_json::to_vec_pretty(&json!({
             "last_mode": "user",
             "user": {
                 "apple_id": "dev@example.com",
                 "team_id": "TEAM999999",
-                "provider_id": null,
                 "provider_name": "Old Team",
                 "last_validated_at_unix": 123
             },
@@ -261,16 +251,12 @@ fn local_team_resolution_ignores_global_auth_team_selection() {
     )
     .unwrap();
 
-    assert_ne!(
-        resolve_local_team_id_if_known(&project).unwrap().as_deref(),
-        Some("TEAM999999")
-    );
+    assert_eq!(resolve_local_team_id_if_known(&project).unwrap(), None);
 }
 
 #[test]
 fn local_team_resolution_observes_manifest_saved_after_project_load() {
-    let (_temp, mut project) = test_project();
-    project.resolved_manifest.team_id = None;
+    let (_temp, project) = test_project();
     std::fs::write(
         &project.manifest_path,
         serde_json::to_vec_pretty(&json!({
@@ -278,9 +264,11 @@ fn local_team_resolution_observes_manifest_saved_after_project_load() {
             "bundle_id": "dev.orbit.fixture",
             "version": "0.1.0",
             "build": 1,
-            "team_id": "TEAM123456",
             "platforms": { "ios": "18.0" },
-            "sources": ["Sources/App"]
+            "sources": ["Sources/App"],
+            "asc": {
+                "team_id": "TEAM123456"
+            }
         }))
         .unwrap(),
     )
@@ -289,51 +277,6 @@ fn local_team_resolution_observes_manifest_saved_after_project_load() {
     assert_eq!(
         resolve_local_team_id_if_known(&project).unwrap().as_deref(),
         Some("TEAM123456")
-    );
-}
-
-#[test]
-fn profile_reuse_accepts_remote_device_superset() {
-    assert!(profile_covers_requested_ids(
-        &["MAC-1".to_owned(), "MAC-2".to_owned()],
-        &["MAC-2".to_owned()]
-    ));
-    assert!(!profile_covers_requested_ids(
-        &["MAC-1".to_owned()],
-        &["MAC-1".to_owned(), "MAC-2".to_owned()]
-    ));
-    assert!(profile_covers_requested_ids(&[], &[]));
-}
-
-#[test]
-fn collects_project_identifier_cleanup_inputs_from_entitlements() {
-    let (_temp, mut project) = test_project();
-    let entitlements_path = project.root.join("App.entitlements");
-    let entitlements = Value::Dictionary(plist::Dictionary::from_iter([
-        (
-            "com.apple.security.application-groups".to_owned(),
-            Value::Array(vec![Value::String("group.dev.orbit.fixture".to_owned())]),
-        ),
-        (
-            "com.apple.developer.in-app-payments".to_owned(),
-            Value::Array(vec![Value::String("merchant.dev.orbit.fixture".to_owned())]),
-        ),
-        (
-            "com.apple.developer.icloud-container-identifiers".to_owned(),
-            Value::Array(vec![Value::String("iCloud.dev.orbit.fixture".to_owned())]),
-        ),
-    ]));
-    entitlements.to_file_xml(&entitlements_path).unwrap();
-    project.resolved_manifest.targets[0].entitlements = Some("App.entitlements".into());
-
-    let identifiers = project_entitlement_identifiers(&project).unwrap();
-    assert_eq!(
-        identifiers,
-        ProjectEntitlementIdentifiers {
-            app_groups: vec!["group.dev.orbit.fixture".to_owned()],
-            merchant_ids: vec!["merchant.dev.orbit.fixture".to_owned()],
-            cloud_containers: vec!["iCloud.dev.orbit.fixture".to_owned()],
-        }
     );
 }
 
@@ -569,291 +512,4 @@ fn merges_managed_profile_entitlements_into_explicit_entitlements() {
             .map(|values| values.len()),
         Some(1)
     );
-}
-
-#[test]
-fn api_key_capability_mutations_fail_for_identifier_linking() {
-    let error = plan_asc_capability_mutations(
-        &[CapabilityUpdate {
-            capability_type: "APP_GROUPS".to_owned(),
-            option: "ON".to_owned(),
-            relationships: CapabilityRelationships {
-                app_groups: Some(vec!["group.dev.orbit.fixture".to_owned()]),
-                merchant_ids: None,
-                cloud_containers: None,
-            },
-        }],
-        &[],
-    )
-    .unwrap_err();
-
-    assert!(error.to_string().contains("cannot link App Groups"));
-}
-
-#[test]
-fn api_key_capability_mutations_fail_for_broadcast_push() {
-    let error = asc_capability_settings(&CapabilityUpdate {
-        capability_type: "PUSH_NOTIFICATIONS".to_owned(),
-        option: ASC_OPTION_PUSH_BROADCAST.to_owned(),
-        relationships: CapabilityRelationships::default(),
-    })
-    .unwrap_err();
-
-    assert!(error.to_string().contains("broadcast push"));
-}
-
-#[test]
-fn api_key_capability_mutations_build_expected_settings() {
-    let remote = vec![RemoteCapability {
-        id: "CAP-APPLE-ID".to_owned(),
-        capability_type: "APPLE_ID_AUTH".to_owned(),
-        enabled: Some(true),
-        settings: Vec::new(),
-    }];
-    let updates = vec![
-        CapabilityUpdate {
-            capability_type: "APPLE_ID_AUTH".to_owned(),
-            option: ASC_OPTION_APPLE_ID_PRIMARY_CONSENT.to_owned(),
-            relationships: CapabilityRelationships::default(),
-        },
-        CapabilityUpdate {
-            capability_type: "DATA_PROTECTION".to_owned(),
-            option: ASC_OPTION_DATA_PROTECTION_COMPLETE.to_owned(),
-            relationships: CapabilityRelationships::default(),
-        },
-    ];
-
-    let mutations = plan_asc_capability_mutations(&updates, &remote).unwrap();
-    assert_eq!(mutations.len(), 2);
-    assert_eq!(mutations[0].remote_id.as_deref(), Some("CAP-APPLE-ID"));
-    assert_eq!(mutations[0].settings[0].key, "APPLE_ID_AUTH_APP_CONSENT");
-    assert_eq!(
-        mutations[0].settings[0].options[0].key,
-        "PRIMARY_APP_CONSENT"
-    );
-    assert_eq!(
-        mutations[1].settings[0].key,
-        "DATA_PROTECTION_PERMISSION_LEVEL"
-    );
-    assert_eq!(
-        mutations[1].settings[0].options[0].key,
-        "COMPLETE_PROTECTION"
-    );
-}
-
-#[test]
-fn developer_services_capability_mutations_choose_resource_operations() {
-    let remote = vec![
-        RemoteCapability {
-            id: "CAP-APP-GROUPS".to_owned(),
-            capability_type: "APP_GROUPS".to_owned(),
-            enabled: Some(true),
-            settings: Vec::new(),
-        },
-        RemoteCapability {
-            id: "CAP-APPLE-PAY".to_owned(),
-            capability_type: "APPLE_PAY".to_owned(),
-            enabled: Some(true),
-            settings: Vec::new(),
-        },
-        RemoteCapability {
-            id: "CAP-ASSOCIATED".to_owned(),
-            capability_type: "ASSOCIATED_DOMAINS".to_owned(),
-            enabled: Some(true),
-            settings: Vec::new(),
-        },
-    ];
-    let updates = vec![
-        CapabilityUpdate {
-            capability_type: "APP_GROUPS".to_owned(),
-            option: "ON".to_owned(),
-            relationships: CapabilityRelationships {
-                app_groups: Some(vec!["GROUP123".to_owned()]),
-                merchant_ids: None,
-                cloud_containers: None,
-            },
-        },
-        CapabilityUpdate {
-            capability_type: "ICLOUD".to_owned(),
-            option: "XCODE_6".to_owned(),
-            relationships: CapabilityRelationships {
-                app_groups: None,
-                merchant_ids: None,
-                cloud_containers: Some(vec!["CLOUD123".to_owned()]),
-            },
-        },
-        CapabilityUpdate {
-            capability_type: "APPLE_PAY".to_owned(),
-            option: "OFF".to_owned(),
-            relationships: CapabilityRelationships::default(),
-        },
-        CapabilityUpdate {
-            capability_type: "ASSOCIATED_DOMAINS".to_owned(),
-            option: "OFF".to_owned(),
-            relationships: CapabilityRelationships::default(),
-        },
-    ];
-
-    let mutations = plan_developer_services_capability_mutations(&updates, &remote);
-    assert_eq!(mutations.len(), 4);
-    assert!(matches!(
-        &mutations[0],
-        DeveloperServicesCapabilityMutation::Update { remote_id, update }
-            if remote_id == "CAP-APP-GROUPS"
-                && update.capability_type == "APP_GROUPS"
-                && update.relationships.app_groups.as_deref() == Some(&["GROUP123".to_owned()])
-    ));
-    assert!(matches!(
-        &mutations[1],
-        DeveloperServicesCapabilityMutation::Create(update)
-            if update.capability_type == "ICLOUD"
-                && update.relationships.cloud_containers.as_deref() == Some(&["CLOUD123".to_owned()])
-    ));
-    assert!(matches!(
-        &mutations[2],
-        DeveloperServicesCapabilityMutation::Delete { remote_id }
-            if remote_id == "CAP-APPLE-PAY"
-    ));
-    assert!(matches!(
-        &mutations[3],
-        DeveloperServicesCapabilityMutation::Delete { remote_id }
-            if remote_id == "CAP-ASSOCIATED"
-    ));
-}
-
-#[test]
-fn capability_sync_is_not_skipped_when_remote_capabilities_need_disabling() {
-    let (_temp, project) = test_project();
-    let target = &project.resolved_manifest.targets[0];
-    let options = CapabilitySyncOptions::default();
-    let remote = vec![RemoteCapability {
-        id: "CAP-ASSOCIATED".to_owned(),
-        capability_type: "ASSOCIATED_DOMAINS".to_owned(),
-        enabled: Some(true),
-        settings: Vec::new(),
-    }];
-
-    assert!(
-        !should_skip_capability_sync(target, &options, &remote),
-        "expected remote capabilities to force a sync even when the target no longer declares entitlements"
-    );
-}
-
-#[test]
-fn api_key_profile_type_uses_ios_profiles_for_watch_and_vision_targets() {
-    let profile = ProfileManifest::new(BuildConfiguration::Release, DistributionKind::AppStore);
-
-    assert_eq!(
-        super::profile_types::asc_profile_type(ApplePlatform::Watchos, &profile).unwrap(),
-        "IOS_APP_STORE"
-    );
-    assert_eq!(
-        super::profile_types::asc_profile_type(ApplePlatform::Visionos, &profile).unwrap(),
-        "IOS_APP_STORE"
-    );
-}
-
-#[test]
-fn plain_push_flag_is_allowed_with_api_key_auth() {
-    let (_temp, mut project) = test_project();
-    project.resolved_manifest.targets[0].push = Some(crate::manifest::PushManifest {
-        broadcast_for_live_activities: false,
-    });
-    let target = &project.resolved_manifest.targets[0];
-    let options = validate_push_setup_with_api_key(target);
-    assert!(options.uses_push_notifications);
-    assert!(!options.uses_broadcast_push_notifications);
-}
-
-#[test]
-fn api_key_path_warns_and_skips_broadcast_push_setting() {
-    let (_temp, mut project) = test_project();
-    project.resolved_manifest.targets[0].push = Some(crate::manifest::PushManifest {
-        broadcast_for_live_activities: true,
-    });
-
-    let target = &project.resolved_manifest.targets[0];
-    let options = validate_push_setup_with_api_key(target);
-    assert!(options.uses_push_notifications);
-    assert!(!options.uses_broadcast_push_notifications);
-}
-
-#[test]
-fn ad_hoc_device_helpers_match_eas_style_reuse_logic() {
-    let devices = vec![
-        CachedDevice {
-            id: "DEV-1".to_owned(),
-            name: "Alice iPhone".to_owned(),
-            udid: "UDID-1".to_owned(),
-            platform: "IOS".to_owned(),
-            status: "ENABLED".to_owned(),
-            device_class: Some("IPHONE".to_owned()),
-            model: Some("iPhone17,1".to_owned()),
-            created_at: Some("2026-03-30T00:00:00Z".to_owned()),
-        },
-        CachedDevice {
-            id: "DEV-2".to_owned(),
-            name: "Bob iPad".to_owned(),
-            udid: "UDID-2".to_owned(),
-            platform: "IOS".to_owned(),
-            status: "ENABLED".to_owned(),
-            device_class: Some("IPAD".to_owned()),
-            model: Some("iPad16,3".to_owned()),
-            created_at: None,
-        },
-    ];
-    let profile = ManagedProfile {
-        id: "PROFILE".to_owned(),
-        profile_type: "IOS_APP_ADHOC".to_owned(),
-        bundle_id: "dev.orbit.fixture".to_owned(),
-        path: std::path::PathBuf::from("/tmp/profile.mobileprovision"),
-        uuid: None,
-        certificate_ids: vec!["CERT".to_owned()],
-        device_ids: vec!["DEV-1".to_owned()],
-    };
-
-    assert_eq!(profile_udids(&profile, &devices), vec!["UDID-1".to_owned()]);
-    assert!(!same_udid_set(
-        &devices
-            .iter()
-            .map(|device| device.udid.clone())
-            .collect::<Vec<_>>(),
-        &profile_udids(&profile, &devices),
-    ));
-    let missing = missing_registered_devices(&devices, &profile_udids(&profile, &devices));
-    assert_eq!(missing.len(), 1);
-    assert!(format_cached_device_label(&devices[0]).contains("UDID-1"));
-    assert!(format_cached_device_label(&devices[0]).contains("Alice iPhone"));
-}
-
-#[test]
-fn current_profile_lookup_prefers_latest_matching_profile() {
-    let first = ManagedProfile {
-        id: "PROFILE-OLD".to_owned(),
-        profile_type: "IOS_APP_ADHOC".to_owned(),
-        bundle_id: "dev.orbit.fixture".to_owned(),
-        path: std::path::PathBuf::from("/tmp/old.mobileprovision"),
-        uuid: None,
-        certificate_ids: vec!["CERT".to_owned()],
-        device_ids: vec!["DEV-1".to_owned()],
-    };
-    let second = ManagedProfile {
-        id: "PROFILE-NEW".to_owned(),
-        profile_type: "IOS_APP_ADHOC".to_owned(),
-        bundle_id: "dev.orbit.fixture".to_owned(),
-        path: std::path::PathBuf::from("/tmp/new.mobileprovision"),
-        uuid: None,
-        certificate_ids: vec!["CERT".to_owned()],
-        device_ids: vec!["DEV-2".to_owned()],
-    };
-    std::fs::write(&first.path, b"old").unwrap();
-    std::fs::write(&second.path, b"new").unwrap();
-    let state = SigningState {
-        certificates: Vec::new(),
-        profiles: vec![first, second],
-    };
-
-    let profile =
-        current_profile_for_target(&state, "dev.orbit.fixture", "IOS_APP_ADHOC", "CERT").unwrap();
-    assert_eq!(profile.id, "PROFILE-NEW");
 }

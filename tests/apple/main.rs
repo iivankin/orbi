@@ -8,7 +8,6 @@ mod e2e_deps;
 mod e2e_hooks;
 mod e2e_ide;
 mod e2e_lifecycle;
-mod e2e_live_apple;
 mod e2e_profile;
 mod e2e_quality;
 mod e2e_run;

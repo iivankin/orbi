@@ -19,7 +19,7 @@ const PLATFORM_ARG_HELP: &str =
 const PLATFORM_ARG_LONG_HELP: &str = "Select a platform when Orbit cannot infer one from the manifest or current command.\n\nCommon values:\n  ios: iPhone and iPad app workflows\n  macos: Mac app workflows\n  tvos: Apple TV workflows\n  visionos: visionOS workflows\n  watchos: watch app and watch extension workflows";
 const DISTRIBUTION_ARG_HELP: &str =
     "Select the packaging and signing mode for the build or submission.";
-const DISTRIBUTION_ARG_LONG_HELP: &str = "Select the packaging and signing mode for the build or submission.\n\nValues:\n  development: local development and debugging\n  ad-hoc: signed device distribution outside the App Store\n  app-store: App Store and TestFlight upload artifacts\n  developer-id: notarized macOS distribution outside the Mac App Store\n  mac-app-store: Mac App Store upload artifacts";
+const DISTRIBUTION_ARG_LONG_HELP: &str = "Select the packaging and signing mode for the build or submission.\n\nValues:\n  development: local development and debugging\n  ad-hoc: signed device distribution outside the App Store\n  app-store: App Store and TestFlight upload artifacts\n  developer-id: signed `.dmg` for notarized macOS distribution outside the Mac App Store\n  mac-app-store: signed `.app` bundle for Mac App Store upload";
 const TRACE_ARG_HELP: &str = "Collect a CPU or memory trace while the command runs.";
 
 #[derive(Debug, Parser)]
@@ -29,7 +29,7 @@ const TRACE_ARG_HELP: &str = "Collect a CPU or memory trace while the command ru
 #[command(styles = CLAP_STYLING)]
 #[command(
     long_about = "Orbit reads app intent from `orbit.json`.\n\nUse the JSON schema to understand manifest fields. Use CLI help for workflows and command behavior. `orbit init` also writes an informational `_description` field that points back here.\n\nEvery command supports `--help` for detailed flags, arguments, and examples. For example: `orbit build --help`, `orbit test --help`, `orbit ui schema --help`.\n\nUse `orbit ui schema` to inspect the accepted `tests.ui` YAML dialect and backend support.",
-    after_help = "Scenarios:\n  Development:\n    Create a new project:\n      orbit init\n\n    Run the app in common modes:\n      orbit run --platform ios --simulator\n      orbit run --platform ios --device --debug\n      orbit run --platform macos\n\n    Capture SwiftUI `#Preview` screenshots:\n      orbit preview list --platform ios\n      orbit preview shot Basic --platform ios\n\n    Check formatting and project semantics:\n      orbit format\n      orbit format --write\n      orbit lint\n\n    Run unit tests:\n      orbit test\n      orbit test --trace\n\n    Run UI tests:\n      orbit test --ui --platform ios\n      orbit test --ui --platform macos\n      orbit test --ui --platform macos --flow onboarding-provider-setup\n\n    Trace UI tests:\n      orbit test --ui --platform ios --trace\n      orbit test --ui --platform macos --trace\n      orbit test --ui --platform macos --trace --flow onboarding-provider-setup\n\n    Inspect recorded traces:\n      orbit inspect-trace .orbit/artifacts/profiles/run.trace\n\n    Inspect the UI test DSL and backend support:\n      orbit ui schema --platform ios\n\n  Build And Submit:\n    Build local development artifacts:\n      orbit build --platform ios --distribution development\n\n    Build release artifacts:\n      orbit build --platform ios --distribution app-store --release\n      orbit build --platform macos --distribution developer-id --release\n\n    Submit a built artifact:\n      orbit submit --platform ios --wait\n      orbit submit --receipt .orbit/receipts/<receipt>.json --wait"
+    after_help = "Scenarios:\n  Development:\n    Create a new project:\n      orbit init\n\n    Run the app in common modes:\n      orbit run --platform ios --simulator\n      orbit run --platform ios --device --debug\n      orbit run --platform macos\n\n    Capture SwiftUI `#Preview` screenshots:\n      orbit preview list --platform ios\n      orbit preview shot Basic --platform ios\n\n    Check formatting and project semantics:\n      orbit format\n      orbit format --write\n      orbit lint\n\n    Run unit tests:\n      orbit test\n      orbit test --trace\n\n    Run UI tests:\n      orbit test --ui --platform ios\n      orbit test --ui --platform macos\n      orbit test --ui --platform macos --flow onboarding-provider-setup\n\n    Trace UI tests:\n      orbit test --ui --platform ios --trace\n      orbit test --ui --platform macos --trace\n      orbit test --ui --platform macos --trace --flow onboarding-provider-setup\n\n    Inspect recorded traces:\n      orbit inspect-trace .orbit/artifacts/profiles/run.trace\n\n    Inspect the UI test DSL and backend support:\n      orbit ui schema --platform ios\n\n  Build And Submit:\n    Build local development artifacts:\n      orbit build --platform ios --distribution development\n\n    Build release artifacts:\n      orbit build --platform ios --distribution app-store --release\n      orbit build --platform macos --distribution developer-id --release\n      orbit build --platform macos --distribution mac-app-store --release\n\n    Submit a built artifact:\n      orbit submit --platform ios --wait\n      orbit submit --receipt .orbit/receipts/<receipt>.json --wait"
 )]
 pub struct Cli {
     #[arg(
@@ -94,8 +94,8 @@ pub enum Command {
     Submit(SubmitArgs),
     /// Remove local and/or remote Orbit-managed state.
     Clean(CleanArgs),
-    /// Apple account, device, and signing utilities.
-    Apple(Box<AppleArgs>),
+    /// App Store Connect sync and signing utilities backed by embedded `asc` config.
+    Asc(Box<AscArgs>),
 }
 
 #[derive(Debug, Args)]
@@ -628,7 +628,7 @@ pub struct RunArgs {
 #[derive(Debug, Args)]
 #[command(
     about = "Produce signed or unsigned build artifacts.",
-    after_help = "Examples:\n  orbit build --platform ios --distribution development\n  orbit build --platform ios --distribution app-store --release\n  orbit build --platform macos --distribution developer-id --release"
+    after_help = "Examples:\n  orbit build --platform ios --distribution development\n  orbit build --platform ios --distribution app-store --release\n  orbit build --platform macos --distribution developer-id --release\n  orbit build --platform macos --distribution mac-app-store --release"
 )]
 pub struct BuildArgs {
     #[arg(
@@ -736,165 +736,136 @@ pub struct CleanArgs {
 }
 
 #[derive(Debug, Args)]
-#[command(about = "Apple account, device, and signing utilities.")]
+#[command(
+    about = "App Store Connect sync and signing utilities backed by the embedded `asc` section in `orbit.json`."
+)]
 #[command(arg_required_else_help = true)]
-pub struct AppleArgs {
+pub struct AscArgs {
     #[command(subcommand)]
-    pub command: AppleCommand,
+    pub command: AscCommand,
 }
 
 #[derive(Debug, Subcommand)]
-pub enum AppleCommand {
-    /// List, register, import, or remove Apple devices.
+pub enum AscCommand {
+    Auth {
+        #[command(subcommand)]
+        command: AscAuthCommand,
+    },
     Device {
         #[command(subcommand)]
-        command: AppleDeviceCommand,
+        command: AscDeviceCommand,
     },
-    /// Export or import signing material managed by Orbit.
+    Validate,
+    Plan,
+    Apply,
+    Revoke(AscRevokeArgs),
+    Submit(AscDirectSubmitArgs),
+    Notarize(AscNotarizeArgs),
     Signing {
         #[command(subcommand)]
-        command: AppleSigningCommand,
+        command: AscSigningCommand,
     },
 }
 
 #[derive(Debug, Subcommand)]
-pub enum AppleDeviceCommand {
-    /// List devices visible to the current Apple account selection.
-    List(ListDevicesArgs),
-    /// Register one device with Apple Developer.
-    Register(RegisterDeviceArgs),
-    /// Import devices from a CSV file.
-    Import(ImportDevicesArgs),
-    /// Remove one registered device.
-    Remove(RemoveDeviceArgs),
+pub enum AscAuthCommand {
+    Import,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum AscDeviceCommand {
+    Add(AscDeviceAddArgs),
+    AddLocal(AscDeviceAddLocalArgs),
 }
 
 #[derive(Debug, Args)]
-pub struct ListDevicesArgs {
-    #[arg(long, help = "Refresh remote device state before printing the list.")]
-    pub refresh: bool,
-}
-
-#[derive(Debug, Args)]
-pub struct RegisterDeviceArgs {
-    #[arg(long, help = "Human-readable device name to register.")]
-    pub name: Option<String>,
-
-    #[arg(long, help = "Device UDID to register.")]
-    pub udid: Option<String>,
-
-    #[arg(
-        long,
-        value_enum,
-        default_value_t = DevicePlatform::Ios,
-        help = "Declared device family for the registration request."
-    )]
-    pub platform: DevicePlatform,
-
-    #[arg(
-        long,
-        conflicts_with_all = ["name", "udid"],
-        help = "Register the current machine instead of passing an explicit name and UDID."
-    )]
-    pub current_machine: bool,
-}
-
-#[derive(Debug, Args)]
-pub struct ImportDevicesArgs {
-    #[arg(
-        long,
-        help = "CSV file to import. Omit to use Orbit's default import source when available."
-    )]
-    pub file: Option<PathBuf>,
-}
-
-#[derive(Debug, Args)]
-pub struct RemoveDeviceArgs {
-    #[arg(long, help = "Orbit or Apple device identifier to remove.")]
+pub struct AscDeviceAddArgs {
+    #[arg(long, value_name = "NAME")]
+    pub name: String,
+    #[arg(long, value_name = "LOGICAL_ID")]
     pub id: Option<String>,
+    #[arg(long, value_enum)]
+    pub family: Option<AscDeviceFamily>,
+    #[arg(long, default_value_t = false)]
+    pub apply: bool,
+    #[arg(long, default_value_t = 300)]
+    pub timeout_seconds: u64,
+}
 
-    #[arg(long, help = "Raw device UDID to remove.")]
+#[derive(Debug, Args)]
+pub struct AscDeviceAddLocalArgs {
+    #[arg(long, value_name = "NAME")]
+    pub name: Option<String>,
+    #[arg(long, value_name = "LOGICAL_ID")]
+    pub id: Option<String>,
+    #[arg(long, default_value_t = false)]
+    pub current_mac: bool,
+    #[arg(long, value_enum)]
+    pub family: Option<AscDeviceFamily>,
+    #[arg(long, value_name = "UDID")]
     pub udid: Option<String>,
+    #[arg(long, default_value_t = false)]
+    pub apply: bool,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, ValueEnum)]
-pub enum DevicePlatform {
-    #[value(name = "ios", help = "iPhone and iPad devices.")]
+pub enum AscDeviceFamily {
+    #[value(name = "ios")]
     Ios,
-    #[value(
-        name = "macos",
-        help = "Mac hardware registered as a development device."
-    )]
-    MacOs,
-    #[value(
-        name = "universal",
-        help = "Device usable across Apple platform families."
-    )]
-    Universal,
+    #[value(name = "ipados")]
+    Ipados,
+    #[value(name = "watchos")]
+    Watchos,
+    #[value(name = "tvos")]
+    Tvos,
+    #[value(name = "visionos")]
+    Visionos,
+    #[value(name = "macos")]
+    Macos,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, ValueEnum)]
+pub enum AscRevokeTarget {
+    Dev,
+    Release,
+    All,
+}
+
+#[derive(Debug, Args)]
+pub struct AscRevokeArgs {
+    #[arg(value_enum)]
+    pub target: AscRevokeTarget,
+}
+
+#[derive(Debug, Args)]
+pub struct AscDirectSubmitArgs {
+    #[arg(long, value_name = "FILE")]
+    pub file: PathBuf,
+    #[arg(long = "bundle-id", value_name = "LOGICAL_ID")]
+    pub bundle_id: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct AscNotarizeArgs {
+    #[arg(long, value_name = "FILE")]
+    pub file: PathBuf,
 }
 
 #[derive(Debug, Subcommand)]
-pub enum AppleSigningCommand {
-    /// Export signing material to a local directory.
-    Export(SigningExportArgs),
-    /// Import signing material from a PKCS#12 archive.
-    Import(SigningImportArgs),
+pub enum AscSigningCommand {
+    Import,
+    PrintBuildSettings,
+    Merge(AscSigningMergeArgs),
 }
 
 #[derive(Debug, Args)]
-pub struct SigningExportArgs {
-    #[arg(
-        long,
-        value_enum,
-        help = PLATFORM_ARG_HELP,
-        long_help = PLATFORM_ARG_LONG_HELP
-    )]
-    pub platform: Option<TargetPlatform>,
-
-    #[arg(
-        long,
-        value_enum,
-        help = DISTRIBUTION_ARG_HELP,
-        long_help = DISTRIBUTION_ARG_LONG_HELP
-    )]
-    pub distribution: Option<DistributionArg>,
-
-    #[arg(
-        long,
-        help = "Directory where Orbit should write the exported certificates, profiles, and metadata."
-    )]
-    pub output_dir: Option<PathBuf>,
-}
-
-#[derive(Debug, Args)]
-pub struct SigningImportArgs {
-    #[arg(
-        long,
-        value_enum,
-        help = PLATFORM_ARG_HELP,
-        long_help = PLATFORM_ARG_LONG_HELP
-    )]
-    pub platform: Option<TargetPlatform>,
-
-    #[arg(
-        long,
-        value_enum,
-        help = DISTRIBUTION_ARG_HELP,
-        long_help = DISTRIBUTION_ARG_LONG_HELP
-    )]
-    pub distribution: Option<DistributionArg>,
-
-    #[arg(
-        long,
-        help = "Path to the PKCS#12 archive that contains the signing certificate and private key."
-    )]
-    pub p12: PathBuf,
-
-    #[arg(
-        long,
-        help = "Password used to decrypt the PKCS#12 archive, if it is encrypted."
-    )]
-    pub password: Option<String>,
+pub struct AscSigningMergeArgs {
+    #[arg(long, value_name = "FILE")]
+    pub base: PathBuf,
+    #[arg(long, value_name = "FILE")]
+    pub ours: PathBuf,
+    #[arg(long, value_name = "FILE")]
+    pub theirs: PathBuf,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, ValueEnum)]
@@ -927,10 +898,13 @@ pub enum DistributionArg {
     AppStore,
     #[value(
         name = "developer-id",
-        help = "Notarized macOS distribution outside the Mac App Store."
+        help = "Signed `.dmg` for notarized macOS distribution outside the Mac App Store."
     )]
     DeveloperId,
-    #[value(name = "mac-app-store", help = "Mac App Store upload artifacts.")]
+    #[value(
+        name = "mac-app-store",
+        help = "Signed `.app` bundle for Mac App Store upload."
+    )]
     MacAppStore,
 }
 
@@ -990,6 +964,7 @@ mod tests {
 
         assert!(help.contains("Select the packaging and signing mode"));
         assert!(help.contains("App Store and TestFlight upload artifacts"));
+        assert!(help.contains("developer-id"));
     }
 
     #[test]

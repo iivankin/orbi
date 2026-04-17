@@ -6,7 +6,8 @@ use crate::support::{
     create_build_xcrun_mock, create_codesign_mock, create_ditto_mock, create_home,
     create_macos_universal_workspace, create_mixed_language_workspace, create_resource_workspace,
     create_security_mock, create_signing_workspace, create_sw_vers_mock, create_watch_workspace,
-    create_watch_xcrun_mock, create_xcodebuild_mock, read_log, run_and_capture, spawn_asc_mock,
+    create_watch_xcrun_mock, create_xcodebuild_mock, prepare_embedded_asc_state, read_log,
+    run_and_capture, spawn_asc_mock,
 };
 
 fn build_command(
@@ -33,17 +34,8 @@ fn distribution_build_command(
     home: &std::path::Path,
     mock_bin: &std::path::Path,
     log_path: &std::path::Path,
-    base_url: &str,
-    api_key_path: &std::path::Path,
 ) -> std::process::Command {
     let mut command = base_command(workspace, home, mock_bin, log_path);
-    command.env("ORBIT_ASC_BASE_URL", base_url);
-    command.env("ORBIT_ASC_API_KEY_PATH", api_key_path);
-    command.env("ORBIT_ASC_KEY_ID", "KEY1234567");
-    command.env(
-        "ORBIT_ASC_ISSUER_ID",
-        "00000000-0000-0000-0000-000000000000",
-    );
     command.args([
         "--non-interactive",
         "--manifest",
@@ -63,17 +55,8 @@ fn macos_build_command(
     home: &std::path::Path,
     mock_bin: &std::path::Path,
     log_path: &std::path::Path,
-    base_url: &str,
-    api_key_path: &std::path::Path,
 ) -> std::process::Command {
     let mut command = base_command(workspace, home, mock_bin, log_path);
-    command.env("ORBIT_ASC_BASE_URL", base_url);
-    command.env("ORBIT_ASC_API_KEY_PATH", api_key_path);
-    command.env("ORBIT_ASC_KEY_ID", "KEY1234567");
-    command.env(
-        "ORBIT_ASC_ISSUER_ID",
-        "00000000-0000-0000-0000-000000000000",
-    );
     command.args([
         "--non-interactive",
         "--manifest",
@@ -391,16 +374,20 @@ fn distribution_build_reuses_signing_and_export_outputs_between_runs() {
         "dev.orbit.fixture",
         "ExampleApp",
         false,
+        false,
     );
-
-    let mut first = distribution_build_command(
+    let api_base_url = format!("{}/v1", server.base_url);
+    prepare_embedded_asc_state(
         &workspace,
         &home,
         &mock_bin,
         &log_path,
-        &server.base_url,
+        &api_base_url,
         &api_key_path,
     );
+    server.shutdown();
+
+    let mut first = distribution_build_command(&workspace, &home, &mock_bin, &log_path);
     let first_output = run_and_capture(&mut first);
     assert!(
         first_output.status.success(),
@@ -415,22 +402,13 @@ fn distribution_build_reuses_signing_and_export_outputs_between_runs() {
 
     clear_log(&log_path);
 
-    let mut second = distribution_build_command(
-        &workspace,
-        &home,
-        &mock_bin,
-        &log_path,
-        &server.base_url,
-        &api_key_path,
-    );
+    let mut second = distribution_build_command(&workspace, &home, &mock_bin, &log_path);
     let second_output = run_and_capture(&mut second);
     assert!(
         second_output.status.success(),
         "{}",
         String::from_utf8_lossy(&second_output.stderr)
     );
-
-    server.shutdown();
 
     let second_log = read_log(&log_path);
     assert!(!second_log.contains("xcrun --sdk iphoneos swiftc"));
@@ -463,16 +441,20 @@ fn universal_macos_build_reuses_cached_lipo_merge_between_runs() {
         "dev.orbit.fixture.macos-universal",
         "ExampleMacApp",
         false,
+        false,
     );
-
-    let mut first = macos_build_command(
+    let api_base_url = format!("{}/v1", server.base_url);
+    prepare_embedded_asc_state(
         &workspace,
         &home,
         &mock_bin,
         &log_path,
-        &server.base_url,
+        &api_base_url,
         &api_key_path,
     );
+    server.shutdown();
+
+    let mut first = macos_build_command(&workspace, &home, &mock_bin, &log_path);
     let first_output = run_and_capture(&mut first);
     assert!(
         first_output.status.success(),
@@ -485,22 +467,13 @@ fn universal_macos_build_reuses_cached_lipo_merge_between_runs() {
 
     clear_log(&log_path);
 
-    let mut second = macos_build_command(
-        &workspace,
-        &home,
-        &mock_bin,
-        &log_path,
-        &server.base_url,
-        &api_key_path,
-    );
+    let mut second = macos_build_command(&workspace, &home, &mock_bin, &log_path);
     let second_output = run_and_capture(&mut second);
     assert!(
         second_output.status.success(),
         "{}",
         String::from_utf8_lossy(&second_output.stderr)
     );
-
-    server.shutdown();
 
     let second_log = read_log(&log_path);
     assert!(!second_log.contains("xcrun lipo -create -output"));

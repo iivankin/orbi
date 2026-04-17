@@ -153,10 +153,6 @@ pub fn build_artifact(project: &ProjectContext, args: &BuildArgs) -> Result<()> 
         output: args.output.clone(),
         provisioning_udids: None,
     };
-    if request_requires_signing(&request) {
-        crate::apple::auth::ensure_project_authenticated(project)?;
-    }
-
     let outcome = build_project(project, &request, BuildOutputMode::UserFacing)?;
     crate::util::print_success(format!(
         "Built {} for {}.",
@@ -220,9 +216,6 @@ fn build_for_testing_destination_with_output(
         output: None,
         provisioning_udids: None,
     };
-    if request_requires_signing(&request) {
-        crate::apple::auth::ensure_project_authenticated(project)?;
-    }
     build_project(project, &request, output_mode)
 }
 
@@ -313,10 +306,6 @@ pub fn run_on_destination(project: &ProjectContext, args: &RunArgs) -> Result<()
             .as_ref()
             .map(|device| vec![device.provisioning_udid().to_owned()]),
     };
-    if request_requires_signing(&request) {
-        crate::apple::auth::ensure_project_authenticated(project)?;
-    }
-
     let outcome = build_project(project, &request, BuildOutputMode::UserFacing)?;
     crate::util::print_success(format!(
         "Built {} for {}.",
@@ -489,6 +478,7 @@ fn build_project(
         .context("root target did not build")?;
     let artifact_path = export_artifact(
         project,
+        root_target,
         platform,
         root_target_built,
         request.output.as_deref(),

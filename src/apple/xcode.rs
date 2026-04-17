@@ -1,102 +1,21 @@
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::thread;
-use std::time::Duration;
+use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 use plist::Value as PlistValue;
-use reqwest::blocking::Client as HttpClient;
-use reqwest::header::{HeaderMap, USER_AGENT};
-use serde::Deserialize;
-use walkdir::WalkDir;
 
-use crate::apple::developer_services::DeveloperServicesClient;
-use crate::apple::xar_stream;
 use crate::context::AppContext;
-use crate::util::{
-    CliDownloadProgress, CliSpinner, ensure_dir, ensure_parent_dir, prompt_select, run_command,
-};
+use crate::util::prompt_select;
 
-#[path = "xcode/install.rs"]
-mod install;
 #[path = "xcode/selection.rs"]
 mod selection;
 
 #[cfg(test)]
-use self::install::matching_downloadable_xcodes;
-use self::install::{fetch_downloadable_xcodes, install_requested_xcode};
 use self::selection::{
-    compare_versions, load_xcode_bundle, preferred_xcode_install_root, version_matches,
+    compare_versions, discover_xcodes_under, resolve_requested_xcode_in_roots, version_matches,
 };
-#[cfg(test)]
-use self::selection::{
-    configured_xcode_install_root, discover_xcodes_under, resolve_requested_xcode_in_roots,
-};
-
-const XCODE_RELEASES_INDEX_URL: &str = "https://xcodereleases.com/data.json";
-const XCODE_RELEASES_USER_AGENT: &str = concat!("Orbit/", env!("CARGO_PKG_VERSION"));
-const XCODE_DOWNLOAD_RETRY_ATTEMPTS: usize = 3;
-const XCODE_DOWNLOAD_RETRY_DELAY: Duration = Duration::from_millis(750);
-
-#[derive(Debug, Clone)]
-struct DownloadableXcode {
-    version: String,
-    build_version: String,
-    variant_label: String,
-    variant_rank: u8,
-    archive_url: String,
-    archive_filename: String,
-    remote_path: String,
-}
-
-impl DownloadableXcode {
-    fn display_name(&self) -> String {
-        format!("Xcode {} ({})", self.version, self.variant_label)
-    }
-
-    fn install_bundle_name(&self) -> String {
-        format!("Xcode-{}.app", self.version)
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct XcodeReleasesEntry {
-    name: String,
-    version: XcodeReleasesVersion,
-    #[serde(default)]
-    links: XcodeReleasesLinks,
-}
-
-#[derive(Debug, Deserialize)]
-struct XcodeReleasesVersion {
-    number: String,
-    build: Option<String>,
-    #[serde(default)]
-    release: XcodeReleasesState,
-}
-
-#[derive(Debug, Default, Deserialize)]
-struct XcodeReleasesState {
-    #[serde(default)]
-    release: bool,
-    #[serde(default)]
-    gm: bool,
-}
-
-#[derive(Debug, Default, Deserialize)]
-struct XcodeReleasesLinks {
-    download: Option<XcodeReleasesDownload>,
-}
-
-#[derive(Debug, Deserialize)]
-struct XcodeReleasesDownload {
-    url: String,
-    #[serde(default)]
-    architectures: Vec<String>,
-}
 
 #[derive(Debug, Clone)]
 pub struct SelectedXcode {
@@ -237,9 +156,8 @@ mod tests {
     use plist::Value as PlistValue;
 
     use super::{
-        SelectedXcode, XcodeReleasesEntry, compare_versions, configured_xcode_install_root,
-        developer_dir_path, discover_xcodes_under, lldb_path, log_redirect_dylib_path,
-        matching_downloadable_xcodes, open_simulator_command, resolve_requested_xcode_in_roots,
+        SelectedXcode, compare_versions, developer_dir_path, discover_xcodes_under, lldb_path,
+        log_redirect_dylib_path, open_simulator_command, resolve_requested_xcode_in_roots,
         version_matches,
     };
 
@@ -319,7 +237,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_xcode_error_mentions_native_install_when_not_installed() {
+    fn missing_xcode_error_mentions_manual_install_when_not_installed() {
         let error = resolve_requested_xcode_in_roots(
             Some("26.4"),
             &[PathBuf::from("/definitely-missing")],
@@ -328,111 +246,7 @@ mod tests {
         .unwrap_err()
         .to_string();
 
-        assert!(error.contains("Orbit can download and install"));
-    }
-
-    #[test]
-    fn matching_downloadable_xcodes_prefers_exact_stable_release_variants() {
-        let entries: Vec<XcodeReleasesEntry> = serde_json::from_str(
-            r#"
-            [
-              {
-                "name": "Xcode (Apple Silicon)",
-                "version": {
-                  "number": "26.4",
-                  "build": "17E192",
-                  "release": {"release": true}
-                },
-                "links": {
-                  "download": {
-                    "url": "https://download.developer.apple.com/Developer_Tools/Xcode_26.4/Xcode_26.4_Apple_silicon.xip",
-                    "architectures": ["arm64"]
-                  }
-                }
-              },
-              {
-                "name": "Xcode",
-                "version": {
-                  "number": "26.4",
-                  "build": "17E192",
-                  "release": {"release": true}
-                },
-                "links": {
-                  "download": {
-                    "url": "https://download.developer.apple.com/Developer_Tools/Xcode_26.4/Xcode_26.4_Universal.xip",
-                    "architectures": ["arm64", "x86_64"]
-                  }
-                }
-              },
-              {
-                "name": "Xcode",
-                "version": {
-                  "number": "26.4",
-                  "build": "17E5179g",
-                  "release": {"beta": 3}
-                },
-                "links": {
-                  "download": {
-                    "url": "https://download.developer.apple.com/Developer_Tools/Xcode_26.4_beta_3/Xcode_26.4_beta_3_Universal.xip",
-                    "architectures": ["arm64", "x86_64"]
-                  }
-                }
-              }
-            ]
-            "#,
-        )
-        .unwrap();
-
-        let candidates = matching_downloadable_xcodes("26.4", &entries).unwrap();
-        assert_eq!(candidates.len(), 2);
-        assert!(
-            candidates
-                .iter()
-                .all(|candidate| candidate.build_version == "17E192")
-        );
-    }
-
-    #[test]
-    fn matching_downloadable_xcodes_uses_latest_stable_prefix_match() {
-        let entries: Vec<XcodeReleasesEntry> = serde_json::from_str(
-            r#"
-            [
-              {
-                "name": "Xcode",
-                "version": {
-                  "number": "26.3",
-                  "build": "17D5044a",
-                  "release": {"release": true}
-                },
-                "links": {
-                  "download": {
-                    "url": "https://download.developer.apple.com/Developer_Tools/Xcode_26.3/Xcode_26.3_Universal.xip",
-                    "architectures": ["arm64", "x86_64"]
-                  }
-                }
-              },
-              {
-                "name": "Xcode",
-                "version": {
-                  "number": "26.4",
-                  "build": "17E192",
-                  "release": {"release": true}
-                },
-                "links": {
-                  "download": {
-                    "url": "https://download.developer.apple.com/Developer_Tools/Xcode_26.4/Xcode_26.4_Universal.xip",
-                    "architectures": ["arm64", "x86_64"]
-                  }
-                }
-              }
-            ]
-            "#,
-        )
-        .unwrap();
-
-        let candidates = matching_downloadable_xcodes("26", &entries).unwrap();
-        assert_eq!(candidates.len(), 1);
-        assert_eq!(candidates[0].version, "26.4");
+        assert!(error.contains("Install the requested Xcode.app manually"));
     }
 
     #[test]
@@ -514,21 +328,5 @@ mod tests {
             log_redirect_dylib_path(Some(&selected)).unwrap(),
             log_redirect
         );
-    }
-
-    #[test]
-    fn configured_install_root_uses_single_override_search_root() {
-        let temp = tempfile::tempdir().unwrap();
-        let install_root = temp.path().join("Xcodes");
-        fs::create_dir_all(&install_root).unwrap();
-        unsafe {
-            std::env::set_var("ORBIT_XCODE_SEARCH_ROOTS", &install_root);
-        }
-        let resolved = configured_xcode_install_root(std::slice::from_ref(&install_root));
-        unsafe {
-            std::env::remove_var("ORBIT_XCODE_SEARCH_ROOTS");
-        }
-
-        assert_eq!(resolved, Some(install_root));
     }
 }

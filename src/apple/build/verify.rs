@@ -15,22 +15,10 @@ pub(crate) fn should_verify_developer_id_artifact(receipt: &BuildReceipt) -> boo
 pub(crate) fn verify_post_build(receipt: &BuildReceipt) -> Result<String> {
     let verifier = DeveloperIdArtifactVerifier::new(receipt)?;
     verifier.verify_codesign()?;
-    verifier.verify_pkg_signature()?;
+    verifier.verify_artifact_signature()?;
     let gatekeeper = verifier.verify_gatekeeper_before_notarization()?;
     Ok(format!(
         "Verified Developer ID signing for `{}`; Gatekeeper reports `{gatekeeper}` before notarization.",
-        receipt.artifact_path.display()
-    ))
-}
-
-pub(crate) fn verify_post_notarization(receipt: &BuildReceipt) -> Result<String> {
-    let verifier = DeveloperIdArtifactVerifier::new(receipt)?;
-    verifier.verify_codesign()?;
-    verifier.verify_pkg_signature()?;
-    verifier.verify_stapled_ticket()?;
-    verifier.verify_gatekeeper_after_notarization()?;
-    Ok(format!(
-        "Verified notarized Developer ID package `{}` with stapled ticket.",
         receipt.artifact_path.display()
     ))
 }
@@ -93,23 +81,23 @@ impl<'a> DeveloperIdArtifactVerifier<'a> {
         Ok(())
     }
 
-    fn verify_pkg_signature(&self) -> Result<()> {
-        let (success, stdout, stderr) = run_capture("pkgutil", |command| {
-            command.args(["--check-signature"]);
+    fn verify_artifact_signature(&self) -> Result<()> {
+        let (success, stdout, stderr) = run_capture("codesign", |command| {
+            command.args(["-dv", "--verbose=4"]);
             command.arg(&self.receipt.artifact_path);
         })?;
         if !success {
             return Err(command_failure(
-                "pkg signature verification",
+                "artifact signature verification",
                 &self.receipt.artifact_path,
                 &stdout,
                 &stderr,
             ));
         }
         let output = combine_command_output(&stdout, &stderr);
-        if !output.contains("Developer ID Installer:") {
+        if !output.contains("Developer ID Application:") {
             bail!(
-                "pkgutil verification for `{}` did not report a Developer ID Installer identity\n{}",
+                "codesign verification for `{}` did not report a Developer ID Application identity\n{}",
                 self.receipt.artifact_path.display(),
                 output
             );
@@ -119,43 +107,10 @@ impl<'a> DeveloperIdArtifactVerifier<'a> {
 
     fn verify_gatekeeper_before_notarization(&self) -> Result<&'static str> {
         let (success, stdout, stderr) = run_capture("spctl", |command| {
-            command.args(["-a", "-vvv", "--type", "install"]);
+            command.args(["-a", "-vvv", "--type", "open"]);
             command.arg(&self.receipt.artifact_path);
         })?;
         classify_pre_notary_gatekeeper_result(&stdout, &stderr, success)
-    }
-
-    fn verify_stapled_ticket(&self) -> Result<()> {
-        let (success, stdout, stderr) = run_capture("xcrun", |command| {
-            command.arg("stapler");
-            command.arg("validate");
-            command.arg(&self.receipt.artifact_path);
-        })?;
-        if !success {
-            return Err(command_failure(
-                "stapler validation",
-                &self.receipt.artifact_path,
-                &stdout,
-                &stderr,
-            ));
-        }
-        Ok(())
-    }
-
-    fn verify_gatekeeper_after_notarization(&self) -> Result<()> {
-        let (success, stdout, stderr) = run_capture("spctl", |command| {
-            command.args(["-a", "-vvv", "--type", "install"]);
-            command.arg(&self.receipt.artifact_path);
-        })?;
-        if !success {
-            return Err(command_failure(
-                "Gatekeeper notarization validation",
-                &self.receipt.artifact_path,
-                &stdout,
-                &stderr,
-            ));
-        }
-        Ok(())
     }
 }
 
@@ -172,7 +127,7 @@ fn classify_pre_notary_gatekeeper_result(
         return Ok("unnotarized-developer-id");
     }
     bail!(
-        "Gatekeeper rejected the package for an unexpected reason before notarization\n{}",
+        "Gatekeeper rejected the artifact for an unexpected reason before notarization\n{}",
         output
     );
 }

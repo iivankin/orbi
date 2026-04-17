@@ -71,11 +71,41 @@ pub fn create_signing_workspace(root: &Path) -> PathBuf {
             "bundle_id": "dev.orbit.fixture",
             "version": "0.1.0",
             "build": 1,
-            "team_id": "TEAM123456",
             "platforms": {
                 "ios": "18.0"
             },
-            "sources": ["Sources/App"]
+            "sources": ["Sources/App"],
+            "asc": {
+                "team_id": "TEAM123456",
+                "bundle_ids": {
+                    "app": {
+                        "bundle_id": "dev.orbit.fixture",
+                        "name": "ExampleApp",
+                        "platform": "ios"
+                    }
+                },
+                "devices": {
+                    "fixture-device": {
+                        "family": "ios",
+                        "udid": "00008110-0000000000000001",
+                        "name": "Fixture Device"
+                    }
+                },
+                "certs": {
+                    "ios-distribution": {
+                        "type": "distribution",
+                        "name": "Example Distribution"
+                    }
+                },
+                "profiles": {
+                    "ios-app-store": {
+                        "name": "Example iOS App Store",
+                        "type": "ios_app_store",
+                        "bundle_id": "app",
+                        "certs": ["ios-distribution"]
+                    }
+                }
+            }
         }),
     )
 }
@@ -179,14 +209,137 @@ pub fn create_macos_universal_workspace(root: &Path) -> PathBuf {
             "bundle_id": "dev.orbit.fixture.macos-universal",
             "version": "0.1.0",
             "build": 1,
-            "team_id": "TEAM123456",
             "platforms": {
                 "macos": "15.0"
             },
             "macos": {
                 "universal_binary": true
             },
-            "sources": ["Sources/App"]
+            "sources": ["Sources/App"],
+            "asc": {
+                "team_id": "TEAM123456",
+                "bundle_ids": {
+                    "app": {
+                        "bundle_id": "dev.orbit.fixture.macos-universal",
+                        "name": "ExampleMacApp",
+                        "platform": "mac_os"
+                    }
+                },
+                "devices": {
+                    "fixture-mac": {
+                        "family": "macos",
+                        "udid": "00000000-0000-0000-0000-000000000001",
+                        "name": "Fixture Mac"
+                    }
+                },
+                "certs": {
+                    "mac-development": {
+                        "type": "development",
+                        "name": "Example Development"
+                    }
+                },
+                "profiles": {
+                    "mac-development": {
+                        "name": "Example Mac Development",
+                        "type": "mac_app_development",
+                        "bundle_id": "app",
+                        "certs": ["mac-development"],
+                        "devices": ["fixture-mac"]
+                    }
+                }
+            }
+        }),
+    )
+}
+
+pub fn create_macos_developer_id_workspace(root: &Path) -> PathBuf {
+    create_workspace(
+        root,
+        "macos-developer-id-workspace",
+        &[(
+            "Sources/App/App.swift",
+            "import SwiftUI\n@main struct ExampleMacApp: App { var body: some Scene { WindowGroup { Text(\"Mac\") } } }\n",
+        )],
+        &serde_json::json!({
+            "$schema": "/tmp/.orbit/schemas/apple-app.v1.json",
+            "name": "ExampleMacApp",
+            "bundle_id": "dev.orbit.fixture.macos-direct",
+            "version": "0.1.0",
+            "build": 1,
+            "platforms": {
+                "macos": "15.0"
+            },
+            "sources": ["Sources/App"],
+            "asc": {
+                "team_id": "TEAM123456",
+                "bundle_ids": {
+                    "app": {
+                        "bundle_id": "dev.orbit.fixture.macos-direct",
+                        "name": "ExampleMacApp",
+                        "platform": "mac_os"
+                    }
+                },
+                "certs": {
+                    "developer-id": {
+                        "type": "developer_id_application",
+                        "name": "Developer ID Application: Example Team"
+                    }
+                },
+                "profiles": {
+                    "mac-direct": {
+                        "name": "Example Mac Direct",
+                        "type": "mac_app_direct",
+                        "bundle_id": "app",
+                        "certs": ["developer-id"]
+                    }
+                }
+            }
+        }),
+    )
+}
+
+pub fn create_macos_app_store_workspace(root: &Path) -> PathBuf {
+    create_workspace(
+        root,
+        "macos-app-store-workspace",
+        &[(
+            "Sources/App/App.swift",
+            "import SwiftUI\n@main struct ExampleMacApp: App { var body: some Scene { WindowGroup { Text(\"Mac\") } } }\n",
+        )],
+        &serde_json::json!({
+            "$schema": "/tmp/.orbit/schemas/apple-app.v1.json",
+            "name": "ExampleMacApp",
+            "bundle_id": "dev.orbit.fixture.macos-store",
+            "version": "0.1.0",
+            "build": 1,
+            "platforms": {
+                "macos": "15.0"
+            },
+            "sources": ["Sources/App"],
+            "asc": {
+                "team_id": "TEAM123456",
+                "bundle_ids": {
+                    "app": {
+                        "bundle_id": "dev.orbit.fixture.macos-store",
+                        "name": "ExampleMacApp",
+                        "platform": "mac_os"
+                    }
+                },
+                "certs": {
+                    "mac-distribution": {
+                        "type": "distribution",
+                        "name": "Apple Distribution: Example Team"
+                    }
+                },
+                "profiles": {
+                    "mac-store": {
+                        "name": "Example Mac App Store",
+                        "type": "mac_app_store",
+                        "bundle_id": "app",
+                        "certs": ["mac-distribution"]
+                    }
+                }
+            }
         }),
     )
 }

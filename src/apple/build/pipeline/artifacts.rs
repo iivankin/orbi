@@ -11,11 +11,14 @@ use super::cache::{
     cached_exported_artifact_path, compute_artifact_fingerprint, write_artifact_cache,
 };
 use crate::context::ProjectContext;
-use crate::manifest::{ApplePlatform, DistributionKind, ProfileManifest, TargetKind};
+use crate::manifest::{
+    ApplePlatform, DistributionKind, ProfileManifest, TargetKind, TargetManifest,
+};
 use crate::util::{copy_dir_recursive, copy_file, ensure_dir, resolve_path, run_command};
 
 pub(super) fn export_artifact(
     project: &ProjectContext,
+    target: &TargetManifest,
     platform: ApplePlatform,
     built_target: &BuiltTarget,
     explicit_output: Option<&Path>,
@@ -103,6 +106,7 @@ pub(super) fn export_artifact(
         }
         DistributionKind::DeveloperId | DistributionKind::MacAppStore => export_macos_artifact(
             project,
+            target,
             platform,
             built_target,
             explicit_output,
@@ -126,6 +130,7 @@ pub(super) fn remove_existing_path(path: &Path) -> Result<()> {
 
 fn export_macos_artifact(
     project: &ProjectContext,
+    target: &TargetManifest,
     platform: ApplePlatform,
     built_target: &BuiltTarget,
     explicit_output: Option<&Path>,
@@ -135,20 +140,96 @@ fn export_macos_artifact(
     if platform != ApplePlatform::Macos {
         bail!("macOS artifact export was requested for non-macOS platform `{platform}`");
     }
-    let artifact_name = explicit_output.map(Path::to_path_buf).unwrap_or_else(|| {
-        project.project_paths.artifacts_dir.join(format!(
-            "{}-{:?}.pkg",
-            built_target.target_name, profile.distribution
-        ))
-    });
-    let artifact_path = resolve_path(&project.root, &artifact_name);
     let signed_bundle_fingerprint = signed_bundle_fingerprint.with_context(|| {
         format!(
             "missing signing fingerprint for exported artifact `{}`",
             built_target.target_name
         )
     })?;
-    let signing = crate::apple::signing::prepare_package_signing(project, profile)?;
+    match profile.distribution {
+        DistributionKind::MacAppStore => export_signed_macos_app_bundle(
+            project,
+            built_target,
+            explicit_output,
+            profile,
+            signed_bundle_fingerprint,
+        ),
+        DistributionKind::DeveloperId => export_signed_macos_disk_image(
+            project,
+            target,
+            platform,
+            built_target,
+            explicit_output,
+            profile,
+            signed_bundle_fingerprint,
+        ),
+        _ => unreachable!("macOS artifact export only handles release macOS distributions"),
+    }
+}
+
+fn export_signed_macos_app_bundle(
+    project: &ProjectContext,
+    built_target: &BuiltTarget,
+    explicit_output: Option<&Path>,
+    profile: &ProfileManifest,
+    signed_bundle_fingerprint: &str,
+) -> Result<std::path::PathBuf> {
+    let artifact_name = explicit_output.map(Path::to_path_buf).unwrap_or_else(|| {
+        project.project_paths.artifacts_dir.join(format!(
+            "{}-{:?}.app",
+            built_target.target_name, profile.distribution
+        ))
+    });
+    let artifact_path = resolve_path(&project.root, &artifact_name);
+    let artifact_fingerprint =
+        compute_artifact_fingerprint(profile.distribution, signed_bundle_fingerprint, None);
+    if let Some(cached_artifact) = cached_exported_artifact_path(
+        &built_target.target_dir,
+        &artifact_path,
+        &artifact_fingerprint,
+    )? {
+        return reuse_cached_artifact(
+            &built_target.target_dir,
+            &artifact_fingerprint,
+            &cached_artifact,
+            &artifact_path,
+        );
+    }
+
+    if built_target.bundle_path != artifact_path {
+        remove_existing_path(&artifact_path)?;
+        copy_product(&built_target.bundle_path, &artifact_path)?;
+    }
+    write_artifact_cache(
+        &built_target.target_dir,
+        &artifact_fingerprint,
+        &artifact_path,
+    )?;
+    Ok(artifact_path)
+}
+
+fn export_signed_macos_disk_image(
+    project: &ProjectContext,
+    target: &TargetManifest,
+    platform: ApplePlatform,
+    built_target: &BuiltTarget,
+    explicit_output: Option<&Path>,
+    profile: &ProfileManifest,
+    signed_bundle_fingerprint: &str,
+) -> Result<std::path::PathBuf> {
+    let artifact_name = explicit_output.map(Path::to_path_buf).unwrap_or_else(|| {
+        project.project_paths.artifacts_dir.join(format!(
+            "{}-{:?}.dmg",
+            built_target.target_name, profile.distribution
+        ))
+    });
+    let artifact_path = resolve_path(&project.root, &artifact_name);
+    let signing = crate::apple::signing::prepare_distribution_artifact_signing(
+        project,
+        &target.bundle_id,
+        platform,
+        profile,
+    )?;
     let artifact_fingerprint = compute_artifact_fingerprint(
         profile.distribution,
         signed_bundle_fingerprint,
@@ -166,22 +247,42 @@ fn export_macos_artifact(
             &artifact_path,
         );
     }
+
     remove_existing_path(&artifact_path)?;
-    let mut command = Command::new("productbuild");
-    command.arg("--component");
-    command.arg(&built_target.bundle_path);
-    command.arg("/Applications");
-    command.arg("--sign").arg(&signing.signing_identity);
-    command.arg("--keychain").arg(&signing.keychain_path);
-    command.arg("--timestamp");
-    command.arg(&artifact_path);
-    run_command(&mut command)?;
+    create_disk_image(
+        &built_target.bundle_path,
+        &built_target.target_name,
+        &artifact_path,
+    )?;
+    sign_disk_image(&signing, &artifact_path)?;
     write_artifact_cache(
         &built_target.target_dir,
         &artifact_fingerprint,
         &artifact_path,
     )?;
     Ok(artifact_path)
+}
+
+fn create_disk_image(bundle_path: &Path, volume_name: &str, artifact_path: &Path) -> Result<()> {
+    let mut command = Command::new("hdiutil");
+    command.args(["create", "-fs", "HFS+", "-format", "UDZO", "-volname"]);
+    command.arg(volume_name);
+    command.arg("-srcfolder").arg(bundle_path);
+    command.arg(artifact_path);
+    run_command(&mut command)
+}
+
+fn sign_disk_image(
+    signing: &crate::apple::signing::ArtifactSigningMaterial,
+    artifact_path: &Path,
+) -> Result<()> {
+    let mut command = Command::new("codesign");
+    command.args(["--force", "--sign"]);
+    command.arg(&signing.signing_identity);
+    command.args(["--keychain"]);
+    command.arg(&signing.keychain_path);
+    command.arg(artifact_path);
+    run_command(&mut command)
 }
 
 fn export_non_app_artifact(

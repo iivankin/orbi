@@ -2,7 +2,7 @@ use std::fs;
 
 use anyhow::Result;
 
-use crate::apple::signing::{clean_local_signing_state, clean_remote_signing_state};
+use crate::apple::signing::clean_local_signing_state;
 use crate::cli::CleanArgs;
 use crate::context::ProjectContext;
 use crate::util::prompt_confirm;
@@ -35,6 +35,10 @@ impl CleanupPlan {
 
 pub fn clean_project(project: &ProjectContext, args: &CleanArgs) -> Result<()> {
     let mut plan = cleanup_plan(args);
+    let signing_bundle_path = project
+        .manifest_path
+        .parent()
+        .map(|root| root.join(asc_sync::bundle::BUNDLE_FILE_NAME));
 
     if plan.cleans_apple()
         && project.app.interactive
@@ -51,7 +55,7 @@ pub fn clean_project(project: &ProjectContext, args: &CleanArgs) -> Result<()> {
     // Orbit-managed profiles and identifiers belong to this project.
     let remote_summary = plan
         .cleans_apple()
-        .then(|| clean_remote_signing_state(project))
+        .then(|| crate::asc::revoke_for_clean(project))
         .transpose()?;
 
     if plan.cleans_local_state() && project.project_paths.orbit_dir.exists() {
@@ -59,6 +63,17 @@ pub fn clean_project(project: &ProjectContext, args: &CleanArgs) -> Result<()> {
         println!(
             "removed_local_orbit_dir: {}",
             project.project_paths.orbit_dir.display()
+        );
+    }
+
+    if plan.cleans_local_state()
+        && let Some(signing_bundle_path) = &signing_bundle_path
+        && signing_bundle_path.exists()
+    {
+        fs::remove_file(signing_bundle_path)?;
+        println!(
+            "removed_local_signing_bundle: {}",
+            signing_bundle_path.display()
         );
     }
 
@@ -71,15 +86,8 @@ pub fn clean_project(project: &ProjectContext, args: &CleanArgs) -> Result<()> {
         );
     }
 
-    if let Some(summary) = remote_summary {
-        println!("removed_remote_profiles: {}", summary.removed_profiles);
-        println!("removed_remote_apps: {}", summary.removed_apps);
-        println!("removed_remote_app_groups: {}", summary.removed_app_groups);
-        println!("removed_remote_merchants: {}", summary.removed_merchants);
-        println!(
-            "removed_remote_cloud_containers: {}",
-            summary.removed_cloud_containers
-        );
+    if remote_summary.is_some() {
+        println!("revoked_remote_asc_state: true");
     }
 
     Ok(())

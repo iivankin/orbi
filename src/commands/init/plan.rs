@@ -17,6 +17,13 @@ const DEFAULT_WATCH_APP_SOURCE_DIR: &str = "Sources/WatchApp";
 const DEFAULT_WATCH_EXTENSION_SOURCE_DIR: &str = "Sources/WatchExtension";
 const HOME_VIEW_NAME: &str = "HomeView";
 const MANIFEST_DESCRIPTION: &str = "This file is documented by its `$schema`. Start with `orbit --help` for the common workflow and `orbit ui schema` for the `tests.ui` DSL.";
+const ASC_TEAM_ID_PLACEHOLDER: &str = "YOUR_TEAM_ID";
+const ASC_IOS_DEVICE_ID: &str = "local-ios-device";
+const ASC_IOS_DEVICE_UDID: &str = "YOUR_IOS_DEVICE_UDID";
+const ASC_TVOS_DEVICE_ID: &str = "local-apple-tv";
+const ASC_TVOS_DEVICE_UDID: &str = "YOUR_TVOS_DEVICE_UDID";
+const ASC_MAC_DEVICE_ID: &str = "local-mac";
+const ASC_MAC_DEVICE_UDID: &str = "YOUR_MAC_DEVICE_UDID";
 
 const APPLE_TEMPLATE_CHOICES: [TemplateChoice; 6] = [
     TemplateChoice {
@@ -140,7 +147,6 @@ pub(super) struct InitAnswers {
     pub(super) name: String,
     pub(super) bundle_id: String,
     pub(super) template: InitTemplate,
-    pub(super) team_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -289,27 +295,29 @@ fn app_template_plan(
 
 fn watch_companion_plan(answers: &InitAnswers, schema_reference: &str) -> ScaffoldPlan {
     let swift_name = swift_type_name(&answers.name);
-    let mut manifest = json!({
-        "$schema": schema_reference,
-        "_description": MANIFEST_DESCRIPTION,
-        "name": answers.name,
-        "bundle_id": answers.bundle_id,
-        "version": DEFAULT_VERSION,
-        "build": DEFAULT_BUILD,
-        "platforms": platform_manifest(&IOS_WATCH_PLATFORMS),
-        "sources": [DEFAULT_SOURCE_DIR],
-        "resources": [DEFAULT_RESOURCES_DIR],
-        "watch": {
-            "sources": [DEFAULT_WATCH_APP_SOURCE_DIR],
-            "extension": {
-                "sources": [DEFAULT_WATCH_EXTENSION_SOURCE_DIR],
-                "entry": {
-                    "class": "WatchExtensionDelegate"
+    let manifest = with_scaffolded_asc(
+        answers,
+        json!({
+            "$schema": schema_reference,
+            "_description": MANIFEST_DESCRIPTION,
+            "name": answers.name,
+            "bundle_id": answers.bundle_id,
+            "version": DEFAULT_VERSION,
+            "build": DEFAULT_BUILD,
+            "platforms": platform_manifest(&IOS_WATCH_PLATFORMS),
+            "sources": [DEFAULT_SOURCE_DIR],
+            "resources": [DEFAULT_RESOURCES_DIR],
+            "watch": {
+                "sources": [DEFAULT_WATCH_APP_SOURCE_DIR],
+                "extension": {
+                    "sources": [DEFAULT_WATCH_EXTENSION_SOURCE_DIR],
+                    "entry": {
+                        "class": "WatchExtensionDelegate"
+                    }
                 }
             }
-        }
-    });
-    insert_optional_team_id(&mut manifest, answers.team_id.as_deref());
+        }),
+    );
     ScaffoldPlan {
         manifest,
         directories: [
@@ -363,19 +371,383 @@ fn app_manifest(
     schema_reference: &str,
     platforms: &[ManifestPlatform],
 ) -> JsonValue {
-    let mut manifest = json!({
-        "$schema": schema_reference,
-        "_description": MANIFEST_DESCRIPTION,
-        "name": answers.name,
-        "bundle_id": answers.bundle_id,
-        "version": DEFAULT_VERSION,
-        "build": DEFAULT_BUILD,
-        "platforms": platform_manifest(platforms),
-        "sources": [DEFAULT_SOURCE_DIR],
-        "resources": [DEFAULT_RESOURCES_DIR]
-    });
-    insert_optional_team_id(&mut manifest, answers.team_id.as_deref());
+    with_scaffolded_asc(
+        answers,
+        json!({
+            "$schema": schema_reference,
+            "_description": MANIFEST_DESCRIPTION,
+            "name": answers.name,
+            "bundle_id": answers.bundle_id,
+            "version": DEFAULT_VERSION,
+            "build": DEFAULT_BUILD,
+            "platforms": platform_manifest(platforms),
+            "sources": [DEFAULT_SOURCE_DIR],
+            "resources": [DEFAULT_RESOURCES_DIR]
+        }),
+    )
+}
+
+fn with_scaffolded_asc(answers: &InitAnswers, mut manifest: JsonValue) -> JsonValue {
     manifest
+        .as_object_mut()
+        .expect("init manifests always serialize as JSON objects")
+        .insert("asc".to_owned(), asc_manifest(answers));
+    manifest
+}
+
+fn asc_manifest(answers: &InitAnswers) -> JsonValue {
+    match answers.template {
+        InitTemplate::Ios => ios_asc_manifest(&answers.name, &answers.bundle_id),
+        InitTemplate::Macos => macos_asc_manifest(&answers.name, &answers.bundle_id),
+        InitTemplate::AppleMultiplatform => {
+            multiplatform_asc_manifest(&answers.name, &answers.bundle_id)
+        }
+        InitTemplate::IosWatchCompanion => {
+            watch_companion_asc_manifest(&answers.name, &answers.bundle_id)
+        }
+        InitTemplate::Tvos => tvos_asc_manifest(&answers.name, &answers.bundle_id),
+        InitTemplate::Visionos => visionos_asc_manifest(&answers.name, &answers.bundle_id),
+    }
+}
+
+fn ios_asc_manifest(name: &str, bundle_id: &str) -> JsonValue {
+    json!({
+        "$schema": asc_sync::schema::PUBLISHED_SCHEMA_URL,
+        "team_id": ASC_TEAM_ID_PLACEHOLDER,
+        "bundle_ids": {
+            "app": asc_bundle_id(bundle_id, name, "ios")
+        },
+        "devices": {
+            (ASC_IOS_DEVICE_ID): asc_device("ios", ASC_IOS_DEVICE_UDID, "Your iPhone")
+        },
+        "certs": {
+            "development": asc_cert("development", format!("{name} Development")),
+            "distribution": asc_cert("distribution", format!("{name} Distribution"))
+        },
+        "profiles": {
+            "app-development": asc_profile(
+                format!("{name} Development"),
+                "ios_app_development",
+                "app",
+                &["development"],
+                &[ASC_IOS_DEVICE_ID],
+            ),
+            "app-adhoc": asc_profile(
+                format!("{name} Ad Hoc"),
+                "ios_app_adhoc",
+                "app",
+                &["distribution"],
+                &[ASC_IOS_DEVICE_ID],
+            ),
+            "app-store": asc_profile(
+                format!("{name} App Store"),
+                "ios_app_store",
+                "app",
+                &["distribution"],
+                &[],
+            )
+        }
+    })
+}
+
+fn tvos_asc_manifest(name: &str, bundle_id: &str) -> JsonValue {
+    json!({
+        "$schema": asc_sync::schema::PUBLISHED_SCHEMA_URL,
+        "team_id": ASC_TEAM_ID_PLACEHOLDER,
+        "bundle_ids": {
+            "app": asc_bundle_id(bundle_id, name, "ios")
+        },
+        "devices": {
+            (ASC_TVOS_DEVICE_ID): asc_device("tvos", ASC_TVOS_DEVICE_UDID, "Your Apple TV")
+        },
+        "certs": {
+            "development": asc_cert("development", format!("{name} Development")),
+            "distribution": asc_cert("distribution", format!("{name} Distribution"))
+        },
+        "profiles": {
+            "app-development": asc_profile(
+                format!("{name} Development"),
+                "tvos_app_development",
+                "app",
+                &["development"],
+                &[ASC_TVOS_DEVICE_ID],
+            ),
+            "app-adhoc": asc_profile(
+                format!("{name} Ad Hoc"),
+                "tvos_app_adhoc",
+                "app",
+                &["distribution"],
+                &[ASC_TVOS_DEVICE_ID],
+            ),
+            "app-store": asc_profile(
+                format!("{name} App Store"),
+                "tvos_app_store",
+                "app",
+                &["distribution"],
+                &[],
+            )
+        }
+    })
+}
+
+fn macos_asc_manifest(name: &str, bundle_id: &str) -> JsonValue {
+    json!({
+        "$schema": asc_sync::schema::PUBLISHED_SCHEMA_URL,
+        "team_id": ASC_TEAM_ID_PLACEHOLDER,
+        "bundle_ids": {
+            "app": asc_bundle_id(bundle_id, name, "mac_os")
+        },
+        "devices": {
+            (ASC_MAC_DEVICE_ID): asc_device("macos", ASC_MAC_DEVICE_UDID, "This Mac")
+        },
+        "certs": {
+            "development": asc_cert("development", format!("{name} Development")),
+            "distribution": asc_cert("distribution", format!("{name} Distribution")),
+            "developer-id": asc_cert("developer_id_application", format!("{name} Developer ID"))
+        },
+        "profiles": {
+            "app-development": asc_profile(
+                format!("{name} Development"),
+                "mac_app_development",
+                "app",
+                &["development"],
+                &[ASC_MAC_DEVICE_ID],
+            ),
+            "app-store": asc_profile(
+                format!("{name} Mac App Store"),
+                "mac_app_store",
+                "app",
+                &["distribution"],
+                &[],
+            ),
+            "developer-id": asc_profile(
+                format!("{name} Developer ID"),
+                "mac_app_direct",
+                "app",
+                &["developer-id"],
+                &[],
+            )
+        }
+    })
+}
+
+fn multiplatform_asc_manifest(name: &str, bundle_id: &str) -> JsonValue {
+    json!({
+        "$schema": asc_sync::schema::PUBLISHED_SCHEMA_URL,
+        "team_id": ASC_TEAM_ID_PLACEHOLDER,
+        "bundle_ids": {
+            "app": asc_bundle_id(bundle_id, name, "universal")
+        },
+        "devices": {
+            (ASC_IOS_DEVICE_ID): asc_device("ios", ASC_IOS_DEVICE_UDID, "Your iPhone"),
+            (ASC_MAC_DEVICE_ID): asc_device("macos", ASC_MAC_DEVICE_UDID, "This Mac")
+        },
+        "certs": {
+            "development": asc_cert("development", format!("{name} Development")),
+            "distribution": asc_cert("distribution", format!("{name} Distribution")),
+            "developer-id": asc_cert("developer_id_application", format!("{name} Developer ID"))
+        },
+        "profiles": {
+            "ios-development": asc_profile(
+                format!("{name} iOS Development"),
+                "ios_app_development",
+                "app",
+                &["development"],
+                &[ASC_IOS_DEVICE_ID],
+            ),
+            "ios-adhoc": asc_profile(
+                format!("{name} iOS Ad Hoc"),
+                "ios_app_adhoc",
+                "app",
+                &["distribution"],
+                &[ASC_IOS_DEVICE_ID],
+            ),
+            "ios-app-store": asc_profile(
+                format!("{name} iOS App Store"),
+                "ios_app_store",
+                "app",
+                &["distribution"],
+                &[],
+            ),
+            "mac-development": asc_profile(
+                format!("{name} Mac Development"),
+                "mac_app_development",
+                "app",
+                &["development"],
+                &[ASC_MAC_DEVICE_ID],
+            ),
+            "mac-app-store": asc_profile(
+                format!("{name} Mac App Store"),
+                "mac_app_store",
+                "app",
+                &["distribution"],
+                &[],
+            ),
+            "developer-id": asc_profile(
+                format!("{name} Developer ID"),
+                "mac_app_direct",
+                "app",
+                &["developer-id"],
+                &[],
+            )
+        }
+    })
+}
+
+fn watch_companion_asc_manifest(name: &str, bundle_id: &str) -> JsonValue {
+    let watch_app_name = format!("{name} Watch App");
+    let watch_extension_name = format!("{name} Watch Extension");
+    json!({
+        "$schema": asc_sync::schema::PUBLISHED_SCHEMA_URL,
+        "team_id": ASC_TEAM_ID_PLACEHOLDER,
+        "bundle_ids": {
+            "app": asc_bundle_id(bundle_id, name, "ios"),
+            "watch-app": asc_bundle_id(
+                &format!("{bundle_id}.watchkitapp"),
+                &watch_app_name,
+                "ios",
+            ),
+            "watch-extension": asc_bundle_id(
+                &format!("{bundle_id}.watchkitapp.watchkitextension"),
+                &watch_extension_name,
+                "ios",
+            )
+        },
+        "devices": {
+            (ASC_IOS_DEVICE_ID): asc_device("ios", ASC_IOS_DEVICE_UDID, "Your iPhone")
+        },
+        "certs": {
+            "development": asc_cert("development", format!("{name} Development")),
+            "distribution": asc_cert("distribution", format!("{name} Distribution"))
+        },
+        "profiles": {
+            "app-development": asc_profile(
+                format!("{name} Development"),
+                "ios_app_development",
+                "app",
+                &["development"],
+                &[ASC_IOS_DEVICE_ID],
+            ),
+            "app-adhoc": asc_profile(
+                format!("{name} Ad Hoc"),
+                "ios_app_adhoc",
+                "app",
+                &["distribution"],
+                &[ASC_IOS_DEVICE_ID],
+            ),
+            "app-store": asc_profile(
+                format!("{name} App Store"),
+                "ios_app_store",
+                "app",
+                &["distribution"],
+                &[],
+            ),
+            "watch-app-development": asc_profile(
+                format!("{watch_app_name} Development"),
+                "ios_app_development",
+                "watch-app",
+                &["development"],
+                &[ASC_IOS_DEVICE_ID],
+            ),
+            "watch-app-adhoc": asc_profile(
+                format!("{watch_app_name} Ad Hoc"),
+                "ios_app_adhoc",
+                "watch-app",
+                &["distribution"],
+                &[ASC_IOS_DEVICE_ID],
+            ),
+            "watch-app-store": asc_profile(
+                format!("{watch_app_name} App Store"),
+                "ios_app_store",
+                "watch-app",
+                &["distribution"],
+                &[],
+            ),
+            "watch-extension-development": asc_profile(
+                format!("{watch_extension_name} Development"),
+                "ios_app_development",
+                "watch-extension",
+                &["development"],
+                &[ASC_IOS_DEVICE_ID],
+            ),
+            "watch-extension-adhoc": asc_profile(
+                format!("{watch_extension_name} Ad Hoc"),
+                "ios_app_adhoc",
+                "watch-extension",
+                &["distribution"],
+                &[ASC_IOS_DEVICE_ID],
+            ),
+            "watch-extension-store": asc_profile(
+                format!("{watch_extension_name} App Store"),
+                "ios_app_store",
+                "watch-extension",
+                &["distribution"],
+                &[],
+            )
+        }
+    })
+}
+
+fn visionos_asc_manifest(name: &str, bundle_id: &str) -> JsonValue {
+    json!({
+        "$schema": asc_sync::schema::PUBLISHED_SCHEMA_URL,
+        "team_id": ASC_TEAM_ID_PLACEHOLDER,
+        "bundle_ids": {
+            "app": asc_bundle_id(bundle_id, name, "ios")
+        },
+        "devices": {},
+        "certs": {
+            "distribution": asc_cert("distribution", format!("{name} Distribution"))
+        },
+        "profiles": {
+            "app-store": asc_profile(
+                format!("{name} App Store"),
+                "ios_app_store",
+                "app",
+                &["distribution"],
+                &[],
+            )
+        }
+    })
+}
+
+fn asc_bundle_id(bundle_id: &str, name: &str, platform: &str) -> JsonValue {
+    json!({
+        "bundle_id": bundle_id,
+        "name": name,
+        "platform": platform
+    })
+}
+
+fn asc_device(family: &str, udid: &str, name: &str) -> JsonValue {
+    json!({
+        "family": family,
+        "udid": udid,
+        "name": name
+    })
+}
+
+fn asc_cert(kind: &str, name: String) -> JsonValue {
+    json!({
+        "type": kind,
+        "name": name
+    })
+}
+
+fn asc_profile(
+    name: String,
+    kind: &str,
+    bundle_id: &str,
+    certs: &[&str],
+    devices: &[&str],
+) -> JsonValue {
+    json!({
+        "name": name,
+        "type": kind,
+        "bundle_id": bundle_id,
+        "certs": certs,
+        "devices": devices
+    })
 }
 
 fn platform_manifest(platforms: &[ManifestPlatform]) -> JsonValue {
@@ -404,16 +776,6 @@ fn generated_file(path: &str, contents: String) -> GeneratedFile {
         path: PathBuf::from(path),
         contents,
     }
-}
-
-fn insert_optional_team_id(manifest: &mut JsonValue, team_id: Option<&str>) {
-    let Some(team_id) = team_id else {
-        return;
-    };
-    let Some(object) = manifest.as_object_mut() else {
-        return;
-    };
-    object.insert("team_id".to_owned(), JsonValue::String(team_id.to_owned()));
 }
 
 fn ensure_gitignore_entry(project_root: &Path, entry: &str) -> Result<()> {
@@ -499,7 +861,6 @@ mod tests {
                 name: "Example App".to_owned(),
                 bundle_id: "dev.orbit.exampleapp".to_owned(),
                 template: InitTemplate::Ios,
-                team_id: None,
             },
             schema_path,
         );
@@ -517,7 +878,58 @@ mod tests {
                     "ios": "18.0"
                 },
                 "sources": ["Sources/App"],
-                "resources": ["Resources"]
+                "resources": ["Resources"],
+                "asc": {
+                    "$schema": asc_sync::schema::PUBLISHED_SCHEMA_URL,
+                    "team_id": ASC_TEAM_ID_PLACEHOLDER,
+                    "bundle_ids": {
+                        "app": {
+                            "bundle_id": "dev.orbit.exampleapp",
+                            "name": "Example App",
+                            "platform": "ios"
+                        }
+                    },
+                    "devices": {
+                        (ASC_IOS_DEVICE_ID): {
+                            "family": "ios",
+                            "udid": ASC_IOS_DEVICE_UDID,
+                            "name": "Your iPhone"
+                        }
+                    },
+                    "certs": {
+                        "development": {
+                            "type": "development",
+                            "name": "Example App Development"
+                        },
+                        "distribution": {
+                            "type": "distribution",
+                            "name": "Example App Distribution"
+                        }
+                    },
+                    "profiles": {
+                        "app-development": {
+                            "name": "Example App Development",
+                            "type": "ios_app_development",
+                            "bundle_id": "app",
+                            "certs": ["development"],
+                            "devices": [ASC_IOS_DEVICE_ID]
+                        },
+                        "app-adhoc": {
+                            "name": "Example App Ad Hoc",
+                            "type": "ios_app_adhoc",
+                            "bundle_id": "app",
+                            "certs": ["distribution"],
+                            "devices": [ASC_IOS_DEVICE_ID]
+                        },
+                        "app-store": {
+                            "name": "Example App App Store",
+                            "type": "ios_app_store",
+                            "bundle_id": "app",
+                            "certs": ["distribution"],
+                            "devices": []
+                        }
+                    }
+                }
             })
         );
         assert_eq!(
@@ -545,7 +957,6 @@ mod tests {
                 name: "Example App".to_owned(),
                 bundle_id: "dev.orbit.exampleapp".to_owned(),
                 template: InitTemplate::IosWatchCompanion,
-                team_id: None,
             },
             schema_path,
         );
@@ -573,12 +984,177 @@ mod tests {
                             "class": "WatchExtensionDelegate"
                         }
                     }
+                },
+                "asc": {
+                    "$schema": asc_sync::schema::PUBLISHED_SCHEMA_URL,
+                    "team_id": ASC_TEAM_ID_PLACEHOLDER,
+                    "bundle_ids": {
+                        "app": {
+                            "bundle_id": "dev.orbit.exampleapp",
+                            "name": "Example App",
+                            "platform": "ios"
+                        },
+                        "watch-app": {
+                            "bundle_id": "dev.orbit.exampleapp.watchkitapp",
+                            "name": "Example App Watch App",
+                            "platform": "ios"
+                        },
+                        "watch-extension": {
+                            "bundle_id": "dev.orbit.exampleapp.watchkitapp.watchkitextension",
+                            "name": "Example App Watch Extension",
+                            "platform": "ios"
+                        }
+                    },
+                    "devices": {
+                        (ASC_IOS_DEVICE_ID): {
+                            "family": "ios",
+                            "udid": ASC_IOS_DEVICE_UDID,
+                            "name": "Your iPhone"
+                        }
+                    },
+                    "certs": {
+                        "development": {
+                            "type": "development",
+                            "name": "Example App Development"
+                        },
+                        "distribution": {
+                            "type": "distribution",
+                            "name": "Example App Distribution"
+                        }
+                    },
+                    "profiles": {
+                        "app-development": {
+                            "name": "Example App Development",
+                            "type": "ios_app_development",
+                            "bundle_id": "app",
+                            "certs": ["development"],
+                            "devices": [ASC_IOS_DEVICE_ID]
+                        },
+                        "app-adhoc": {
+                            "name": "Example App Ad Hoc",
+                            "type": "ios_app_adhoc",
+                            "bundle_id": "app",
+                            "certs": ["distribution"],
+                            "devices": [ASC_IOS_DEVICE_ID]
+                        },
+                        "app-store": {
+                            "name": "Example App App Store",
+                            "type": "ios_app_store",
+                            "bundle_id": "app",
+                            "certs": ["distribution"],
+                            "devices": []
+                        },
+                        "watch-app-development": {
+                            "name": "Example App Watch App Development",
+                            "type": "ios_app_development",
+                            "bundle_id": "watch-app",
+                            "certs": ["development"],
+                            "devices": [ASC_IOS_DEVICE_ID]
+                        },
+                        "watch-app-adhoc": {
+                            "name": "Example App Watch App Ad Hoc",
+                            "type": "ios_app_adhoc",
+                            "bundle_id": "watch-app",
+                            "certs": ["distribution"],
+                            "devices": [ASC_IOS_DEVICE_ID]
+                        },
+                        "watch-app-store": {
+                            "name": "Example App Watch App App Store",
+                            "type": "ios_app_store",
+                            "bundle_id": "watch-app",
+                            "certs": ["distribution"],
+                            "devices": []
+                        },
+                        "watch-extension-development": {
+                            "name": "Example App Watch Extension Development",
+                            "type": "ios_app_development",
+                            "bundle_id": "watch-extension",
+                            "certs": ["development"],
+                            "devices": [ASC_IOS_DEVICE_ID]
+                        },
+                        "watch-extension-adhoc": {
+                            "name": "Example App Watch Extension Ad Hoc",
+                            "type": "ios_app_adhoc",
+                            "bundle_id": "watch-extension",
+                            "certs": ["distribution"],
+                            "devices": [ASC_IOS_DEVICE_ID]
+                        },
+                        "watch-extension-store": {
+                            "name": "Example App Watch Extension App Store",
+                            "type": "ios_app_store",
+                            "bundle_id": "watch-extension",
+                            "certs": ["distribution"],
+                            "devices": []
+                        }
+                    }
                 }
             })
         );
         assert!(plan.files.iter().any(|file| file.path
             == Path::new("Sources/WatchExtension/Extension.swift")
             && file.contents.contains("final class WatchExtensionDelegate")));
+    }
+
+    #[test]
+    fn multiplatform_template_scaffolds_universal_asc_bundle() {
+        let plan = scaffold_plan(
+            &InitAnswers {
+                ecosystem: InitEcosystem::Apple,
+                name: "Example App".to_owned(),
+                bundle_id: "dev.orbit.exampleapp".to_owned(),
+                template: InitTemplate::AppleMultiplatform,
+            },
+            "/tmp/.orbit/schemas/apple-app.v1.json",
+        );
+
+        assert_eq!(
+            plan.manifest["asc"]["bundle_ids"]["app"]["platform"],
+            "universal"
+        );
+        assert_eq!(
+            plan.manifest["asc"]["profiles"]["developer-id"]["type"],
+            "mac_app_direct"
+        );
+        assert_eq!(
+            plan.manifest["asc"]["profiles"]["ios-development"]["devices"],
+            json!([ASC_IOS_DEVICE_ID])
+        );
+        assert_eq!(
+            plan.manifest["asc"]["profiles"]["mac-development"]["devices"],
+            json!([ASC_MAC_DEVICE_ID])
+        );
+    }
+
+    #[test]
+    fn visionos_template_scaffolds_release_only_asc_until_device_profiles_exist() {
+        let plan = scaffold_plan(
+            &InitAnswers {
+                ecosystem: InitEcosystem::Apple,
+                name: "Vision Example".to_owned(),
+                bundle_id: "dev.orbit.visionexample".to_owned(),
+                template: InitTemplate::Visionos,
+            },
+            "/tmp/.orbit/schemas/apple-app.v1.json",
+        );
+
+        assert_eq!(plan.manifest["asc"]["bundle_ids"]["app"]["platform"], "ios");
+        assert_eq!(
+            plan.manifest["asc"]["profiles"]["app-store"]["type"],
+            "ios_app_store"
+        );
+        assert!(
+            plan.manifest["asc"]["devices"]
+                .as_object()
+                .expect("devices is an object")
+                .is_empty()
+        );
+        assert_eq!(
+            plan.manifest["asc"]["certs"]
+                .as_object()
+                .expect("certs is an object")
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -591,7 +1167,6 @@ mod tests {
                 name: "Example App".to_owned(),
                 bundle_id: "dev.orbit.exampleapp".to_owned(),
                 template: InitTemplate::AppleMultiplatform,
-                team_id: None,
             },
             "/tmp/.orbit/schemas/apple-app.v1.json",
         );
@@ -619,22 +1194,5 @@ mod tests {
         let gitignore =
             std::fs::read_to_string(manifest_path.parent().unwrap().join(".gitignore")).unwrap();
         assert_eq!(gitignore, ".bsp/\n.orbit/\n");
-    }
-
-    #[test]
-    fn ios_template_includes_selected_team_id() {
-        let schema_path = "https://orbitstorage.dev/schemas/apple-app.v1-orbit-0.1.0.json";
-        let plan = scaffold_plan(
-            &InitAnswers {
-                ecosystem: InitEcosystem::Apple,
-                name: "Example App".to_owned(),
-                bundle_id: "dev.orbit.exampleapp".to_owned(),
-                template: InitTemplate::Ios,
-                team_id: Some("TEAM123456".to_owned()),
-            },
-            schema_path,
-        );
-
-        assert_eq!(plan.manifest["team_id"], "TEAM123456");
     }
 }

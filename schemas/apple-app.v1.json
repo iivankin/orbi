@@ -52,16 +52,6 @@
       "pattern": "^[0-9]+(\\.[0-9]+){0,2}$",
       "description": "Optional Xcode version to use for Orbit's Xcode-backed commands, for example `26.4`. Orbit resolves the installed Xcode bundle, uses its developer directory, and can fetch the matching official simulator runtime when needed."
     },
-    "team_id": {
-      "type": "string",
-      "minLength": 1,
-      "description": "Optional default Apple Developer team for the product."
-    },
-    "provider_id": {
-      "type": "string",
-      "minLength": 1,
-      "description": "Optional default App Store Connect provider for the product."
-    },
     "platforms": {
       "$ref": "#/$defs/platformTargets"
     },
@@ -121,9 +111,324 @@
     "quality": {
       "$ref": "#/$defs/qualityManifest",
       "description": "Lint and format configuration owned by Orbit."
+    },
+    "asc": {
+      "$ref": "#/$defs/ascConfig",
+      "description": "Embedded ASC configuration used by `orbit asc ...` and Orbit-managed signing flows."
     }
   },
   "$defs": {
+    "ascConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "team_id"
+      ],
+      "properties": {
+        "$schema": {
+          "type": "string",
+          "description": "Optional embedded schema reference for the ASC section."
+        },
+        "team_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "bundle_ids": {
+          "type": "object",
+          "default": {},
+          "propertyNames": {
+            "$ref": "#/$defs/ascNonEmptyKey"
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/ascBundleId"
+          }
+        },
+        "devices": {
+          "type": "object",
+          "default": {},
+          "propertyNames": {
+            "$ref": "#/$defs/ascNonEmptyKey"
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/ascDevice"
+          }
+        },
+        "certs": {
+          "type": "object",
+          "default": {},
+          "propertyNames": {
+            "$ref": "#/$defs/ascNonEmptyKey"
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/ascCert"
+          }
+        },
+        "profiles": {
+          "type": "object",
+          "default": {},
+          "propertyNames": {
+            "$ref": "#/$defs/ascNonEmptyKey"
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/ascProfile"
+          }
+        }
+      }
+    },
+    "ascNonEmptyKey": {
+      "type": "string",
+      "minLength": 1
+    },
+    "ascBundleId": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "bundle_id",
+        "name",
+        "platform"
+      ],
+      "properties": {
+        "bundle_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "platform": {
+          "type": "string",
+          "enum": [
+            "ios",
+            "mac_os",
+            "universal"
+          ]
+        },
+        "capabilities": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/ascCapability"
+          }
+        }
+      }
+    },
+    "ascDevice": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "family",
+        "udid",
+        "name"
+      ],
+      "properties": {
+        "family": {
+          "type": "string",
+          "enum": [
+            "ios",
+            "ipados",
+            "watchos",
+            "tvos",
+            "visionos",
+            "macos"
+          ]
+        },
+        "udid": {
+          "type": "string",
+          "minLength": 1
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "ascCert": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "name"
+      ],
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": [
+            "development",
+            "distribution",
+            "developer_id_application"
+          ]
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "ascProfile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "type",
+        "bundle_id",
+        "certs"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "ios_app_development",
+            "ios_app_store",
+            "ios_app_adhoc",
+            "ios_app_inhouse",
+            "tvos_app_development",
+            "tvos_app_store",
+            "tvos_app_adhoc",
+            "tvos_app_inhouse",
+            "mac_app_development",
+            "mac_app_store",
+            "mac_app_direct",
+            "mac_catalyst_app_development",
+            "mac_catalyst_app_store",
+            "mac_catalyst_app_direct"
+          ]
+        },
+        "bundle_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "certs": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "devices": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+    "ascCapability": {
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "in_app_purchase",
+            "game_center",
+            "push_notifications",
+            "wallet",
+            "inter_app_audio",
+            "maps",
+            "associated_domains",
+            "personal_vpn",
+            "app_groups",
+            "healthkit",
+            "homekit",
+            "wireless_accessory_configuration",
+            "apple_pay",
+            "sirikit",
+            "network_extensions",
+            "multipath",
+            "hot_spot",
+            "nfc_tag_reading",
+            "classkit",
+            "autofill_credential_provider",
+            "access_wifi_information",
+            "network_custom_protocol",
+            "coremedia_hls_low_latency",
+            "system_extension_install",
+            "user_management"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "icloud"
+          ],
+          "properties": {
+            "icloud": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "version"
+              ],
+              "properties": {
+                "version": {
+                  "type": "string",
+                  "enum": [
+                    "xcode_5",
+                    "xcode_6"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "data_protection"
+          ],
+          "properties": {
+            "data_protection": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "level"
+              ],
+              "properties": {
+                "level": {
+                  "type": "string",
+                  "enum": [
+                    "complete_protection",
+                    "protected_unless_open",
+                    "protected_until_first_user_auth"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "apple_id_auth"
+          ],
+          "properties": {
+            "apple_id_auth": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "app_consent"
+              ],
+              "properties": {
+                "app_consent": {
+                  "type": "string",
+                  "enum": [
+                    "primary_app_consent"
+                  ]
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
     "applePlatform": {
       "type": "string",
       "enum": [
@@ -2983,4 +3288,5 @@
       }
     }
   }
+}
 }

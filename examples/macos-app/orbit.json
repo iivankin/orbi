@@ -4,8 +4,6 @@
   "bundle_id": "dev.orbit.examples.macos",
   "version": "0.1.0",
   "build": 1,
-  "team_id": "JZPJ2RGU5F",
-  "provider_id": "128120286",
   "platforms": {
     "macos": "14.0"
   },

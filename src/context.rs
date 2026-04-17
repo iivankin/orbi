@@ -1,14 +1,11 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use serde::{Deserialize, Serialize};
 use walkdir::WalkDir;
 
 use crate::apple::xcode::{SelectedXcode, resolve_requested_xcode_for_app};
 use crate::manifest::{ManifestSchema, ResolvedManifest, detect_schema_with_env};
-use crate::util::{
-    ensure_dir, prompt_select, read_json_file_if_exists, resolve_path, write_json_file,
-};
+use crate::util::{ensure_dir, prompt_select, resolve_path};
 
 #[derive(Debug, Clone)]
 pub struct AppContext {
@@ -35,9 +32,6 @@ pub struct GlobalPaths {
     pub data_dir: PathBuf,
     pub cache_dir: PathBuf,
     pub schema_dir: PathBuf,
-    pub auth_state_path: PathBuf,
-    pub device_cache_path: PathBuf,
-    pub keychain_path: PathBuf,
 }
 
 #[derive(Debug, Clone)]
@@ -46,11 +40,6 @@ pub struct ProjectPaths {
     pub build_dir: PathBuf,
     pub artifacts_dir: PathBuf,
     pub receipts_dir: PathBuf,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct DeviceCache {
-    pub devices: Vec<crate::apple::device::CachedDevice>,
 }
 
 impl AppContext {
@@ -105,14 +94,6 @@ impl AppContext {
                 receipts_dir,
             },
         })
-    }
-
-    pub fn read_device_cache(&self) -> Result<DeviceCache> {
-        Ok(read_json_file_if_exists(&self.global_paths.device_cache_path)?.unwrap_or_default())
-    }
-
-    pub fn write_device_cache(&self, cache: &DeviceCache) -> Result<()> {
-        write_json_file(&self.global_paths.device_cache_path, cache)
     }
 
     pub fn resolve_manifest_path_for_dispatch(
@@ -189,17 +170,12 @@ fn resolve_global_paths() -> Result<GlobalPaths> {
             .join(".orbit")
             .join("schemas"),
     };
-    let keychain_path = data_dir.join("orbit.keychain-db");
-
     ensure_dir(&data_dir)?;
     ensure_dir(&cache_dir)?;
     Ok(GlobalPaths {
-        auth_state_path: data_dir.join("auth.json"),
-        device_cache_path: data_dir.join("devices.json"),
         data_dir,
         cache_dir,
         schema_dir,
-        keychain_path,
     })
 }
 
