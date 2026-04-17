@@ -3,7 +3,8 @@ use std::fs;
 use serde_json::json;
 
 use crate::support::{
-    base_command, create_build_xcrun_mock, create_fake_xcode_bundle, create_home, create_idb_mock,
+    base_command, create_brew_idb_companion_install_mock, create_build_xcrun_mock,
+    create_fake_xcode_bundle, create_home, create_idb_mock, create_python3_fb_idb_install_mock,
     create_runtime_download_xcodebuild_mock, create_runtime_installing_xcrun_mock,
     create_ui_testing_workspace, format_failure_output, latest_ui_report_path, read_log,
     run_and_capture, set_manifest_platforms, set_manifest_xcode,
@@ -180,6 +181,74 @@ fn orbit_test_ui_trace_fails_early_on_macos_when_flow_suite_relaunches_the_app()
 }
 
 #[test]
+fn orbit_test_ui_discovers_user_site_idb_when_path_is_missing() {
+    let temp = tempdir().unwrap();
+    let home = create_home(temp.path());
+    let mock_bin = temp.path().join("mock-bin");
+    let sdk_root = temp.path().join("sdk-root");
+    let log_path = temp.path().join("mock.log");
+    fs::create_dir_all(&mock_bin).unwrap();
+    create_build_xcrun_mock(&mock_bin, &sdk_root);
+    create_idb_mock(&mock_bin);
+    fs::remove_file(mock_bin.join("idb")).unwrap();
+
+    let user_bin = home.join("Library").join("Python").join("3.12").join("bin");
+    fs::create_dir_all(&user_bin).unwrap();
+    create_idb_mock(&user_bin);
+
+    let workspace = create_ui_testing_workspace(temp.path());
+
+    let mut command = base_command(&workspace, &home, &mock_bin, &log_path);
+    command.env("PATH", format!("{}:/usr/bin:/bin", mock_bin.display()));
+    command.args(["--non-interactive", "test", "--ui", "--platform", "ios"]);
+    let output = run_and_capture(&mut command);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "{}",
+        format_failure_output(&stderr)
+    );
+
+    let log = read_log(&log_path);
+    assert!(!log.contains("python3 -m pip install"));
+    assert!(!log.contains("brew install idb-companion"));
+    assert!(log.contains("idb launch -f dev.orbit.fixture.ui -onboardingComplete true -seedUser qa@example.com --udid IOS-UDID"));
+}
+
+#[test]
+fn orbit_test_ui_auto_installs_missing_idb_tooling() {
+    let temp = tempdir().unwrap();
+    let home = create_home(temp.path());
+    let mock_bin = temp.path().join("mock-bin");
+    let sdk_root = temp.path().join("sdk-root");
+    let log_path = temp.path().join("mock.log");
+    fs::create_dir_all(&mock_bin).unwrap();
+    create_build_xcrun_mock(&mock_bin, &sdk_root);
+    create_python3_fb_idb_install_mock(&mock_bin);
+    create_brew_idb_companion_install_mock(&mock_bin);
+    let workspace = create_ui_testing_workspace(temp.path());
+
+    let mut command = base_command(&workspace, &home, &mock_bin, &log_path);
+    command.env("PATH", format!("{}:/usr/bin:/bin", mock_bin.display()));
+    command.args(["--non-interactive", "test", "--ui", "--platform", "ios"]);
+    let output = run_and_capture(&mut command);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "{}",
+        format_failure_output(&stderr)
+    );
+
+    let log = read_log(&log_path);
+    assert!(log.contains(
+        "python3 -m pip install --user --disable-pip-version-check --no-input fb-idb==1.1.7"
+    ));
+    assert!(log.contains("brew tap facebook/fb"));
+    assert!(log.contains("brew install idb-companion"));
+    assert!(log.contains("idb launch -f dev.orbit.fixture.ui -onboardingComplete true -seedUser qa@example.com --udid IOS-UDID"));
+}
+
+#[test]
 fn orbit_test_ui_fails_early_with_install_hint_when_idb_is_missing() {
     let temp = tempdir().unwrap();
     let home = create_home(temp.path());
@@ -197,9 +266,10 @@ fn orbit_test_ui_fails_early_with_install_hint_when_idb_is_missing() {
     assert!(!output.status.success());
 
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("requires `idb` and `idb_companion` on PATH"));
+    assert!(stderr.contains("requires `idb` and `idb_companion`"));
+    assert!(stderr.contains("Orbit first looks in PATH"));
     assert!(stderr.contains("brew install idb-companion"));
-    assert!(stderr.contains("python3 -m pip install fb-idb"));
+    assert!(stderr.contains("python3 -m pip install --user fb-idb==1.1.7"));
 
     let log = read_log(&log_path);
     assert!(!log.contains("xcrun "));

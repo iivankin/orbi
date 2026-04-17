@@ -2,6 +2,107 @@ use std::path::Path;
 
 use super::write_executable;
 
+const IDB_MOCK_SCRIPT: &str = r#"#!/bin/sh
+set -eu
+echo "idb $@" >> "$MOCK_LOG"
+cmd=""
+if [ "$#" -ge 2 ] && [ "$1" = "ui" ]; then
+  cmd="$2"
+elif [ "$#" -ge 1 ]; then
+  cmd="$1"
+fi
+case "$cmd" in
+  describe-all)
+    cat <<'JSON'
+[
+  {
+    "AXLabel": "ExampleApp",
+    "frame": { "x": 0, "y": 0, "width": 393, "height": 852 }
+  },
+  {
+    "AXLabel": "Continue",
+    "frame": { "x": 40, "y": 120, "width": 200, "height": 44 }
+  },
+  {
+    "AXIdentifier": "email-value",
+    "AXLabel": "qa@example.com",
+    "frame": { "x": 40, "y": 180, "width": 200, "height": 44 }
+  },
+  {
+    "AXLabel": "Welcome",
+    "frame": { "x": 40, "y": 200, "width": 200, "height": 44 }
+  }
+]
+JSON
+    ;;
+  describe-point)
+    cat <<'JSON'
+{
+  "AXLabel": "Continue",
+  "frame": { "x": 40, "y": 120, "width": 200, "height": 44 }
+}
+JSON
+    ;;
+  video|record-video)
+    out="$2"
+    mkdir -p "$(dirname "$out")"
+    printf 'mp4' > "$out"
+    ;;
+  log)
+    printf 'mock log line\n'
+    ;;
+  crash)
+    sub="$2"
+    case "$sub" in
+      list)
+        printf 'mock-crash-1.ips\n'
+        ;;
+      show)
+        printf 'mock crash payload\n'
+        ;;
+      delete)
+        ;;
+      *)
+        echo "unexpected idb crash command: $@" >&2
+        exit 1
+        ;;
+    esac
+    ;;
+  contacts)
+    if [ "$#" -ge 2 ] && [ "$2" = "update" ]; then
+      :
+    else
+      echo "unexpected idb contacts command: $@" >&2
+      exit 1
+    fi
+    ;;
+  dylib)
+    if [ "$#" -ge 2 ] && [ "$2" = "install" ]; then
+      :
+    else
+      echo "unexpected idb dylib command: $@" >&2
+      exit 1
+    fi
+    ;;
+  instruments)
+    printf 'mock instruments trace\n'
+    ;;
+  tap|text|swipe|clear-keychain|set-location|uninstall|approve|launch|focus|add-media|kill|open)
+    ;;
+  button|key|key-sequence)
+    ;;
+  *)
+    echo "unexpected idb command: $@" >&2
+    exit 1
+    ;;
+esac
+"#;
+
+const IDB_COMPANION_MOCK_SCRIPT: &str = r#"#!/bin/sh
+set -eu
+echo "idb_companion $@" >> "$MOCK_LOG"
+"#;
+
 pub fn create_security_mock(mock_bin: &Path, db_path: &Path) {
     write_executable(
         &mock_bin.join("security"),
@@ -346,110 +447,74 @@ fi
 }
 
 pub fn create_idb_mock(mock_bin: &Path) {
-    write_executable(
-        &mock_bin.join("idb"),
-        r#"#!/bin/sh
-set -eu
-echo "idb $@" >> "$MOCK_LOG"
-cmd=""
-if [ "$#" -ge 2 ] && [ "$1" = "ui" ]; then
-  cmd="$2"
-elif [ "$#" -ge 1 ]; then
-  cmd="$1"
-fi
-case "$cmd" in
-  describe-all)
-    cat <<'JSON'
-[
-  {
-    "AXLabel": "ExampleApp",
-    "frame": { "x": 0, "y": 0, "width": 393, "height": 852 }
-  },
-  {
-    "AXLabel": "Continue",
-    "frame": { "x": 40, "y": 120, "width": 200, "height": 44 }
-  },
-  {
-    "AXIdentifier": "email-value",
-    "AXLabel": "qa@example.com",
-    "frame": { "x": 40, "y": 180, "width": 200, "height": 44 }
-  },
-  {
-    "AXLabel": "Welcome",
-    "frame": { "x": 40, "y": 200, "width": 200, "height": 44 }
-  }
-]
-JSON
-    ;;
-  describe-point)
-    cat <<'JSON'
-{
-  "AXLabel": "Continue",
-  "frame": { "x": 40, "y": 120, "width": 200, "height": 44 }
+    write_executable(&mock_bin.join("idb"), IDB_MOCK_SCRIPT);
+    write_executable(&mock_bin.join("idb_companion"), IDB_COMPANION_MOCK_SCRIPT);
 }
-JSON
+
+pub fn create_python3_fb_idb_install_mock(mock_bin: &Path) {
+    write_executable(
+        &mock_bin.join("python3"),
+        &format!(
+            r#"#!/bin/sh
+set -eu
+echo "python3 $@" >> "$MOCK_LOG"
+if [ "$#" -ge 6 ] && [ "$1" = "-m" ] && [ "$2" = "pip" ] && [ "$3" = "install" ]; then
+  case " $* " in
+    *" fb-idb==1.1.7 "*)
+      bin_dir="$HOME/Library/Python/3.12/bin"
+      mkdir -p "$bin_dir"
+      cat > "$bin_dir/idb" <<'EOF'
+{idb_script}
+EOF
+      chmod +x "$bin_dir/idb"
+      exit 0
+      ;;
+  esac
+fi
+echo "unexpected python3 command: $@" >&2
+exit 1
+"#,
+            idb_script = IDB_MOCK_SCRIPT
+        ),
+    );
+}
+
+pub fn create_brew_idb_companion_install_mock(mock_bin: &Path) {
+    write_executable(
+        &mock_bin.join("brew"),
+        &format!(
+            r#"#!/bin/sh
+set -eu
+echo "brew $@" >> "$MOCK_LOG"
+prefix="$HOME/.orbit-test-brew/idb-companion"
+cmd="${{1:-}}"
+case "$cmd" in
+  tap)
+    exit 0
     ;;
-  video|record-video)
-    out="$2"
-    mkdir -p "$(dirname "$out")"
-    printf 'mp4' > "$out"
-    ;;
-  log)
-    printf 'mock log line\n'
-    ;;
-  crash)
-    sub="$2"
-    case "$sub" in
-      list)
-        printf 'mock-crash-1.ips\n'
-        ;;
-      show)
-        printf 'mock crash payload\n'
-        ;;
-      delete)
-        ;;
-      *)
-        echo "unexpected idb crash command: $@" >&2
-        exit 1
-        ;;
-    esac
-    ;;
-  contacts)
-    if [ "$#" -ge 2 ] && [ "$2" = "update" ]; then
-      :
-    else
-      echo "unexpected idb contacts command: $@" >&2
-      exit 1
+  install)
+    if [ "$#" -eq 2 ] && [ "$2" = "idb-companion" ]; then
+      mkdir -p "$prefix/bin"
+      cat > "$prefix/bin/idb_companion" <<'EOF'
+{companion_script}
+EOF
+      chmod +x "$prefix/bin/idb_companion"
+      exit 0
     fi
     ;;
-  dylib)
-    if [ "$#" -ge 2 ] && [ "$2" = "install" ]; then
-      :
-    else
-      echo "unexpected idb dylib command: $@" >&2
-      exit 1
+  --prefix)
+    if [ "$#" -eq 2 ] && [ "$2" = "idb-companion" ] && [ -x "$prefix/bin/idb_companion" ]; then
+      printf '%s\n' "$prefix"
+      exit 0
     fi
-    ;;
-  instruments)
-    printf 'mock instruments trace\n'
-    ;;
-  tap|text|swipe|clear-keychain|set-location|uninstall|approve|launch|focus|add-media|kill|open)
-    ;;
-  button|key|key-sequence)
-    ;;
-  *)
-    echo "unexpected idb command: $@" >&2
     exit 1
     ;;
 esac
+echo "unexpected brew command: $@" >&2
+exit 1
 "#,
-    );
-    write_executable(
-        &mock_bin.join("idb_companion"),
-        r#"#!/bin/sh
-set -eu
-echo "idb_companion $@" >> "$MOCK_LOG"
-"#,
+            companion_script = IDB_COMPANION_MOCK_SCRIPT
+        ),
     );
 }
 

@@ -31,8 +31,8 @@ const P12_PASSWORD_SERVICE: &str = "dev.orbit.cli.codesign-p12";
 #[derive(Debug, Clone)]
 pub struct SigningMaterial {
     pub signing_identity: String,
-    pub keychain_path: PathBuf,
-    pub provisioning_profile_path: PathBuf,
+    pub keychain_path: Option<PathBuf>,
+    pub provisioning_profile_path: Option<PathBuf>,
     pub entitlements_path: Option<PathBuf>,
 }
 
@@ -70,26 +70,30 @@ pub fn sign_bundle(
     bundle_path: &Path,
     material: &SigningMaterial,
 ) -> Result<()> {
-    let embedded_profile = if platform == ApplePlatform::Macos {
-        bundle_path
-            .join("Contents")
-            .join("embedded.provisionprofile")
-    } else {
-        bundle_path.join("embedded.mobileprovision")
-    };
-    ensure_parent_dir(&embedded_profile)?;
-    fs::copy(&material.provisioning_profile_path, &embedded_profile).with_context(|| {
-        format!(
-            "failed to embed provisioning profile into {}",
-            bundle_path.display()
-        )
-    })?;
+    if let Some(provisioning_profile_path) = &material.provisioning_profile_path {
+        let embedded_profile = if platform == ApplePlatform::Macos {
+            bundle_path
+                .join("Contents")
+                .join("embedded.provisionprofile")
+        } else {
+            bundle_path.join("embedded.mobileprovision")
+        };
+        ensure_parent_dir(&embedded_profile)?;
+        fs::copy(provisioning_profile_path, &embedded_profile).with_context(|| {
+            format!(
+                "failed to embed provisioning profile into {}",
+                bundle_path.display()
+            )
+        })?;
+    }
 
     let mut command = Command::new("codesign");
     command.args(["--force", "--sign"]);
     command.arg(&material.signing_identity);
-    command.args(["--keychain"]);
-    command.arg(&material.keychain_path);
+    if let Some(keychain_path) = &material.keychain_path {
+        command.args(["--keychain"]);
+        command.arg(keychain_path);
+    }
     if platform == ApplePlatform::Macos && distribution == DistributionKind::DeveloperId {
         // Developer ID notarization requires the app binary to opt into hardened runtime.
         command.args(["--options", "runtime"]);

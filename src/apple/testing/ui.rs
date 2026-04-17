@@ -1,4 +1,3 @@
-use std::env;
 use std::fs::{File, OpenOptions, TryLockError};
 use std::path::Path;
 use std::time::Instant;
@@ -11,6 +10,8 @@ use uuid::Uuid;
 pub(crate) mod backend;
 #[path = "ui/flow.rs"]
 mod flow;
+#[path = "ui/idb.rs"]
+mod idb;
 #[path = "ui/matching.rs"]
 mod matching;
 #[path = "ui/model.rs"]
@@ -250,16 +251,16 @@ pub(crate) fn describe_point_json(
 }
 
 pub(crate) fn reset_idb() -> Result<()> {
-    ensure_idb_tooling_available()?;
+    idb::ensure_tooling_available()?;
     let mut command = std::process::Command::new("idb");
     command.arg("kill");
-    crate::util::run_command(&mut command).context(idb_requirement_message())
+    crate::util::run_command(&mut command).context(idb::requirement_message())
 }
 
 pub(crate) fn doctor(project: &ProjectContext, platform: ApplePlatform) -> Result<()> {
     match platform {
         ApplePlatform::Ios => {
-            ensure_idb_tooling_available()?;
+            idb::ensure_tooling_available()?;
             println!("ui backend: orbit-idb-ios-simulator");
             println!("idb: ok");
             println!("idb_companion: ok");
@@ -282,7 +283,7 @@ pub(crate) fn attach_backend(
 ) -> Result<Box<dyn UiBackend>> {
     match platform {
         ApplePlatform::Ios => {
-            ensure_idb_tooling_available()?;
+            idb::ensure_tooling_available()?;
             Ok(Box::new(IosSimulatorBackend::attach(project)?))
         }
         ApplePlatform::Macos => {
@@ -387,7 +388,7 @@ fn prepare_ui_session(
     let destination = ui_testing_destination(platform);
     match platform {
         ApplePlatform::Ios => {
-            ensure_idb_tooling_available()?;
+            idb::ensure_tooling_available()?;
             let build_outcome =
                 build::build_for_testing_destination(project, platform, destination)?;
             let backend = IosSimulatorBackend::prepare(project, &build_outcome.receipt)?;
@@ -426,33 +427,6 @@ fn ui_testing_destination(platform: ApplePlatform) -> DestinationKind {
         ApplePlatform::Macos => DestinationKind::Device,
         _ => DestinationKind::Simulator,
     }
-}
-
-pub(crate) fn idb_requirement_message() -> &'static str {
-    "Orbit UI tooling for iOS simulators requires `idb` and `idb_companion` on PATH.\n\nInstall them with:\n  brew tap facebook/fb\n  brew install idb-companion\n  python3 -m pip install fb-idb\n\nIf `idb` was installed with pip, ensure your user Python bin directory is on PATH, for example `~/Library/Python/3.12/bin`."
-}
-
-fn ensure_idb_tooling_available() -> Result<()> {
-    let mut missing = Vec::new();
-    if !path_contains_executable("idb") {
-        missing.push("idb");
-    }
-    if !path_contains_executable("idb_companion") {
-        missing.push("idb_companion");
-    }
-    if missing.is_empty() {
-        return Ok(());
-    }
-
-    bail!(
-        "{}\nMissing: {}.",
-        idb_requirement_message(),
-        missing
-            .into_iter()
-            .map(|entry| format!("`{entry}`"))
-            .collect::<Vec<_>>()
-            .join(", ")
-    )
 }
 
 fn start_ui_trace_recording(
@@ -514,11 +488,6 @@ fn start_ui_trace_recording(
             prepared.build_outcome.receipt.platform
         ),
     }
-}
-
-fn path_contains_executable(name: &str) -> bool {
-    env::var_os("PATH")
-        .is_some_and(|paths| env::split_paths(&paths).any(|path| path.join(name).is_file()))
 }
 
 #[cfg(test)]

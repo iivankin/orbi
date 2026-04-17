@@ -5,6 +5,7 @@ use serde_json::json;
 use tempfile::TempDir;
 
 use super::entitlements::materialize_signing_entitlements;
+use super::prepare_signing;
 use super::{
     CertificateOrigin, ManagedCertificate, ManagedProfile, SigningState, clean_local_signing_state,
     identifier_name, load_state, resolve_local_team_id_if_known, save_state, target_is_app_clip,
@@ -12,8 +13,9 @@ use super::{
 };
 use crate::context::{AppContext, GlobalPaths, ProjectContext, ProjectPaths};
 use crate::manifest::{
-    ApplePlatform, HooksManifest, ManifestSchema, PlatformManifest, QualityManifest,
-    ResolvedManifest, TargetKind, TargetManifest, TestsManifest,
+    ApplePlatform, BuildConfiguration, DistributionKind, HooksManifest, ManifestSchema,
+    PlatformManifest, ProfileManifest, QualityManifest, ResolvedManifest, TargetKind,
+    TargetManifest, TestsManifest,
 };
 
 fn test_project() -> (TempDir, ProjectContext) {
@@ -113,6 +115,31 @@ fn test_project() -> (TempDir, ProjectContext) {
         },
     };
     (temp, project)
+}
+
+fn configure_project_for_macos_local_signing(project: &mut ProjectContext) {
+    project.resolved_manifest.platforms = BTreeMap::from([(
+        ApplePlatform::Macos,
+        PlatformManifest {
+            deployment_target: "15.0".to_owned(),
+            universal_binary: false,
+        },
+    )]);
+    project.resolved_manifest.targets[0].platforms = vec![ApplePlatform::Macos];
+    let manifest = json!({
+        "$schema": crate::apple::manifest::SCHEMA_URL,
+        "name": "OrbitFixture",
+        "bundle_id": "dev.orbit.fixture",
+        "version": "0.1.0",
+        "build": 1,
+        "platforms": { "macos": "15.0" },
+        "sources": ["Sources/App"]
+    });
+    std::fs::write(
+        &project.manifest_path,
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
 }
 
 #[test]
@@ -511,5 +538,81 @@ fn merges_managed_profile_entitlements_into_explicit_entitlements() {
             .and_then(plist::Value::as_array)
             .map(|values| values.len()),
         Some(1)
+    );
+}
+
+#[test]
+fn macos_development_signing_without_embedded_asc_uses_ad_hoc_signature() {
+    let (_temp, mut project) = test_project();
+    configure_project_for_macos_local_signing(&mut project);
+
+    let target = project
+        .resolved_manifest
+        .resolve_target(Some("ExampleApp"))
+        .unwrap();
+    let material = prepare_signing(
+        &project,
+        target,
+        ApplePlatform::Macos,
+        &ProfileManifest::new(BuildConfiguration::Debug, DistributionKind::Development),
+        None,
+    )
+    .unwrap();
+
+    assert_eq!(material.signing_identity, "-");
+    assert!(material.keychain_path.is_none());
+    assert!(material.provisioning_profile_path.is_none());
+
+    let entitlements_path = material
+        .entitlements_path
+        .expect("expected local macOS development entitlements");
+    let entitlements = plist::Value::from_file(&entitlements_path)
+        .unwrap()
+        .into_dictionary()
+        .unwrap();
+    assert_eq!(
+        entitlements
+            .get("com.apple.security.get-task-allow")
+            .and_then(plist::Value::as_boolean),
+        Some(true)
+    );
+}
+
+#[test]
+fn macos_development_signing_without_embedded_asc_rejects_profile_backed_entitlements() {
+    let (_temp, mut project) = test_project();
+    configure_project_for_macos_local_signing(&mut project);
+
+    let entitlements_path = project.root.join("App.entitlements");
+    Value::Dictionary(plist::Dictionary::from_iter([(
+        "com.apple.developer.associated-domains".to_owned(),
+        Value::Array(vec![Value::String("applinks:example.com".to_owned())]),
+    )]))
+    .to_file_xml(&entitlements_path)
+    .unwrap();
+    project.resolved_manifest.targets[0].entitlements = Some("App.entitlements".into());
+
+    let target = project
+        .resolved_manifest
+        .resolve_target(Some("ExampleApp"))
+        .unwrap();
+    let error = prepare_signing(
+        &project,
+        target,
+        ApplePlatform::Macos,
+        &ProfileManifest::new(BuildConfiguration::Debug, DistributionKind::Development),
+        None,
+    )
+    .unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("local macOS development fallback only supports unrestricted `com.apple.security.*` entitlements")
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("com.apple.developer.associated-domains")
     );
 }

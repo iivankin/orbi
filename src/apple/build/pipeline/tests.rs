@@ -385,6 +385,12 @@ fn device_builds_require_signing_in_development() {
     ));
 }
 
+#[test]
+fn macos_development_device_builds_require_signing() {
+    let profile = ProfileManifest::new(BuildConfiguration::Debug, DistributionKind::Development);
+    assert!(build_requires_signing(&profile, DestinationKind::Device));
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn writes_macos_app_metadata_under_contents() {

@@ -5,9 +5,10 @@ use crate::support::{
     base_command, clear_log, create_api_key, create_asset_resource_workspace,
     create_build_xcrun_mock, create_codesign_mock, create_ditto_mock, create_home,
     create_macos_universal_workspace, create_mixed_language_workspace, create_resource_workspace,
-    create_security_mock, create_signing_workspace, create_sw_vers_mock, create_watch_workspace,
-    create_watch_xcrun_mock, create_xcodebuild_mock, prepare_embedded_asc_state, read_log,
-    run_and_capture, spawn_asc_mock,
+    create_security_mock, create_signing_workspace, create_sw_vers_mock,
+    create_ui_testing_workspace, create_watch_workspace, create_watch_xcrun_mock,
+    create_xcodebuild_mock, prepare_embedded_asc_state, read_log, run_and_capture,
+    set_manifest_platforms, spawn_asc_mock,
 };
 
 fn build_command(
@@ -477,4 +478,47 @@ fn universal_macos_build_reuses_cached_lipo_merge_between_runs() {
 
     let second_log = read_log(&log_path);
     assert!(!second_log.contains("xcrun lipo -create -output"));
+}
+
+#[test]
+fn macos_development_build_without_embedded_asc_uses_ad_hoc_signing() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = create_ui_testing_workspace(temp.path());
+    set_manifest_platforms(
+        workspace.join("orbit.json").as_path(),
+        serde_json::json!({
+            "macos": "15.0"
+        }),
+    );
+    let home = create_home(temp.path());
+    let mock_bin = temp.path().join("mock-bin");
+    let log_path = temp.path().join("commands.log");
+    let sdk_root = temp.path().join("sdk");
+    fs::create_dir_all(&mock_bin).unwrap();
+
+    create_build_xcrun_mock(&mock_bin, &sdk_root);
+    create_codesign_mock(&mock_bin);
+    create_xcodebuild_mock(&mock_bin);
+    create_sw_vers_mock(&mock_bin);
+
+    let mut command = base_command(&workspace, &home, &mock_bin, &log_path);
+    command.args([
+        "--non-interactive",
+        "--manifest",
+        workspace.join("orbit.json").to_str().unwrap(),
+        "build",
+        "--platform",
+        "macos",
+    ]);
+    let output = run_and_capture(&mut command);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let log = read_log(&log_path);
+    assert!(log.contains("codesign --force --sign -"));
+    assert!(log.contains("--entitlements"));
+    assert!(!log.contains("security cms -D -i"));
 }

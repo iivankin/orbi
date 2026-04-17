@@ -3,7 +3,9 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
 
-use super::entitlements::materialize_signing_entitlements;
+use super::entitlements::{
+    materialize_local_macos_development_entitlements, materialize_signing_entitlements,
+};
 use super::{
     SigningIdentity, SigningMaterial, recover_system_keychain_identity, signing_progress_step,
 };
@@ -17,6 +19,12 @@ pub fn prepare_signing(
     profile: &ProfileManifest,
     device_udids: Option<Vec<String>>,
 ) -> Result<SigningMaterial> {
+    if platform == ApplePlatform::Macos
+        && profile.distribution == DistributionKind::Development
+        && crate::asc::config::load_raw(project)?.is_none()
+    {
+        return prepare_local_macos_development_signing(project, target);
+    }
     prepare_signing_with_embedded_asc(project, target, platform, profile, device_udids)
 }
 
@@ -96,8 +104,39 @@ fn prepare_signing_with_embedded_asc(
 
     Ok(SigningMaterial {
         signing_identity: signing_identity.hash,
-        keychain_path: signing_identity.keychain_path,
-        provisioning_profile_path,
+        keychain_path: Some(signing_identity.keychain_path),
+        provisioning_profile_path: Some(provisioning_profile_path),
+        entitlements_path,
+    })
+}
+
+fn prepare_local_macos_development_signing(
+    project: &ProjectContext,
+    target: &TargetManifest,
+) -> Result<SigningMaterial> {
+    let entitlements_path = signing_progress_step(
+        format!(
+            "Preparing local macOS development entitlements for target `{}`",
+            target.name
+        ),
+        |path: &Option<PathBuf>| match path {
+            Some(path) => format!(
+                "Prepared local macOS development entitlements for target `{}`: {}.",
+                target.name,
+                path.display()
+            ),
+            None => format!(
+                "No additional entitlements were needed for local macOS development target `{}`.",
+                target.name
+            ),
+        },
+        || materialize_local_macos_development_entitlements(project, target),
+    )?;
+
+    Ok(SigningMaterial {
+        signing_identity: "-".to_owned(),
+        keychain_path: None,
+        provisioning_profile_path: None,
         entitlements_path,
     })
 }

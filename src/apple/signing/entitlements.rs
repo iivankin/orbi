@@ -151,6 +151,40 @@ pub(super) fn materialize_signing_entitlements(
     Ok(Some(path))
 }
 
+pub(super) fn materialize_local_macos_development_entitlements(
+    project: &ProjectContext,
+    target: &TargetManifest,
+) -> Result<Option<PathBuf>> {
+    let original_path = target
+        .entitlements
+        .as_ref()
+        .map(|path| project.root.join(path));
+    let mut entitlements = original_path
+        .as_ref()
+        .map(|path| load_plist_dictionary(path))
+        .transpose()?
+        .unwrap_or_default();
+    ensure_local_macos_entitlements_supported(target, &entitlements)?;
+    let changed =
+        set_dictionary_boolean(&mut entitlements, "com.apple.security.get-task-allow", true);
+
+    if !changed {
+        return Ok(original_path);
+    }
+
+    let generated_dir = project
+        .project_paths
+        .orbit_dir
+        .join("signing")
+        .join("entitlements");
+    ensure_dir(&generated_dir)?;
+    let path = generated_dir.join(format!("{}.local-debug.entitlements", target.name));
+    Value::Dictionary(entitlements)
+        .to_file_xml(&path)
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    Ok(Some(path))
+}
+
 pub(super) fn materialize_macos_debug_trace_entitlements(
     project: &ProjectContext,
     target: &TargetManifest,
@@ -284,6 +318,51 @@ fn normalize_application_identifier_prefix(prefix: &str) -> String {
         prefix.to_owned()
     } else {
         format!("{prefix}.")
+    }
+}
+
+fn ensure_local_macos_entitlements_supported(
+    target: &TargetManifest,
+    entitlements: &Dictionary,
+) -> Result<()> {
+    if contains_entitlement_placeholders(entitlements) {
+        bail!(
+            "target `{}` uses entitlement placeholders like `$(AppIdentifierPrefix)` without an embedded `asc` section; add `asc` and run `orbit asc apply`, or replace the placeholder-based entitlements with literal macOS values",
+            target.name
+        );
+    }
+
+    let unsupported = entitlements
+        .keys()
+        .filter(|key| !key.starts_with("com.apple.security."))
+        .cloned()
+        .collect::<Vec<_>>();
+    if unsupported.is_empty() {
+        return Ok(());
+    }
+
+    bail!(
+        "target `{}` claims provisioning-backed macOS entitlements without an embedded `asc` section: {}; local macOS development fallback only supports unrestricted `com.apple.security.*` entitlements. Add `asc` and run `orbit asc apply`, or remove the restricted entitlements",
+        target.name,
+        unsupported.join(", ")
+    )
+}
+
+fn contains_entitlement_placeholders(dictionary: &Dictionary) -> bool {
+    dictionary
+        .values()
+        .any(value_contains_entitlement_placeholders)
+}
+
+fn value_contains_entitlement_placeholders(value: &Value) -> bool {
+    match value {
+        Value::Array(values) => values.iter().any(value_contains_entitlement_placeholders),
+        Value::Dictionary(dictionary) => contains_entitlement_placeholders(dictionary),
+        Value::String(text) => {
+            text.contains(APP_IDENTIFIER_PREFIX_PLACEHOLDER)
+                || text.contains(TEAM_IDENTIFIER_PREFIX_PLACEHOLDER)
+        }
+        _ => false,
     }
 }
 

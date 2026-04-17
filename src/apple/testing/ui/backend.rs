@@ -147,6 +147,6 @@ pub(crate) struct MacosDoctorStatus {
     pub screen_capture_access: bool,
 }
 
-fn idb_requirement_message() -> &'static str {
-    super::idb_requirement_message()
+fn idb_requirement_message() -> String {
+    super::idb::requirement_message()
 }

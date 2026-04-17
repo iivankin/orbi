@@ -413,8 +413,16 @@ pub(super) fn compute_signing_fingerprint(
     hasher.update(bundle_content_fingerprint.as_bytes());
     hasher.update(built_target.binary_path.to_string_lossy().as_bytes());
     hasher.update(material.signing_identity.as_bytes());
-    hasher.update(material.keychain_path.to_string_lossy().as_bytes());
-    hash_file_contents(&mut hasher, &material.provisioning_profile_path)?;
+    if let Some(keychain_path) = &material.keychain_path {
+        hasher.update(keychain_path.to_string_lossy().as_bytes());
+    } else {
+        hasher.update(b"no-keychain");
+    }
+    if let Some(provisioning_profile_path) = &material.provisioning_profile_path {
+        hash_file_contents(&mut hasher, provisioning_profile_path)?;
+    } else {
+        hasher.update(b"no-provisioning-profile");
+    }
     if let Some(entitlements_path) = &material.entitlements_path {
         hash_file_contents(&mut hasher, entitlements_path)?;
     } else {
