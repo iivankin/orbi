@@ -1,11 +1,8 @@
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::mpsc::TryRecvError;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::Result;
 use serde_json::json;
@@ -16,9 +13,8 @@ use super::flow::select_ui_flow_paths;
 use super::{
     UiCommand, UiCrashDeleteRequest, UiCrashQuery, UiFlowRunner, UiHardwareButton, UiKeyModifier,
     UiKeyPress, UiPermissionConfig, UiSelector, UiSwipeDirection, UiTravel,
-    acquire_waiting_file_lock, find_element_by_selector, find_visible_element_by_selector,
-    find_visible_scroll_container, infer_screen_frame, macos_ui_test_lock_path,
-    plan_macos_ui_trace, ui_testing_destination,
+    cleanup_macos_trace_temp_dir, find_element_by_selector, find_visible_element_by_selector,
+    find_visible_scroll_container, infer_screen_frame, ui_testing_destination,
 };
 use crate::apple::build::toolchain::DestinationKind;
 use crate::manifest::ApplePlatform;
@@ -71,6 +67,10 @@ impl UiBackend for TestUiBackend {
     }
 
     fn focus(&self) -> Result<()> {
+        Ok(())
+    }
+
+    fn abort_pending_trace_launch(&self) -> Result<()> {
         Ok(())
     }
 
@@ -330,69 +330,6 @@ fn visible_scroll_container_prefers_largest_visible_scroll_role() {
 }
 
 #[test]
-fn macos_trace_plan_allows_single_launch_with_prelaunch_commands() {
-    let temp = tempdir().unwrap();
-    let flow = write_flow(
-        temp.path(),
-        "flow.yaml",
-        "---\n- clearState\n- launchApp\n- assertVisible: Ready\n",
-    );
-
-    let plan = plan_macos_ui_trace(&[flow]).unwrap();
-    assert_eq!(plan.prelaunch_commands.len(), 1);
-    assert!(matches!(
-        plan.prelaunch_commands.first(),
-        Some(UiCommand::ClearState(None))
-    ));
-    assert!(plan.launch.is_some());
-}
-
-#[test]
-fn macos_trace_plan_rejects_multiple_launches() {
-    let temp = tempdir().unwrap();
-    let first = write_flow(temp.path(), "first.yaml", "---\n- launchApp\n");
-    let second = write_flow(temp.path(), "second.yaml", "---\n- launchApp\n");
-
-    let error = plan_macos_ui_trace(&[first, second]).unwrap_err();
-    assert!(error.to_string().contains("only one `launchApp`"));
-}
-
-#[test]
-fn ui_runner_skips_only_the_first_launch_when_trace_prelaunched_the_app() {
-    let temp = tempdir().unwrap();
-    let launches = Arc::new(Mutex::new(Vec::new()));
-    let backend = TestUiBackend {
-        launches: launches.clone(),
-        selector_taps: Arc::new(Mutex::new(Vec::new())),
-    };
-    let mut runner = UiFlowRunner::new(
-        Box::new(backend),
-        temp.path().join("artifacts"),
-        "dev.orbit.fixture".to_owned(),
-        true,
-    );
-
-    runner
-        .run_leaf_command(&UiCommand::LaunchApp(super::UiLaunchApp::default()))
-        .unwrap();
-    assert!(launches.lock().unwrap().is_empty());
-
-    runner
-        .run_leaf_command(&UiCommand::LaunchApp(super::UiLaunchApp {
-            arguments: vec![("seedUser".to_owned(), "qa@example.com".to_owned())],
-            ..super::UiLaunchApp::default()
-        }))
-        .unwrap();
-
-    let recorded = launches.lock().unwrap();
-    assert_eq!(recorded.len(), 1);
-    assert_eq!(
-        recorded[0],
-        vec![("seedUser".to_owned(), "qa@example.com".to_owned())]
-    );
-}
-
-#[test]
 fn ui_runner_prefers_backend_selector_activation_for_tap_on() {
     let temp = tempdir().unwrap();
     let selector_taps = Arc::new(Mutex::new(Vec::new()));
@@ -404,7 +341,7 @@ fn ui_runner_prefers_backend_selector_activation_for_tap_on() {
         Box::new(backend),
         temp.path().join("artifacts"),
         "dev.orbit.fixture".to_owned(),
-        false,
+        None,
     );
 
     runner
@@ -418,6 +355,42 @@ fn ui_runner_prefers_backend_selector_activation_for_tap_on() {
     assert_eq!(recorded.len(), 1);
     assert!(recorded[0].text.is_none());
     assert_eq!(recorded[0].id.as_deref(), Some("continue-button"));
+}
+
+#[test]
+fn trace_temp_cleanup_removes_only_stale_ktrace_files_by_default() {
+    let temp = tempdir().unwrap();
+    let stale = temp.path().join("instruments-old.ktrace");
+    let recent = temp.path().join("instruments-new.ktrace");
+    let ignored = temp.path().join("notes.txt");
+    fs::write(&stale, vec![0_u8; 8]).unwrap();
+    thread::sleep(Duration::from_secs(2));
+    fs::write(&recent, vec![1_u8; 4]).unwrap();
+    fs::write(&ignored, b"keep").unwrap();
+
+    let summary = cleanup_macos_trace_temp_dir(temp.path(), false, Duration::from_secs(1)).unwrap();
+    assert_eq!(summary.scanned_files, 2);
+    assert_eq!(summary.removed_files, 1);
+    assert_eq!(summary.skipped_recent_files, 1);
+    assert_eq!(summary.freed_bytes, 8);
+    assert!(!stale.exists());
+    assert!(recent.exists());
+    assert!(ignored.exists());
+}
+
+#[test]
+fn trace_temp_cleanup_can_remove_recent_ktrace_files_with_all_flag() {
+    let temp = tempdir().unwrap();
+    let recent = temp.path().join("instruments-live.ktrace");
+    fs::write(&recent, vec![7_u8; 16]).unwrap();
+
+    let summary =
+        cleanup_macos_trace_temp_dir(temp.path(), true, Duration::from_secs(3600)).unwrap();
+    assert_eq!(summary.scanned_files, 1);
+    assert_eq!(summary.removed_files, 1);
+    assert_eq!(summary.skipped_recent_files, 0);
+    assert_eq!(summary.freed_bytes, 16);
+    assert!(!recent.exists());
 }
 
 #[test]
@@ -464,49 +437,4 @@ fn flow_selector_reports_available_flows_when_no_match_exists() {
     assert!(message.contains("missing-flow"));
     assert!(message.contains("onboarding-profile.yaml"));
     assert!(message.contains("onboarding-provider-setup-profile"));
-}
-
-#[test]
-fn macos_ui_test_lock_path_uses_global_data_dir() {
-    let path = macos_ui_test_lock_path(Path::new("/tmp/orbit-data"));
-    assert_eq!(path, Path::new("/tmp/orbit-data/locks/macos-ui-tests.lock"));
-}
-
-#[test]
-fn file_lock_waits_for_existing_holder_to_exit() {
-    let temp = tempdir().unwrap();
-    let lock_path = temp.path().join("macos-ui-tests.lock");
-    let mut holder = Command::new("/usr/bin/perl")
-        .arg("-e")
-        .arg(
-            "use Fcntl qw(:flock); open my $fh, '>>', $ARGV[0] or die $!; flock($fh, LOCK_EX) or die $!; select STDOUT; $| = 1; print qq(locked\\n); scalar <STDIN>;",
-        )
-        .arg(&lock_path)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .unwrap();
-
-    let mut ready = String::new();
-    let stdout = holder.stdout.take().unwrap();
-    BufReader::new(stdout).read_line(&mut ready).unwrap();
-    assert_eq!(ready, "locked\n");
-
-    let (tx, rx) = std::sync::mpsc::channel();
-    let waiter_lock_path = lock_path.clone();
-    let waiter = thread::spawn(move || {
-        let started = Instant::now();
-        let _guard = acquire_waiting_file_lock(&waiter_lock_path, "waiting").unwrap();
-        tx.send(started.elapsed()).unwrap();
-    });
-
-    thread::sleep(Duration::from_millis(250));
-    assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
-
-    holder.stdin.as_mut().unwrap().write_all(b"\n").unwrap();
-    assert!(holder.wait().unwrap().success());
-
-    let waited = rx.recv_timeout(Duration::from_secs(3)).unwrap();
-    waiter.join().unwrap();
-    assert!(waited >= Duration::from_millis(250));
 }

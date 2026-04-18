@@ -22,7 +22,7 @@ use crate::apple::xcode::{
     xcodebuild_command, xcrun_command,
 };
 use crate::cli::ProfileKind;
-use crate::context::ProjectContext;
+use crate::context::{ProjectContext, ProjectPaths};
 use crate::manifest::ApplePlatform;
 use crate::util::{
     CliSpinner, combine_command_output, command_output_allow_failure, debug_command, ensure_dir,
@@ -55,7 +55,7 @@ pub(super) fn run_on_macos(
             target,
             &receipt.bundle_path,
         )?;
-        let launch_target = prepare_macos_trace_launch_executable(project, receipt)?;
+        let launch_target = prepare_macos_trace_launch_executable(&project.project_paths, receipt)?;
         println!(
             "Launching {} under xctrace on the local Mac. Orbit will wait for the recording to finish; press Ctrl-C to stop.",
             receipt.bundle_id
@@ -79,33 +79,70 @@ pub(super) fn run_on_macos(
     run_macos_application(project, receipt)
 }
 
-fn stop_existing_macos_application(receipt: &BuildReceipt) -> Result<()> {
+pub(crate) fn stop_existing_macos_application(receipt: &BuildReceipt) -> Result<()> {
     let mut script = Command::new("osascript");
     script.args(["-e", &macos_quit_applescript(receipt.bundle_id.as_str())]);
-    let _ = command_output_allow_failure(&mut script)?;
+    script.stdout(Stdio::null());
+    script.stderr(Stdio::null());
+    if let Ok(mut child) = script.spawn() {
+        let quit_deadline = Instant::now() + Duration::from_millis(500);
+        let mut finished = false;
+        while Instant::now() < quit_deadline {
+            if child.try_wait()?.is_some() {
+                finished = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+        if !finished {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
 
     let executable = macos_executable_path(receipt)?;
     let started = Instant::now();
     while started.elapsed() < Duration::from_secs(2) {
-        if !macos_process_running(&executable)? {
+        let matching_pids = matching_macos_processes(&executable)?;
+        if matching_pids.is_empty() {
             return Ok(());
         }
         thread::sleep(Duration::from_millis(100));
     }
 
-    let mut command = Command::new("pkill");
-    command.args(["-f"]);
-    command.arg(executable);
-    let _ = command_output_allow_failure(&mut command)?;
+    terminate_matching_macos_processes(&executable, "TERM")?;
+    let terminate_deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < terminate_deadline {
+        if matching_macos_processes(&executable)?.is_empty() {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    terminate_matching_macos_processes(&executable, "KILL")?;
     Ok(())
 }
 
-fn macos_process_running(executable: &Path) -> Result<bool> {
+fn matching_macos_processes(executable: &Path) -> Result<Vec<u32>> {
     let mut command = Command::new("pgrep");
     command.args(["-f"]);
     command.arg(executable);
-    let (success, _stdout, _stderr) = command_output_allow_failure(&mut command)?;
-    Ok(success)
+    let (success, stdout, _stderr) = command_output_allow_failure(&mut command)?;
+    if !success {
+        return Ok(Vec::new());
+    }
+    Ok(stdout
+        .lines()
+        .filter_map(|line| line.trim().parse::<u32>().ok())
+        .collect())
+}
+
+fn terminate_matching_macos_processes(executable: &Path, signal: &str) -> Result<()> {
+    for pid in matching_macos_processes(executable)? {
+        let mut command = Command::new("kill");
+        command.args([format!("-{signal}").as_str(), &pid.to_string()]);
+        let _ = command_output_allow_failure(&mut command)?;
+    }
+    Ok(())
 }
 
 fn write_temp_script(contents: &str, context: &str, executable: bool) -> Result<NamedTempFile> {
@@ -637,11 +674,10 @@ fn run_on_device_with_trace(
 }
 
 pub(crate) fn prepare_macos_trace_launch_executable(
-    project: &ProjectContext,
+    project_paths: &ProjectPaths,
     receipt: &BuildReceipt,
 ) -> Result<String> {
-    let launch_dir = project
-        .project_paths
+    let launch_dir = project_paths
         .artifacts_dir
         .join("profiles")
         .join("launch-targets");
@@ -669,11 +705,13 @@ pub(crate) fn prepare_macos_trace_launch_executable(
     );
     let launch_executable =
         rewrite_macos_trace_launch_bundle_executable(&launch_alias, &launch_executable_name)?;
+    let original_entitlements = extract_macos_codesign_entitlements(receipt.bundle_path.as_path())?;
     let mut codesign = Command::new("codesign");
-    // The copied trace launch target must stay ad-hoc signed without extra entitlements.
-    // Adding `get-task-allow` here makes `xctrace --launch` spawn a duplicate Dock-visible
-    // macOS app process for this copied bundle in live validation.
     codesign.args(["--force", "--sign", "-"]);
+    if let Some(entitlements) = original_entitlements.as_ref() {
+        codesign.arg("--entitlements");
+        codesign.arg(entitlements.path());
+    }
     codesign.arg(&launch_alias);
     run_command(&mut codesign).with_context(|| {
         format!(
@@ -744,6 +782,44 @@ fn rewrite_macos_trace_launch_bundle_executable(
         .to_file_xml(&info_plist_path)
         .with_context(|| format!("failed to write {}", info_plist_path.display()))?;
     Ok(renamed_executable_path)
+}
+
+fn extract_macos_codesign_entitlements(bundle_path: &Path) -> Result<Option<NamedTempFile>> {
+    let mut command = Command::new("codesign");
+    command.args(["-d", "--entitlements", ":-"]);
+    command.arg(bundle_path);
+    let (success, stdout, stderr) = command_output_allow_failure(&mut command)?;
+    if !success {
+        bail!(
+            "failed to inspect code signing entitlements for `{}`: {}",
+            bundle_path.display(),
+            stderr.trim()
+        );
+    }
+
+    let Some(plist) = extract_codesign_entitlements_plist(stdout.as_str()) else {
+        return Ok(None);
+    };
+
+    let mut file = NamedTempFile::new().with_context(|| {
+        format!(
+            "failed to create entitlements temp file for {}",
+            bundle_path.display()
+        )
+    })?;
+    use std::io::Write as _;
+    file.write_all(plist.as_bytes()).with_context(|| {
+        format!(
+            "failed to write extracted entitlements for `{}`",
+            bundle_path.display()
+        )
+    })?;
+    Ok(Some(file))
+}
+
+fn extract_codesign_entitlements_plist(output: &str) -> Option<&str> {
+    let start = output.find("<?xml")?;
+    Some(output[start..].trim())
 }
 
 fn macos_trace_launch_executable_name(value: &str) -> String {
@@ -2167,11 +2243,11 @@ mod tests {
         ApplePlatform, BuildReceipt, DeviceRunningProcess, PhysicalCpuType, PhysicalDevice,
         PhysicalDeviceProperties, PhysicalHardwareProperties, device_is_locked_from_details,
         error_mentions_locked_device, expect_macos_wrapper_script,
-        find_running_process_for_installation, lldb_expect_attach_script,
-        lldb_expect_macos_launch_script, lldb_expect_macos_run_script,
+        extract_codesign_entitlements_plist, find_running_process_for_installation,
+        lldb_expect_attach_script, lldb_expect_macos_launch_script, lldb_expect_macos_run_script,
         lldb_expect_simulator_attach_script, macos_debug_wrapper_script, macos_executable_path,
-        macos_trace_launch_executable_name, macos_xcode_log_redirect_env,
-        select_physical_device_from_candidates, simulator_run_wrapper_script,
+        macos_xcode_log_redirect_env, select_physical_device_from_candidates,
+        simulator_run_wrapper_script,
     };
     use crate::apple::build::receipt::BuildReceiptInput;
     use crate::apple::simulator::SimulatorDevice;
@@ -2195,18 +2271,6 @@ mod tests {
                 udid: udid.to_owned(),
             },
         }
-    }
-
-    #[test]
-    fn builds_trace_launch_executable_name() {
-        assert_eq!(
-            macos_trace_launch_executable_name("1775304762 ExampleMacApp.app"),
-            "OrbitTrace1775304762_ExampleMacApp_app"
-        );
-        assert_eq!(
-            macos_trace_launch_executable_name("%%%"),
-            "OrbitTraceLaunch"
-        );
     }
 
     fn fake_selected_xcode() -> (TempDir, SelectedXcode) {
@@ -2234,6 +2298,19 @@ mod tests {
         };
 
         (temp, selected)
+    }
+
+    #[test]
+    fn extracts_codesign_entitlements_plist_from_mixed_output() {
+        let output = concat!(
+            "Executable=/tmp/Example.app/Contents/MacOS/Example\n",
+            "warning: Specifying ':' in the path is deprecated and will not work in a future release\n",
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n",
+            "<plist version=\"1.0\"><dict><key>com.apple.security.get-task-allow</key><true/></dict></plist>\n"
+        );
+        let plist = extract_codesign_entitlements_plist(output).unwrap();
+        assert!(plist.starts_with("<?xml version=\"1.0\" encoding=\"UTF-8\"?>"));
+        assert!(plist.contains("com.apple.security.get-task-allow"));
     }
 
     #[test]

@@ -135,7 +135,7 @@ fn orbit_test_ui_trace_fails_on_ios_simulator() {
 }
 
 #[test]
-fn orbit_test_ui_trace_fails_early_on_macos_when_flow_suite_relaunches_the_app() {
+fn orbit_test_ui_trace_advances_past_macos_relaunch_planning() {
     let temp = tempdir().unwrap();
     let home = create_home(temp.path());
     let mock_bin = temp.path().join("mock-bin");
@@ -170,14 +170,36 @@ fn orbit_test_ui_trace_fails_early_on_macos_when_flow_suite_relaunches_the_app()
         "cpu",
     ]);
     let output = run_and_capture(&mut command);
-    assert!(!output.status.success());
-
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("only one `launchApp`"));
+    assert!(!output.status.success());
+    assert!(
+        !stderr.contains("only one `launchApp`"),
+        "{}",
+        format_failure_output(&stderr)
+    );
 
-    let log = read_log(&log_path);
-    assert!(!log.contains("xcrun "));
-    assert!(!log.contains("swift "));
+    let report_path = latest_ui_report_path(workspace.join(".orbit/tests/ui").as_path());
+    let report = fs::read_to_string(&report_path).unwrap();
+    assert!(report.contains("\"command\": \"launchApp\""));
+    assert!(report.contains("\"error\": \"could not find `Continue`"));
+
+    let profiles_dir = workspace.join(".orbit/artifacts/profiles");
+    let trace_count = fs::read_dir(&profiles_dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .path()
+                .extension()
+                .and_then(|value| value.to_str())
+                .is_some_and(|extension| extension == "trace")
+        })
+        .count();
+    assert!(
+        trace_count >= 2,
+        "expected at least 2 trace bundles in {}",
+        profiles_dir.display()
+    );
 }
 
 #[test]

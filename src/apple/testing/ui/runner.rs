@@ -16,6 +16,7 @@ use super::report::{
     FlowRunReport, RunStatus, StepRunReport, append_report_error, flow_name_from_path,
     sanitize_artifact_name, sanitize_extension_component, unix_timestamp_secs,
 };
+use super::trace::{MacosUiTraceRuntime, resolve_trace_bundle_id};
 use super::{
     UiCommand, UiDragAndDrop, UiElementScroll, UiElementSwipe, UiExtendedWaitUntil, UiFlow,
     UiKeyPress, UiPressKey, UiScrollUntilVisible, UiSelector, UiSwipe, UiSwipeDirection,
@@ -40,7 +41,7 @@ pub(super) struct UiFlowRunner {
     stack: Vec<PathBuf>,
     clipboard: Option<String>,
     manual_recording: Option<PathBuf>,
-    skip_initial_launch: bool,
+    trace_runtime: Option<MacosUiTraceRuntime>,
 }
 
 impl UiFlowRunner {
@@ -48,7 +49,7 @@ impl UiFlowRunner {
         backend: Box<dyn UiBackend>,
         artifacts_dir: PathBuf,
         bundle_id: String,
-        skip_initial_launch: bool,
+        trace_runtime: Option<MacosUiTraceRuntime>,
     ) -> Self {
         Self {
             backend,
@@ -57,7 +58,7 @@ impl UiFlowRunner {
             stack: Vec::new(),
             clipboard: None,
             manual_recording: None,
-            skip_initial_launch,
+            trace_runtime,
         }
     }
 
@@ -147,6 +148,15 @@ impl UiFlowRunner {
             report.error = Some(error.to_string());
             self.capture_failure_artifacts(&flow_path, &mut report)?;
         }
+        if invoked_by.is_none()
+            && let Err(error) = self.finish_top_level_trace_run()
+        {
+            report.status = RunStatus::Failed;
+            append_report_error(&mut report, error.to_string());
+            if report.failure_screenshot.is_none() {
+                self.capture_failure_artifacts(&flow_path, &mut report)?;
+            }
+        }
         if let Some(path) = video_path.as_ref()
             && auto_video_started
         {
@@ -179,6 +189,37 @@ impl UiFlowRunner {
         let passed = matches!(report.status, RunStatus::Passed);
         reports.push(report);
         Ok(passed)
+    }
+
+    fn finish_top_level_trace_run(&mut self) -> Result<()> {
+        if self.trace_runtime.is_none() {
+            return Ok(());
+        }
+        self.finish_active_trace_segment("flow completion")?;
+        self.backend
+            .stop_app(self.bundle_id.as_str())
+            .with_context(|| format!("failed to stop `{}` after traced flow", self.bundle_id))
+    }
+
+    fn finish_active_trace_segment(&mut self, reason: &str) -> Result<()> {
+        let Some(trace_runtime) = self.trace_runtime.as_mut() else {
+            return Ok(());
+        };
+        if let Some(path) = trace_runtime
+            .finish_active()
+            .with_context(|| format!("failed to finalize active trace before `{reason}`"))?
+        {
+            println!("trace: {}", path.display());
+        }
+        Ok(())
+    }
+
+    fn resolve_command_bundle_id(&self, requested: Option<&str>, source: &str) -> Result<String> {
+        if self.trace_runtime.is_some() {
+            resolve_trace_bundle_id(&self.bundle_id, requested, source).map(str::to_owned)
+        } else {
+            Ok(self.resolve_bundle_id(requested).to_owned())
+        }
     }
 
     #[cfg(test)]
@@ -328,35 +369,52 @@ impl UiFlowRunner {
     fn run_leaf_command_inner(&mut self, command: &UiCommand) -> Result<Option<PathBuf>> {
         match command {
             UiCommand::LaunchApp(command) => {
-                if self.skip_initial_launch {
-                    self.skip_initial_launch = false;
-                    return Ok(None);
+                if let Some(trace_runtime) = self.trace_runtime.as_mut() {
+                    trace_runtime.launch_app(self.backend.as_ref(), command)?;
+                } else {
+                    let app_id = self.resolve_bundle_id(command.app_id.as_deref());
+                    if command.clear_keychain {
+                        self.backend.clear_keychain()?;
+                    }
+                    if command.clear_state {
+                        self.backend.clear_app_state(app_id)?;
+                    }
+                    if let Some(permissions) = command.permissions.as_ref() {
+                        self.backend.set_permissions(app_id, permissions)?;
+                    }
+                    self.backend.launch_app(
+                        app_id,
+                        command.stop_app,
+                        command.arguments.as_slice(),
+                    )?;
                 }
-                let app_id = self.resolve_bundle_id(command.app_id.as_deref());
-                if command.clear_keychain {
-                    self.backend.clear_keychain()?;
-                }
-                if command.clear_state {
-                    self.backend.clear_app_state(app_id)?;
-                }
-                if let Some(permissions) = command.permissions.as_ref() {
-                    self.backend.set_permissions(app_id, permissions)?;
-                }
-                self.backend
-                    .launch_app(app_id, command.stop_app, command.arguments.as_slice())?;
                 Ok(None)
             }
             UiCommand::StopApp(app_id) | UiCommand::KillApp(app_id) => {
-                self.backend
-                    .stop_app(self.resolve_bundle_id(app_id.as_deref()))?;
+                let app_id = self.resolve_command_bundle_id(
+                    app_id.as_deref(),
+                    if matches!(command, UiCommand::StopApp(_)) {
+                        "stopApp"
+                    } else {
+                        "killApp"
+                    },
+                )?;
+                self.finish_active_trace_segment(if matches!(command, UiCommand::StopApp(_)) {
+                    "stopApp"
+                } else {
+                    "killApp"
+                })?;
+                self.backend.stop_app(&app_id)?;
                 Ok(None)
             }
             UiCommand::ClearState(app_id) => {
-                self.backend
-                    .clear_app_state(self.resolve_bundle_id(app_id.as_deref()))?;
+                let app_id = self.resolve_command_bundle_id(app_id.as_deref(), "clearState")?;
+                self.finish_active_trace_segment("clearState")?;
+                self.backend.clear_app_state(&app_id)?;
                 Ok(None)
             }
             UiCommand::ClearKeychain => {
+                self.finish_active_trace_segment("clearKeychain")?;
                 self.backend.clear_keychain()?;
                 Ok(None)
             }
@@ -552,8 +610,10 @@ impl UiFlowRunner {
                 Ok(None)
             }
             UiCommand::SetPermissions(command) => {
-                let app_id = self.resolve_bundle_id(command.app_id.as_deref());
-                self.backend.set_permissions(app_id, command)?;
+                let app_id =
+                    self.resolve_command_bundle_id(command.app_id.as_deref(), "setPermissions")?;
+                self.finish_active_trace_segment("setPermissions")?;
+                self.backend.set_permissions(&app_id, command)?;
                 Ok(None)
             }
             UiCommand::Travel(command) => {

@@ -229,6 +229,8 @@ pub enum UiCommand {
     Schema(UiSchemaArgs),
     /// Check automation prerequisites for the selected platform.
     Doctor(UiDoctorArgs),
+    /// Remove stale Instruments temp traces from the current user's temp directory.
+    CleanTraceTemp(UiCleanTraceTempArgs),
     /// Dump the current accessibility tree as JSON.
     DumpTree(UiDumpTreeArgs),
     /// Inspect the accessibility element at a specific point.
@@ -283,6 +285,24 @@ pub struct UiDoctorArgs {
         long_help = PLATFORM_ARG_LONG_HELP
     )]
     pub platform: Option<TargetPlatform>,
+}
+
+#[derive(Debug, Args)]
+#[command(
+    about = "Remove stale `xctrace` / Instruments `.ktrace` temp files from the current user's temp directory.",
+    long_about = "Orbit's macOS trace runs use `xctrace`, which can leave large `instruments*.ktrace` files behind in the current user's temp directory after interrupted sessions.\n\nThis command removes those temp files from `std::env::temp_dir()`. By default it only removes files older than one hour. Pass `--all` to remove every matching temp trace in that directory.",
+    after_help = "Examples:\n  orbit ui clean-trace-temp\n  orbit ui clean-trace-temp --stale-minutes 15\n  orbit ui clean-trace-temp --all"
+)]
+pub struct UiCleanTraceTempArgs {
+    #[arg(
+        long,
+        conflicts_with = "stale_minutes",
+        help = "Remove every matching `instruments*.ktrace` file in the current temp directory, regardless of age."
+    )]
+    pub all: bool,
+
+    #[arg(long, help = "Remove only temp traces older than this many minutes.")]
+    pub stale_minutes: Option<u64>,
 }
 
 #[derive(Debug, Args)]
@@ -942,6 +962,7 @@ mod tests {
         let help = ui.render_long_help().to_string();
 
         assert!(help.contains("schema"));
+        assert!(help.contains("clean-trace-temp"));
         assert!(help.contains("tests.ui"));
     }
 

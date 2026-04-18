@@ -1,21 +1,21 @@
 use std::path::{Path, PathBuf};
-use std::process::{Child, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, bail};
-use signal_hook::consts::signal::SIGINT;
-use signal_hook::iterator::{Handle as SignalHandle, Signals};
-
 use super::export::wait_for_exportable_trace;
 use crate::apple::xcode::{SelectedXcode, xcrun_command};
 use crate::cli::ProfileKind;
 use crate::util::{command_output_allow_failure, debug_command, ensure_parent_dir, timestamp_slug};
+use anyhow::{Context, Result, bail};
+use signal_hook::consts::signal::SIGINT;
+use signal_hook::iterator::{Handle as SignalHandle, Signals};
 
 pub(crate) const SIMULATOR_PROFILING_UNAVAILABLE_MESSAGE: &str = "simulator profiling is currently unavailable because Apple's xctrace/InstrumentsCLI simulator path is unstable and can hang or emit broken traces. Use a physical device or macOS target instead.";
 const TRACE_RECORDING_FINALIZE_TIMEOUT: Duration = Duration::from_secs(90);
+const TRACE_RECORDING_INTERRUPT_GRACE: Duration = Duration::from_millis(250);
 
 pub(crate) struct TraceRecording {
     output_path: PathBuf,
@@ -23,6 +23,7 @@ pub(crate) struct TraceRecording {
     child: Child,
     debug: String,
     backend: TraceRecordingBackend,
+    interrupt_grace: Duration,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -36,6 +37,17 @@ enum TraceRecordingBackend {
 enum TraceLaunchStdio {
     Inherit,
     Null,
+}
+
+struct LaunchedTraceRequest<'a> {
+    root: &'a Path,
+    selected_xcode: Option<&'a SelectedXcode>,
+    interactive: bool,
+    kind: ProfileKind,
+    launch_command: &'a [String],
+    launch_environment: &'a [(String, String)],
+    device: Option<&'a str>,
+    stdio: TraceLaunchStdio,
 }
 
 struct SignalForwarder {
@@ -71,25 +83,23 @@ pub(crate) fn start_optional_launched_command_trace(
     interactive: bool,
     kind: Option<ProfileKind>,
     launch_command: &[String],
+    launch_environment: &[(String, String)],
     device: Option<&str>,
 ) -> Result<Option<(ProfileKind, TraceRecording)>> {
     kind.map(|kind| {
-        start_launched_trace(
+        start_launched_trace(LaunchedTraceRequest {
             root,
             selected_xcode,
             interactive,
             kind,
             launch_command,
+            launch_environment,
             device,
-            TraceLaunchStdio::Inherit,
-        )
+            stdio: TraceLaunchStdio::Inherit,
+        })
         .map(|recording| (kind, recording))
     })
     .transpose()
-}
-
-pub(crate) fn trace_recording_process_id(recording: &TraceRecording) -> u32 {
-    recording.child.id()
 }
 
 pub(crate) fn ensure_simulator_profiling_supported(kind: Option<ProfileKind>) -> Result<()> {
@@ -130,67 +140,69 @@ fn start_launched_process_trace(
     launch_target: &str,
     device: Option<&str>,
 ) -> Result<TraceRecording> {
-    start_launched_trace(
+    start_launched_trace(LaunchedTraceRequest {
         root,
         selected_xcode,
         interactive,
         kind,
-        &[launch_target.to_owned()],
+        launch_command: &[launch_target.to_owned()],
+        launch_environment: &[],
         device,
-        TraceLaunchStdio::Null,
-    )
+        stdio: TraceLaunchStdio::Null,
+    })
 }
 
-fn start_launched_trace(
-    root: &Path,
-    selected_xcode: Option<&SelectedXcode>,
-    interactive: bool,
-    kind: ProfileKind,
-    launch_command: &[String],
-    device: Option<&str>,
-    stdio: TraceLaunchStdio,
-) -> Result<TraceRecording> {
-    if launch_command.is_empty() {
+fn start_launched_trace(request: LaunchedTraceRequest<'_>) -> Result<TraceRecording> {
+    if request.launch_command.is_empty() {
         bail!("xctrace launched trace requires at least one launch argument");
     }
 
-    let output_path = default_trace_output(root, kind)?;
-    let mut command = xcrun_command(selected_xcode);
-    command.arg("xctrace");
-    command.arg("record");
-    command.arg("--template");
-    command.arg(kind.trace_template());
-    command.arg("--output");
-    command.arg(&output_path);
-    if let Some(device) = device {
-        command.arg("--device").arg(device);
-    }
-    command.arg("--env");
-    command.arg("OS_ACTIVITY_DT_MODE=1");
-    command.arg("--env");
-    command.arg("IDEPreferLogStreaming=YES");
-    command.arg("--launch");
-    command.arg("--");
-    command.args(launch_command);
-    if !interactive {
-        command.arg("--no-prompt");
-    }
-    if matches!(stdio, TraceLaunchStdio::Null) {
-        command.stdout(Stdio::null());
-        command.stderr(Stdio::null());
-    }
-
+    let output_path = default_trace_output(request.root, request.kind)?;
+    let mut command = build_xctrace_record_command(&request, &output_path);
     let debug = debug_command(&command);
     let child = command
         .spawn()
         .with_context(|| format!("failed to execute `{debug}`"))?;
     Ok(TraceRecording {
         output_path,
-        selected_xcode: selected_xcode.cloned(),
+        selected_xcode: request.selected_xcode.cloned(),
         child,
         debug,
         backend: TraceRecordingBackend::Xctrace,
+        interrupt_grace: TRACE_RECORDING_INTERRUPT_GRACE,
     })
+}
+
+fn build_xctrace_record_command(request: &LaunchedTraceRequest<'_>, output_path: &Path) -> Command {
+    let mut command = xcrun_command(request.selected_xcode);
+    command.arg("xctrace");
+    command.arg("record");
+    command.arg("--template");
+    command.arg(request.kind.trace_template());
+    command.arg("--output");
+    command.arg(output_path);
+    if let Some(device) = request.device {
+        command.arg("--device").arg(device);
+    }
+    if !request.interactive {
+        command.arg("--no-prompt");
+    }
+    command.arg("--env");
+    command.arg("OS_ACTIVITY_DT_MODE=1");
+    command.arg("--env");
+    command.arg("IDEPreferLogStreaming=YES");
+    for (key, value) in request.launch_environment {
+        command.arg("--env");
+        command.arg(format!("{key}={value}"));
+    }
+    command.arg("--launch");
+    command.arg("--");
+    command.args(request.launch_command);
+    if matches!(request.stdio, TraceLaunchStdio::Null) {
+        command.stdout(Stdio::null());
+        command.stderr(Stdio::null());
+    }
+    command
 }
 
 fn wait_for_trace_recording_exit(
@@ -237,6 +249,18 @@ fn finish_trace_recording(recording: TraceRecording) -> Result<PathBuf> {
     }
 }
 
+fn accept_finished_xctrace_output(recording: &TraceRecording) -> Result<Option<PathBuf>> {
+    if !recording.output_path.exists() {
+        return Ok(None);
+    }
+    wait_for_exportable_trace(
+        &recording.output_path,
+        recording.selected_xcode.as_ref(),
+        &recording.debug,
+    )?;
+    Ok(Some(recording.output_path.clone()))
+}
+
 fn verify_recording_output(recording: &TraceRecording) -> Result<()> {
     match recording.backend {
         TraceRecordingBackend::Xctrace => {
@@ -272,15 +296,14 @@ fn wait_for_recording_output_path(recording: &TraceRecording, timeout: Duration)
 
 fn finish_xctrace_recording(mut recording: TraceRecording) -> Result<PathBuf> {
     let graceful_wait_started = Instant::now();
-    while graceful_wait_started.elapsed() < Duration::from_millis(250) {
+    while graceful_wait_started.elapsed() < recording.interrupt_grace {
         if let Some(status) = recording.child.try_wait()? {
-            if status.success() && recording.output_path.exists() {
-                wait_for_exportable_trace(
-                    &recording.output_path,
-                    recording.selected_xcode.as_ref(),
-                    &recording.debug,
-                )?;
-                return Ok(recording.output_path);
+            if status.success() {
+                if let Some(path) = accept_finished_xctrace_output(&recording)? {
+                    return Ok(path);
+                }
+            } else if let Some(path) = accept_finished_xctrace_output(&recording)? {
+                return Ok(path);
             }
             bail!(
                 "`{}` exited with {status} before writing {}",
@@ -298,13 +321,12 @@ fn finish_xctrace_recording(mut recording: TraceRecording) -> Result<PathBuf> {
     let started = Instant::now();
     while started.elapsed() < TRACE_RECORDING_FINALIZE_TIMEOUT {
         if let Some(status) = recording.child.try_wait()? {
-            if status.success() && recording.output_path.exists() {
-                wait_for_exportable_trace(
-                    &recording.output_path,
-                    recording.selected_xcode.as_ref(),
-                    &recording.debug,
-                )?;
-                return Ok(recording.output_path);
+            if status.success() {
+                if let Some(path) = accept_finished_xctrace_output(&recording)? {
+                    return Ok(path);
+                }
+            } else if let Some(path) = accept_finished_xctrace_output(&recording)? {
+                return Ok(path);
             }
             bail!(
                 "`{}` exited with {status} before writing {}",
@@ -317,15 +339,8 @@ fn finish_xctrace_recording(mut recording: TraceRecording) -> Result<PathBuf> {
 
     let _ = recording.child.kill();
     let _ = recording.child.wait();
-    if recording.output_path.exists()
-        && wait_for_exportable_trace(
-            &recording.output_path,
-            recording.selected_xcode.as_ref(),
-            &recording.debug,
-        )
-        .is_ok()
-    {
-        return Ok(recording.output_path);
+    if let Some(path) = accept_finished_xctrace_output(&recording)? {
+        return Ok(path);
     }
 
     bail!(
@@ -338,7 +353,7 @@ fn finish_xctrace_recording(mut recording: TraceRecording) -> Result<PathBuf> {
 #[cfg(test)]
 fn finish_plain_recording(mut recording: TraceRecording) -> Result<PathBuf> {
     let graceful_wait_started = Instant::now();
-    while graceful_wait_started.elapsed() < Duration::from_millis(250) {
+    while graceful_wait_started.elapsed() < TRACE_RECORDING_INTERRUPT_GRACE {
         if let Some(status) = recording.child.try_wait()? {
             if status.success() && recording.output_path.exists() {
                 return Ok(recording.output_path);
@@ -470,14 +485,69 @@ fn validate_trace_output_path(output_path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::path::PathBuf;
     use std::process::Command;
     use std::thread;
     use std::time::{Duration, Instant};
 
     use tempfile::tempdir;
 
-    use super::{TraceRecording, TraceRecordingBackend, wait_for_trace_recording_exit};
+    use super::{
+        LaunchedTraceRequest, TraceLaunchStdio, TraceRecording, TraceRecordingBackend,
+        build_xctrace_record_command, wait_for_trace_recording_exit,
+    };
     use crate::cli::ProfileKind;
+
+    fn command_args(command: &Command) -> Vec<String> {
+        command
+            .get_args()
+            .map(|value| value.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn launched_trace_command_keeps_prompts_when_interactive() {
+        let root = PathBuf::from("/tmp");
+        let launch_command = ["/tmp/App.app/Contents/MacOS/App".to_owned()];
+        let request = LaunchedTraceRequest {
+            root: root.as_path(),
+            selected_xcode: None,
+            interactive: true,
+            kind: ProfileKind::Memory,
+            launch_command: &launch_command,
+            launch_environment: &[],
+            device: None,
+            stdio: TraceLaunchStdio::Inherit,
+        };
+        let command = build_xctrace_record_command(
+            &request,
+            PathBuf::from("/tmp/interactive.trace").as_path(),
+        );
+        let args = command_args(&command);
+        assert!(!args.iter().any(|value| value == "--no-prompt"));
+    }
+
+    #[test]
+    fn launched_trace_command_suppresses_prompts_when_noninteractive() {
+        let root = PathBuf::from("/tmp");
+        let launch_command = ["/tmp/App.app/Contents/MacOS/App".to_owned()];
+        let request = LaunchedTraceRequest {
+            root: root.as_path(),
+            selected_xcode: None,
+            interactive: false,
+            kind: ProfileKind::Memory,
+            launch_command: &launch_command,
+            launch_environment: &[],
+            device: None,
+            stdio: TraceLaunchStdio::Inherit,
+        };
+        let command = build_xctrace_record_command(
+            &request,
+            PathBuf::from("/tmp/noninteractive.trace").as_path(),
+        );
+        let args = command_args(&command);
+        assert!(args.iter().any(|value| value == "--no-prompt"));
+    }
 
     #[test]
     fn interrupted_trace_wait_returns_written_output_even_if_child_exits_non_zero() {
@@ -522,6 +592,7 @@ raise SystemExit(130)
             child,
             debug: "writer".to_owned(),
             backend: TraceRecordingBackend::PlainFile,
+            interrupt_grace: super::TRACE_RECORDING_INTERRUPT_GRACE,
         };
 
         let (interrupt_tx, interrupt_rx) = std::sync::mpsc::channel();

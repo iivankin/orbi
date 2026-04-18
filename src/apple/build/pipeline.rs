@@ -11,6 +11,7 @@ mod tests;
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fs;
+use std::fs::TryLockError;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -20,7 +21,9 @@ use self::runtime::{
     debug_on_device, debug_on_macos, debug_on_simulator, run_on_device, run_on_macos,
     run_on_simulator, select_physical_device, validate_run_platform,
 };
-pub(crate) use self::runtime::{macos_executable_path, prepare_macos_trace_launch_executable};
+pub(crate) use self::runtime::{
+    macos_executable_path, prepare_macos_trace_launch_executable, stop_existing_macos_application,
+};
 use crate::apple::build::receipt::{BuildReceipt, BuildReceiptInput, write_receipt};
 use crate::apple::build::toolchain::{DestinationKind, Toolchain};
 use crate::apple::build::verify::{should_verify_developer_id_artifact, verify_post_build};
@@ -40,6 +43,10 @@ use crate::util::{
     resolve_path, run_command,
 };
 use anyhow::{Context, Result, bail};
+
+struct BuildOutputLockGuard {
+    _file: fs::File,
+}
 use plist::{Dictionary, Value};
 
 #[derive(Debug, Clone)]
@@ -424,6 +431,7 @@ fn build_project(
         .join(profile.variant_name())
         .join(request.destination.as_str());
     ensure_dir(&build_root)?;
+    let _build_output_lock = acquire_build_output_lock(&build_root)?;
 
     let ordered_targets = project
         .resolved_manifest
@@ -523,6 +531,34 @@ fn build_project(
         receipt,
         receipt_path,
     })
+}
+
+fn acquire_build_output_lock(build_root: &Path) -> Result<BuildOutputLockGuard> {
+    let lock_path = build_root.join(".orbit-build-output.lock");
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .with_context(|| format!("failed to open {}", lock_path.display()))?;
+
+    match file.try_lock() {
+        Ok(()) => {}
+        Err(TryLockError::WouldBlock) => {
+            eprintln!(
+                "another Orbit build is updating {}; waiting for the shared build output lock",
+                build_root.display()
+            );
+            file.lock()
+                .with_context(|| format!("failed to lock {}", lock_path.display()))?;
+        }
+        Err(TryLockError::Error(error)) => {
+            return Err(error).with_context(|| format!("failed to lock {}", lock_path.display()));
+        }
+    }
+
+    Ok(BuildOutputLockGuard { _file: file })
 }
 
 fn should_build_universal_macos(

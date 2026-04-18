@@ -43,11 +43,22 @@ pub trait UiBackend {
     fn stop_app(&self, bundle_id: &str) -> Result<()>;
     fn clear_app_state(&self, bundle_id: &str) -> Result<()>;
     fn focus(&self) -> Result<()>;
-    fn pin_running_target_by_executable(
+    fn frontmost_application_pid(&self) -> Result<Option<u32>> {
+        Ok(None)
+    }
+    fn pin_pending_trace_launch(&self) -> Result<()> {
+        Ok(())
+    }
+    fn prepare_trace_launch_environment(
         &self,
-        _executable_path: &Path,
-        _ignored_pid: Option<u32>,
-    ) -> Result<()> {
+        _previous_frontmost_pid: Option<u32>,
+    ) -> Result<Vec<(String, String)>> {
+        Ok(Vec::new())
+    }
+    fn abort_pending_trace_launch(&self) -> Result<()> {
+        Ok(())
+    }
+    fn prepare_external_running_target(&self) -> Result<()> {
         Ok(())
     }
     fn tap_point(&self, x: f64, y: f64, duration_ms: Option<u32>) -> Result<()>;

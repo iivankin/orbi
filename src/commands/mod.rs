@@ -15,7 +15,7 @@ pub fn execute(app: &AppContext, cli: &Cli) -> Result<()> {
         Command::Ui(ui_args)
             if matches!(
                 &ui_args.command,
-                UiCommand::Schema(_) | UiCommand::ResetIdb(_)
+                UiCommand::Schema(_) | UiCommand::CleanTraceTemp(_) | UiCommand::ResetIdb(_)
             ) =>
         {
             apple::execute(app, cli)

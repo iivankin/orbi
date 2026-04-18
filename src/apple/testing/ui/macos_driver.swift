@@ -66,6 +66,40 @@ struct DoctorStatus {
     }
 }
 
+struct FrontmostApplicationInfo {
+    let pid: pid_t
+    let bundleID: String?
+
+    var dictionary: [String: Any] {
+        [
+            "pid": Int(pid),
+            "bundleId": bundleID ?? NSNull(),
+        ]
+    }
+}
+
+struct LaunchedApplicationInfo {
+    let pid: pid_t
+    let bundleID: String?
+
+    var dictionary: [String: Any] {
+        [
+            "pid": Int(pid),
+            "bundleId": bundleID ?? NSNull(),
+        ]
+    }
+}
+
+struct BridgeConfig {
+    let directory: String
+    let notificationName: String
+}
+
+struct BridgeResponse: Decodable {
+    let ok: Bool
+    let error: String?
+}
+
 enum ApplicationTarget {
     case bundleID(String)
     case pid(pid_t)
@@ -135,6 +169,15 @@ func optionalFlag(_ name: String, in arguments: [String]) throws -> String? {
     return try requireFlag(name, in: arguments)
 }
 
+func optionalBridgeConfig(in arguments: [String]) throws -> BridgeConfig? {
+    guard let directory = try optionalFlag("--bridge-dir", in: arguments),
+          let notificationName = try optionalFlag("--bridge-name", in: arguments)
+    else {
+        return nil
+    }
+    return BridgeConfig(directory: directory, notificationName: notificationName)
+}
+
 func repeatedFlags(_ name: String, in arguments: [String]) throws -> [String] {
     var values = [String]()
     var index = 0
@@ -151,6 +194,23 @@ func repeatedFlags(_ name: String, in arguments: [String]) throws -> [String] {
     }
     guard !values.isEmpty else {
         throw DriverError.missingFlag(name)
+    }
+    return values
+}
+
+func optionalRepeatedFlags(_ name: String, in arguments: [String]) throws -> [String] {
+    var values = [String]()
+    var index = 0
+    while index < arguments.count {
+        if arguments[index] == name {
+            guard index + 1 < arguments.count else {
+                throw DriverError.missingFlag(name)
+            }
+            values.append(arguments[index + 1])
+            index += 2
+            continue
+        }
+        index += 1
     }
     return values
 }
@@ -175,9 +235,32 @@ func optionalApplicationTarget(in arguments: [String]) throws -> ApplicationTarg
     return nil
 }
 
+func optionalTargetPID(in arguments: [String]) throws -> pid_t? {
+    guard let target = try optionalApplicationTarget(in: arguments) else {
+        return nil
+    }
+    return try targetProcessIdentifier(target: target)
+}
+
 func ensureAccessibilityPermission() throws {
     guard AXIsProcessTrusted() else {
         throw DriverError.accessibilityPermission
+    }
+}
+
+func processExists(_ pid: pid_t) -> Bool {
+    kill(pid, 0) == 0 || errno == EPERM
+}
+
+func targetProcessIdentifier(target: ApplicationTarget) throws -> pid_t {
+    switch target {
+    case .bundleID:
+        return try runningApplication(target: target).processIdentifier
+    case .pid(let pid):
+        guard processExists(pid) else {
+            throw DriverError.appNotRunning("pid \(pid)")
+        }
+        return pid
     }
 }
 
@@ -198,9 +281,90 @@ func runningApplication(target: ApplicationTarget) throws -> NSRunningApplicatio
     }
 }
 
-func applicationElement(target: ApplicationTarget) throws -> (NSRunningApplication, AXUIElement) {
-    let application = try runningApplication(target: target)
-    return (application, AXUIElementCreateApplication(application.processIdentifier))
+func applicationElement(target: ApplicationTarget) throws -> (pid_t, AXUIElement) {
+    let pid = try targetProcessIdentifier(target: target)
+    return (pid, AXUIElementCreateApplication(pid))
+}
+
+func frontmostApplicationInfo() -> FrontmostApplicationInfo? {
+    guard let application = NSWorkspace.shared.frontmostApplication else {
+        return nil
+    }
+    return FrontmostApplicationInfo(
+        pid: application.processIdentifier,
+        bundleID: application.bundleIdentifier
+    )
+}
+
+func environmentVariables(from entries: [String]) throws -> [String: String] {
+    var environment = [String: String]()
+    for entry in entries {
+        guard let separator = entry.firstIndex(of: "=") else {
+            throw DriverError.helper("launch environment entry `\(entry)` must be KEY=VALUE")
+        }
+        let key = String(entry[..<separator])
+        guard !key.isEmpty else {
+            throw DriverError.helper("launch environment entry `\(entry)` is missing a key")
+        }
+        let value = String(entry[entry.index(after: separator)...])
+        environment[key] = value
+    }
+    return environment
+}
+
+func launchApplication(
+    appPath: String,
+    arguments: [String],
+    environmentEntries: [String]
+) throws -> LaunchedApplicationInfo {
+    let configuration = NSWorkspace.OpenConfiguration()
+    configuration.activates = false
+    configuration.createsNewApplicationInstance = true
+    configuration.allowsRunningApplicationSubstitution = false
+    configuration.arguments = arguments
+    configuration.environment = try environmentVariables(from: environmentEntries)
+
+    let launchSemaphore = DispatchSemaphore(value: 0)
+    var launchedApplication: NSRunningApplication?
+    var launchError: Error?
+    NSWorkspace.shared.openApplication(at: URL(fileURLWithPath: appPath), configuration: configuration) {
+        application,
+        error in
+        launchedApplication = application
+        launchError = error
+        launchSemaphore.signal()
+    }
+    launchSemaphore.wait()
+
+    if let launchError {
+        throw launchError
+    }
+    guard let launchedApplication else {
+        throw DriverError.helper("Launch Services did not return a running application")
+    }
+    return LaunchedApplicationInfo(
+        pid: launchedApplication.processIdentifier,
+        bundleID: launchedApplication.bundleIdentifier
+    )
+}
+
+func reopenApplication(target: ApplicationTarget) throws {
+    let targetDescriptor: NSAppleEventDescriptor
+    switch target {
+    case .bundleID(let bundleID):
+        targetDescriptor = NSAppleEventDescriptor(bundleIdentifier: bundleID)
+    case .pid(let pid):
+        targetDescriptor = NSAppleEventDescriptor(processIdentifier: pid)
+    }
+
+    let event = NSAppleEventDescriptor(
+        eventClass: AEEventClass(kCoreEventClass),
+        eventID: AEEventID(kAEReopenApplication),
+        targetDescriptor: targetDescriptor,
+        returnID: AEReturnID(kAutoGenerateReturnID),
+        transactionID: AETransactionID(kAnyTransactionID)
+    )
+    _ = try event.sendEvent(options: [], timeout: 5)
 }
 
 func frame(for element: AXUIElement) -> CGRect? {
@@ -216,9 +380,9 @@ func frame(for element: AXUIElement) -> CGRect? {
 }
 
 func focusedWindowFrame(target: ApplicationTarget) -> CGRect? {
-    guard let (_, application) = try? applicationElement(target: target),
+    guard let (_, applicationElementRef) = try? applicationElement(target: target),
           let focusedWindow = attributeValue(
-            application,
+            applicationElementRef,
             attribute: kAXFocusedWindowAttribute as String
           ),
           CFGetTypeID(focusedWindow) == AXUIElementGetTypeID()
@@ -237,7 +401,7 @@ func intersectionArea(_ lhs: CGRect, _ rhs: CGRect) -> CGFloat {
 }
 
 func windowCaptureInfo(target: ApplicationTarget) throws -> WindowCaptureInfo {
-    let application = try runningApplication(target: target)
+    let pid = Int(try targetProcessIdentifier(target: target))
     guard let windows = CGWindowListCopyWindowInfo(
         [.optionOnScreenOnly, .excludeDesktopElements],
         kCGNullWindowID
@@ -245,7 +409,6 @@ func windowCaptureInfo(target: ApplicationTarget) throws -> WindowCaptureInfo {
         throw DriverError.helper("failed to enumerate macOS windows")
     }
 
-    let pid = Int(application.processIdentifier)
     let candidateWindows = windows.compactMap { window -> WindowCaptureInfo? in
         guard let ownerPID = window[kCGWindowOwnerPID as String] as? Int,
               ownerPID == pid,
@@ -525,26 +688,34 @@ func bestMatchingElement(
     return bestMatch?.element
 }
 
-func pressElementOrAncestor(_ element: AXUIElement) throws {
+func pressElementOrAncestor(
+    _ element: AXUIElement,
+    targetPID: pid_t? = nil
+) throws {
     var candidate: AXUIElement? = element
     for _ in 0..<6 {
         guard let current = candidate else {
             break
         }
         let role = stringAttribute(current, attribute: kAXRoleAttribute as String)
-        if role != kAXTextFieldRole as String && role != kAXTextAreaRole as String,
-           AXUIElementPerformAction(current, kAXPressAction as CFString) == .success
+        if role == kAXTextFieldRole as String || role == kAXTextAreaRole as String
         {
+            if setFocusAttribute(on: current) {
+                usleep(40_000)
+                return
+            }
+        } else if AXUIElementPerformAction(current, kAXPressAction as CFString) == .success {
             return
         }
 
         if let frame = frame(for: current) {
             try tap(
                 at: CGPoint(x: frame.midX, y: frame.midY),
-                durationMs: nil
+                durationMs: nil,
+                targetPID: targetPID
             )
             usleep(80_000)
-            if role == kAXTextFieldRole as String || role == kAXTextAreaRole as String,
+            if (role == kAXTextFieldRole as String || role == kAXTextAreaRole as String) &&
                setFocusAttribute(on: current)
             {
                 usleep(40_000)
@@ -568,6 +739,49 @@ func outputJSON(_ object: Any) throws {
     print(string)
 }
 
+func bridgeRequest(
+    _ request: [String: Any],
+    config: BridgeConfig
+) throws {
+    let requestID = UUID().uuidString
+    let requestPath = URL(fileURLWithPath: config.directory)
+        .appendingPathComponent("request-\(requestID).json")
+    let responsePath = URL(fileURLWithPath: config.directory)
+        .appendingPathComponent("response-\(requestID).json")
+
+    var payload = request
+    payload["requestId"] = requestID
+
+    let data = try JSONSerialization.data(withJSONObject: payload, options: [])
+    try data.write(to: requestPath)
+
+    DistributedNotificationCenter.default().postNotificationName(
+        Notification.Name(config.notificationName),
+        object: nil,
+        userInfo: ["requestId": requestID],
+        deliverImmediately: true
+    )
+
+    let deadline = Date().addingTimeInterval(5)
+    while Date() < deadline {
+        if FileManager.default.fileExists(atPath: responsePath.path) {
+            let responseData = try Data(contentsOf: responsePath)
+            let response = try JSONDecoder().decode(BridgeResponse.self, from: responseData)
+            try? FileManager.default.removeItem(at: requestPath)
+            try? FileManager.default.removeItem(at: responsePath)
+            if response.ok {
+                return
+            }
+            throw DriverError.helper(response.error ?? "the injected macOS UI bridge rejected the request")
+        }
+        usleep(20_000)
+    }
+
+    throw DriverError.helper(
+        "timed out waiting for the injected macOS UI bridge `\(config.notificationName)`"
+    )
+}
+
 func pointElement(x: Double, y: Double) throws -> AXUIElement {
     let systemWide = AXUIElementCreateSystemWide()
     var resolved: AXUIElement?
@@ -578,7 +792,15 @@ func pointElement(x: Double, y: Double) throws -> AXUIElement {
     return resolved
 }
 
-func focusedElement() -> AXUIElement? {
+func focusedElement(target: ApplicationTarget? = nil) -> AXUIElement? {
+    if let target,
+       let (_, application) = try? applicationElement(target: target),
+       let value = attributeValue(application, attribute: kAXFocusedUIElementAttribute as String),
+       CFGetTypeID(value) == AXUIElementGetTypeID()
+    {
+        return (value as! AXUIElement)
+    }
+
     let systemWide = AXUIElementCreateSystemWide()
     var value: CFTypeRef?
     let error = AXUIElementCopyAttributeValue(
@@ -659,35 +881,18 @@ func editableElement(at point: CGPoint) throws -> AXUIElement {
     )
 }
 
-func pressableElement(at point: CGPoint) -> AXUIElement? {
-    let pressableRoles = Set([
-        kAXButtonRole as String,
-        kAXCheckBoxRole as String,
-        kAXRadioButtonRole as String,
-        kAXPopUpButtonRole as String,
-    ])
-    var candidate = try? pointElement(x: point.x, y: point.y)
-    for _ in 0..<6 {
-        guard let element = candidate else {
-            break
-        }
-        let role = stringAttribute(element, attribute: kAXRoleAttribute as String)
-        if let role, pressableRoles.contains(role) {
-            return element
-        }
-        candidate = elementAttribute(element, attribute: kAXParentAttribute as String)
-    }
-    return nil
-}
-
 func postMouseEvent(
     type: CGEventType,
     point: CGPoint,
     button: CGMouseButton = .left,
-    clickState: Int64? = nil
+    clickState: Int64? = nil,
+    pressure: Double? = nil,
+    delta: CGPoint? = nil,
+    source: CGEventSource? = nil,
+    targetPID: pid_t? = nil
 ) throws {
     guard let event = CGEvent(
-        mouseEventSource: nil,
+        mouseEventSource: source,
         mouseType: type,
         mouseCursorPosition: point,
         mouseButton: button
@@ -697,72 +902,162 @@ func postMouseEvent(
     if let clickState {
         event.setIntegerValueField(.mouseEventClickState, value: clickState)
     }
-    event.post(tap: .cghidEventTap)
+    event.setIntegerValueField(.mouseEventButtonNumber, value: Int64(button.rawValue))
+    if let pressure {
+        event.setDoubleValueField(.mouseEventPressure, value: pressure)
+    }
+    if let delta {
+        event.setIntegerValueField(.mouseEventDeltaX, value: Int64(delta.x.rounded()))
+        event.setIntegerValueField(.mouseEventDeltaY, value: Int64(delta.y.rounded()))
+    }
+    if let targetPID {
+        event.postToPid(targetPID)
+    } else {
+        event.post(tap: .cghidEventTap)
+    }
 }
 
-func tap(at point: CGPoint, durationMs: Int?) throws {
-    try postMouseEvent(type: .mouseMoved, point: point)
-    try postMouseEvent(type: .leftMouseDown, point: point)
+func makeMouseEventSource() throws -> CGEventSource {
+    guard let source = CGEventSource(stateID: .combinedSessionState) else {
+        throw DriverError.helper("failed to construct a Quartz event source")
+    }
+    source.localEventsSuppressionInterval = 0
+    return source
+}
+
+func tap(at point: CGPoint, durationMs: Int?, targetPID: pid_t? = nil) throws {
+    try postMouseEvent(type: .mouseMoved, point: point, targetPID: targetPID)
+    try postMouseEvent(type: .leftMouseDown, point: point, targetPID: targetPID)
     if let durationMs, durationMs > 0 {
         usleep(useconds_t(durationMs * 1000))
     }
-    try postMouseEvent(type: .leftMouseUp, point: point)
+    try postMouseEvent(type: .leftMouseUp, point: point, targetPID: targetPID)
 }
 
-func rightClick(at point: CGPoint) throws {
-    try postMouseEvent(type: .mouseMoved, point: point)
-    try postMouseEvent(type: .rightMouseDown, point: point, button: .right)
+func rightClick(at point: CGPoint, targetPID: pid_t? = nil) throws {
+    try postMouseEvent(type: .mouseMoved, point: point, targetPID: targetPID)
+    try postMouseEvent(type: .rightMouseDown, point: point, button: .right, targetPID: targetPID)
     usleep(40_000)
-    try postMouseEvent(type: .rightMouseUp, point: point, button: .right)
+    try postMouseEvent(type: .rightMouseUp, point: point, button: .right, targetPID: targetPID)
 }
 
-func moveCursor(to point: CGPoint) throws {
-    try postMouseEvent(type: .mouseMoved, point: point)
+func moveCursor(to point: CGPoint, targetPID: pid_t? = nil) throws {
+    try postMouseEvent(type: .mouseMoved, point: point, targetPID: targetPID)
 }
 
-func swipe(from start: CGPoint, to end: CGPoint, durationMs: Int, delta: Int?) throws {
+func swipe(
+    from start: CGPoint,
+    to end: CGPoint,
+    durationMs: Int,
+    delta: Int?,
+    targetPID: pid_t? = nil
+) throws {
     let distance = hypot(end.x - start.x, end.y - start.y)
     let stepSize = max(1.0, Double(delta ?? 6))
     let steps = max(2, Int(distance / stepSize))
     let sleepMicros = max(1, durationMs * 1000 / steps)
+    let source = try makeMouseEventSource()
 
-    try postMouseEvent(type: .mouseMoved, point: start)
-    try postMouseEvent(type: .leftMouseDown, point: start)
+    try postMouseEvent(type: .mouseMoved, point: start, source: source, targetPID: targetPID)
+    try postMouseEvent(
+        type: .leftMouseDown,
+        point: start,
+        clickState: 1,
+        pressure: 1,
+        source: source,
+        targetPID: targetPID
+    )
+    var previousPoint = start
     for step in 1...steps {
         let progress = Double(step) / Double(steps)
         let point = CGPoint(
             x: start.x + ((end.x - start.x) * progress),
             y: start.y + ((end.y - start.y) * progress)
         )
-        try postMouseEvent(type: .leftMouseDragged, point: point)
+        let deltaPoint = CGPoint(
+            x: point.x - previousPoint.x,
+            y: point.y - previousPoint.y
+        )
+        try postMouseEvent(
+            type: .leftMouseDragged,
+            point: point,
+            clickState: 1,
+            pressure: 1,
+            delta: deltaPoint,
+            source: source,
+            targetPID: targetPID
+        )
+        previousPoint = point
         usleep(useconds_t(sleepMicros))
     }
-    try postMouseEvent(type: .leftMouseUp, point: end)
+    try postMouseEvent(
+        type: .leftMouseUp,
+        point: end,
+        clickState: 1,
+        pressure: 0,
+        source: source,
+        targetPID: targetPID
+    )
 }
 
-func drag(from start: CGPoint, to end: CGPoint, durationMs: Int, delta: Int?) throws {
+func drag(
+    from start: CGPoint,
+    to end: CGPoint,
+    durationMs: Int,
+    delta: Int?,
+    targetPID: pid_t? = nil
+) throws {
     let distance = hypot(end.x - start.x, end.y - start.y)
     let stepSize = max(1.0, Double(delta ?? 6))
     let steps = max(2, Int(distance / stepSize))
     let sleepMicros = max(1, durationMs * 1000 / steps)
+    let source = try makeMouseEventSource()
 
-    try postMouseEvent(type: .mouseMoved, point: start)
-    try postMouseEvent(type: .leftMouseDown, point: start)
+    try postMouseEvent(type: .mouseMoved, point: start, source: source, targetPID: targetPID)
+    try postMouseEvent(
+        type: .leftMouseDown,
+        point: start,
+        clickState: 1,
+        pressure: 1,
+        source: source,
+        targetPID: targetPID
+    )
     usleep(80_000)
+    var previousPoint = start
     for step in 1...steps {
         let progress = Double(step) / Double(steps)
         let point = CGPoint(
             x: start.x + ((end.x - start.x) * progress),
             y: start.y + ((end.y - start.y) * progress)
         )
-        try postMouseEvent(type: .leftMouseDragged, point: point)
+        let deltaPoint = CGPoint(
+            x: point.x - previousPoint.x,
+            y: point.y - previousPoint.y
+        )
+        try postMouseEvent(
+            type: .leftMouseDragged,
+            point: point,
+            clickState: 1,
+            pressure: 1,
+            delta: deltaPoint,
+            source: source,
+            targetPID: targetPID
+        )
+        previousPoint = point
         usleep(useconds_t(sleepMicros))
     }
     usleep(80_000)
-    try postMouseEvent(type: .leftMouseUp, point: end)
+    try postMouseEvent(
+        type: .leftMouseUp,
+        point: end,
+        clickState: 1,
+        pressure: 0,
+        source: source,
+        targetPID: targetPID
+    )
 }
 
-func scroll(direction: String, point: CGPoint? = nil) throws {
+func scroll(direction: String, point: CGPoint? = nil, targetPID: pid_t? = nil) throws {
     let (vertical, horizontal): (Int32, Int32)
     switch direction.lowercased() {
     case "up":
@@ -782,7 +1077,7 @@ func scroll(direction: String, point: CGPoint? = nil) throws {
     }
 
     if let point {
-        try postMouseEvent(type: .mouseMoved, point: point)
+        try postMouseEvent(type: .mouseMoved, point: point, targetPID: targetPID)
     }
 
     guard let event = CGEvent(
@@ -795,17 +1090,20 @@ func scroll(direction: String, point: CGPoint? = nil) throws {
     ) else {
         throw DriverError.helper("failed to construct scroll event")
     }
-    event.post(tap: .cghidEventTap)
+    if let targetPID {
+        event.postToPid(targetPID)
+    } else {
+        event.post(tap: .cghidEventTap)
+    }
 }
 
 func inputText(_ text: String, target: ApplicationTarget?) throws {
     var targetPID: pid_t?
     if let target {
-        try bringApplicationToFront(target: target)
-        targetPID = try runningApplication(target: target).processIdentifier
+        targetPID = try targetProcessIdentifier(target: target)
     }
 
-    if let element = focusedElement() {
+    if let element = focusedElement(target: target) {
         let role = stringAttribute(element, attribute: kAXRoleAttribute as String)
         if role == kAXTextFieldRole as String || role == kAXTextAreaRole as String {
             try typeTextEvents(text, targetPID: targetPID)
@@ -920,23 +1218,6 @@ func pressKeyCode(
     }
 }
 
-func postModifiedKeyPress(_ keyCode: CGKeyCode, flags: CGEventFlags, targetPID: pid_t? = nil) throws {
-    guard let keyDown = CGEvent(keyboardEventSource: nil, virtualKey: keyCode, keyDown: true),
-          let keyUp = CGEvent(keyboardEventSource: nil, virtualKey: keyCode, keyDown: false)
-    else {
-        throw DriverError.helper("failed to construct modified keyboard event")
-    }
-    keyDown.flags = flags
-    keyUp.flags = flags
-    if let targetPID {
-        keyDown.postToPid(targetPID)
-        keyUp.postToPid(targetPID)
-    } else {
-        keyDown.post(tap: .cghidEventTap)
-        keyUp.post(tap: .cghidEventTap)
-    }
-}
-
 func postUnicodeEvent(_ text: String, keyDown: Bool, targetPID: pid_t? = nil) throws {
     guard let event = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: keyDown) else {
         throw DriverError.helper("failed to construct unicode keyboard event")
@@ -948,7 +1229,11 @@ func postUnicodeEvent(_ text: String, keyDown: Bool, targetPID: pid_t? = nil) th
         event.keyboardSetUnicodeString(stringLength: buffer.count, unicodeString: baseAddress)
     }
 
-    event.post(tap: .cghidEventTap)
+    if let targetPID {
+        event.postToPid(targetPID)
+    } else {
+        event.post(tap: .cghidEventTap)
+    }
 }
 
 func typeTextEvents(_ text: String, targetPID: pid_t? = nil) throws {
@@ -957,19 +1242,6 @@ func typeTextEvents(_ text: String, targetPID: pid_t? = nil) throws {
         try postUnicodeEvent(scalar, keyDown: true, targetPID: targetPID)
         try postUnicodeEvent(scalar, keyDown: false, targetPID: targetPID)
         usleep(8_000)
-    }
-}
-
-func pasteViaClipboard(_ text: String, targetPID: pid_t? = nil) throws {
-    let pasteboard = NSPasteboard.general
-    let previousText = pasteboard.string(forType: .string)
-    pasteboard.clearContents()
-    pasteboard.setString(text, forType: .string)
-    try postModifiedKeyPress(CGKeyCode(9), flags: .maskCommand, targetPID: targetPID)
-    usleep(100_000)
-    pasteboard.clearContents()
-    if let previousText {
-        pasteboard.setString(previousText, forType: .string)
     }
 }
 
@@ -1104,9 +1376,6 @@ func selectMenuItem(target: ApplicationTarget, path: [String]) throws {
         throw DriverError.helper("`selectMenuItem` requires at least one menu label")
     }
 
-    try bringApplicationToFront(target: target)
-    usleep(150_000)
-
     let (_, applicationElementRef) = try applicationElement(target: target)
     guard let menuBar = menuBarElement(for: applicationElementRef) else {
         throw DriverError.helper("failed to resolve the menu bar for `\(target.description)`")
@@ -1220,6 +1489,31 @@ func run() throws {
         return
     }
 
+    if command == "frontmost-application" {
+        try outputJSON(frontmostApplicationInfo()?.dictionary ?? [:])
+        return
+    }
+
+    if command == "launch-app" {
+        let appPath = try requireFlag("--app-path", in: arguments)
+        let launchArguments = try optionalRepeatedFlags("--argument", in: arguments)
+        let launchEnvironment = try optionalRepeatedFlags("--env", in: arguments)
+        try outputJSON(
+            launchApplication(
+                appPath: appPath,
+                arguments: launchArguments,
+                environmentEntries: launchEnvironment
+            ).dictionary
+        )
+        return
+    }
+
+    if command == "reopen-app" {
+        let target = try requireApplicationTarget(in: arguments)
+        try reopenApplication(target: target)
+        return
+    }
+
     try ensureAccessibilityPermission()
 
     switch command {
@@ -1246,7 +1540,20 @@ func run() throws {
         let x = try requireDoubleFlag("--x", in: arguments)
         let y = try requireDoubleFlag("--y", in: arguments)
         let durationMs = try optionalIntFlag("--duration-ms", in: arguments)
-        try tap(at: CGPoint(x: x, y: y), durationMs: durationMs)
+        if let bridge = try optionalBridgeConfig(in: arguments) {
+            try bridgeRequest(
+                [
+                    "command": "tap",
+                    "x": x,
+                    "y": y,
+                    "durationMs": durationMs ?? NSNull(),
+                ],
+                config: bridge
+            )
+            return
+        }
+        let targetPID = try optionalTargetPID(in: arguments)
+        try tap(at: CGPoint(x: x, y: y), durationMs: durationMs, targetPID: targetPID)
 
     case "activate-element":
         let target = try requireApplicationTarget(in: arguments)
@@ -1255,23 +1562,46 @@ func run() throws {
         guard identifier != nil || text != nil else {
             throw DriverError.usage("activate-element requires --id and/or --text")
         }
-        try bringApplicationToFront(target: target)
-        usleep(80_000)
         let (_, element) = try applicationElement(target: target)
+        let targetPID = try targetProcessIdentifier(target: target)
         guard let match = bestMatchingElement(root: element, text: text, identifier: identifier) else {
             throw DriverError.helper("failed to resolve a matching accessibility element")
         }
-        try pressElementOrAncestor(match)
+        try pressElementOrAncestor(match, targetPID: targetPID)
 
     case "move":
         let x = try requireDoubleFlag("--x", in: arguments)
         let y = try requireDoubleFlag("--y", in: arguments)
-        try moveCursor(to: CGPoint(x: x, y: y))
+        if let bridge = try optionalBridgeConfig(in: arguments) {
+            try bridgeRequest(
+                [
+                    "command": "move",
+                    "x": x,
+                    "y": y,
+                ],
+                config: bridge
+            )
+            return
+        }
+        let targetPID = try optionalTargetPID(in: arguments)
+        try moveCursor(to: CGPoint(x: x, y: y), targetPID: targetPID)
 
     case "right-click":
         let x = try requireDoubleFlag("--x", in: arguments)
         let y = try requireDoubleFlag("--y", in: arguments)
-        try rightClick(at: CGPoint(x: x, y: y))
+        if let bridge = try optionalBridgeConfig(in: arguments) {
+            try bridgeRequest(
+                [
+                    "command": "right-click",
+                    "x": x,
+                    "y": y,
+                ],
+                config: bridge
+            )
+            return
+        }
+        let targetPID = try optionalTargetPID(in: arguments)
+        try rightClick(at: CGPoint(x: x, y: y), targetPID: targetPID)
 
     case "swipe":
         let startX = try requireDoubleFlag("--start-x", in: arguments)
@@ -1280,11 +1610,13 @@ func run() throws {
         let endY = try requireDoubleFlag("--end-y", in: arguments)
         let durationMs = try optionalIntFlag("--duration-ms", in: arguments) ?? 500
         let delta = try optionalIntFlag("--delta", in: arguments)
+        let targetPID = try optionalTargetPID(in: arguments)
         try swipe(
             from: CGPoint(x: startX, y: startY),
             to: CGPoint(x: endX, y: endY),
             durationMs: durationMs,
-            delta: delta
+            delta: delta,
+            targetPID: targetPID
         )
 
     case "drag":
@@ -1294,22 +1626,82 @@ func run() throws {
         let endY = try requireDoubleFlag("--end-y", in: arguments)
         let durationMs = try optionalIntFlag("--duration-ms", in: arguments) ?? 650
         let delta = try optionalIntFlag("--delta", in: arguments)
+        if let bridge = try optionalBridgeConfig(in: arguments) {
+            try bridgeRequest(
+                [
+                    "command": "drag",
+                    "startX": startX,
+                    "startY": startY,
+                    "endX": endX,
+                    "endY": endY,
+                    "durationMs": durationMs,
+                    "delta": delta ?? NSNull(),
+                ],
+                config: bridge
+            )
+            return
+        }
+        let targetPID = try optionalTargetPID(in: arguments)
         try drag(
             from: CGPoint(x: startX, y: startY),
             to: CGPoint(x: endX, y: endY),
             durationMs: durationMs,
-            delta: delta
+            delta: delta,
+            targetPID: targetPID
         )
 
     case "scroll":
         let direction = try requireFlag("--direction", in: arguments)
-        try scroll(direction: direction)
+        if let bridge = try optionalBridgeConfig(in: arguments) {
+            let x = try requireDoubleFlag("--x", in: arguments)
+            let y = try requireDoubleFlag("--y", in: arguments)
+            try bridgeRequest(
+                [
+                    "command": "scroll",
+                    "direction": direction,
+                    "x": x,
+                    "y": y,
+                ],
+                config: bridge
+            )
+            return
+        }
+        let targetPID = try optionalTargetPID(in: arguments)
+        let point: CGPoint?
+        if let x = try optionalFlag("--x", in: arguments),
+           let y = try optionalFlag("--y", in: arguments),
+           let xValue = Double(x),
+           let yValue = Double(y)
+        {
+            point = CGPoint(x: xValue, y: yValue)
+        } else {
+            point = nil
+        }
+        try scroll(direction: direction, point: point, targetPID: targetPID)
 
     case "scroll-at-point":
         let x = try requireDoubleFlag("--x", in: arguments)
         let y = try requireDoubleFlag("--y", in: arguments)
         let direction = try requireFlag("--direction", in: arguments)
-        try scroll(direction: direction, point: CGPoint(x: x, y: y))
+        if let bridge = try optionalBridgeConfig(in: arguments) {
+            try bridgeRequest(
+                [
+                    "command": "scroll",
+                    "direction": direction,
+                    "x": x,
+                    "y": y,
+                ],
+                config: bridge
+            )
+            return
+        }
+        let targetPID = try optionalTargetPID(in: arguments)
+        try scroll(direction: direction, point: CGPoint(x: x, y: y), targetPID: targetPID)
+
+    case "bridge-ping":
+        let bridge = try optionalBridgeConfig(in: arguments)
+            ?? { throw DriverError.usage("bridge-ping requires --bridge-dir and --bridge-name") }()
+        try bridgeRequest(["command": "ping"], config: bridge)
 
     case "text":
         let text = try requireFlag("--text", in: arguments)
@@ -1327,13 +1719,12 @@ func run() throws {
         let keyCode = try requireIntFlag("--keycode", in: arguments)
         let durationMs = try optionalIntFlag("--duration-ms", in: arguments)
         let modifiers = try keyboardModifiers(from: arguments)
-        try bringApplicationToFront(target: target)
-        let application = try runningApplication(target: target)
+        let targetPID = try targetProcessIdentifier(target: target)
         try pressKeyCode(
             keyCode: keyCode,
             durationMs: durationMs,
             modifiers: modifiers,
-            targetPID: application.processIdentifier
+            targetPID: targetPID
         )
 
     case "menu-item":

@@ -1,6 +1,6 @@
-use std::fs::{File, OpenOptions, TryLockError};
+use std::fs;
 use std::path::Path;
-use std::time::Instant;
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result, bail};
 use serde_json::Value as JsonValue;
@@ -44,17 +44,14 @@ pub(crate) use self::model::{
 use self::report::{RunStatus, UiTestRunReport, unix_timestamp_secs};
 use self::runner::UiFlowRunner;
 pub(crate) use self::schema::{schema_json, schema_text};
-use self::trace::{
-    UiTracePlan, apply_macos_ui_trace_prelaunch, plan_macos_ui_trace,
-    prepare_macos_ui_trace_launch_command,
-};
+use self::trace::MacosUiTraceRuntime;
 use crate::apple::build::toolchain::DestinationKind;
 use crate::apple::logs::SimulatorAppLogStream;
 use crate::apple::{build, runtime};
-use crate::cli::TestArgs;
+use crate::cli::{TestArgs, UiCleanTraceTempArgs};
 use crate::context::ProjectContext;
 use crate::manifest::ApplePlatform;
-use crate::util::{ensure_dir, format_elapsed, print_success, write_json_file};
+use crate::util::{ensure_dir, format_elapsed, human_bytes, print_success, write_json_file};
 
 struct PreparedUiSession {
     build_outcome: crate::apple::build::pipeline::BuildOutcome,
@@ -63,8 +60,12 @@ struct PreparedUiSession {
     selected_xcode: Option<crate::apple::xcode::SelectedXcode>,
 }
 
-struct UiRunLockGuard {
-    _file: File,
+#[derive(Debug, Default, PartialEq, Eq)]
+struct TempTraceCleanupSummary {
+    scanned_files: usize,
+    removed_files: usize,
+    skipped_recent_files: usize,
+    freed_bytes: u64,
 }
 
 pub fn run_ui_tests(project: &ProjectContext, args: &TestArgs) -> Result<()> {
@@ -83,24 +84,13 @@ pub fn run_ui_tests(project: &ProjectContext, args: &TestArgs) -> Result<()> {
     if flow_paths.is_empty() {
         bail!("`tests.ui` did not contain any `.yml` or `.yaml` files");
     }
-    let trace_plan = match (platform, args.trace) {
-        (ApplePlatform::Ios, kind) => {
-            crate::apple::profile::ensure_simulator_profiling_supported(kind)?;
-            None
-        }
-        (ApplePlatform::Macos, Some(_)) => Some(plan_macos_ui_trace(flow_paths.as_slice())?),
-        _ => None,
-    };
+    if platform == ApplePlatform::Ios {
+        crate::apple::profile::ensure_simulator_profiling_supported(args.trace)?;
+    }
     if platform == ApplePlatform::Macos {
         let status = backend::macos_doctor(project)?;
         ensure_macos_ui_test_requirements(&status)?;
     }
-    let _macos_ui_test_lock = if platform == ApplePlatform::Macos {
-        Some(acquire_macos_ui_test_lock(project)?)
-    } else {
-        None
-    };
-
     let run_id = format!("{}-{}", unix_timestamp_secs(), Uuid::new_v4());
     let run_root = project
         .project_paths
@@ -114,14 +104,15 @@ pub fn run_ui_tests(project: &ProjectContext, args: &TestArgs) -> Result<()> {
     let started_at_unix = unix_timestamp_secs();
     let started = Instant::now();
     let prepared = prepare_ui_session(project, platform, false)?;
-    let trace_recording = start_ui_trace_recording(
-        project,
-        args,
-        prepared.build_outcome.receipt.bundle_id.as_str(),
-        &prepared,
-        trace_plan.as_ref(),
-    )?;
-    let run_result = (|| {
+    if platform == ApplePlatform::Macos && args.trace.is_some() {
+        let target = project.resolved_manifest.resolve_target(None)?;
+        crate::apple::signing::prepare_macos_bundle_for_debug_tracing(
+            project,
+            target,
+            &prepared.build_outcome.receipt.bundle_path,
+        )?;
+    }
+    (|| {
         let report_path = run_root.join("report.json");
         let mut flow_reports = Vec::new();
         let _app_logs = start_ui_app_logs(&prepared);
@@ -129,9 +120,20 @@ pub fn run_ui_tests(project: &ProjectContext, args: &TestArgs) -> Result<()> {
             prepared.backend,
             artifacts_dir.clone(),
             prepared.build_outcome.receipt.bundle_id.clone(),
-            trace_plan
-                .as_ref()
-                .is_some_and(|plan| plan.launch.is_some()),
+            if platform == ApplePlatform::Macos {
+                args.trace.map(|kind| {
+                    MacosUiTraceRuntime::new(
+                        project.root.clone(),
+                        &project.project_paths,
+                        project.selected_xcode.clone(),
+                        &prepared.build_outcome.receipt,
+                        kind,
+                        project.app.interactive,
+                    )
+                })
+            } else {
+                None
+            },
         );
         let mut has_failures = false;
         for flow_path in &flow_paths {
@@ -139,9 +141,10 @@ pub fn run_ui_tests(project: &ProjectContext, args: &TestArgs) -> Result<()> {
                 has_failures = true;
             }
         }
-        if let Err(error) = runner
-            .backend
-            .stop_app(prepared.build_outcome.receipt.bundle_id.as_str())
+        if args.trace.is_none()
+            && let Err(error) = runner
+                .backend
+                .stop_app(prepared.build_outcome.receipt.bundle_id.as_str())
         {
             eprintln!(
                 "warning: failed to stop `{}` after UI tests on {}: {error:#}",
@@ -187,26 +190,7 @@ pub fn run_ui_tests(project: &ProjectContext, args: &TestArgs) -> Result<()> {
             format_elapsed(started.elapsed())
         ));
         Ok(())
-    })();
-    let trace_result = trace_recording
-        .map(|(kind, recording)| crate::apple::profile::finish_started_trace(kind, recording))
-        .transpose();
-    match (run_result, trace_result) {
-        (Err(run_error), Err(trace_error)) => {
-            Err(run_error.context(format!("also failed to finalize UI trace: {trace_error:#}")))
-        }
-        (Err(run_error), Ok(Some(path))) => {
-            println!("trace: {}", path.display());
-            Err(run_error)
-        }
-        (Err(run_error), Ok(None)) => Err(run_error),
-        (Ok(()), Err(trace_error)) => Err(trace_error),
-        (Ok(()), Ok(Some(path))) => {
-            println!("trace: {}", path.display());
-            Ok(())
-        }
-        (Ok(()), Ok(None)) => Ok(()),
-    }
+    })()
 }
 
 fn start_ui_app_logs(prepared: &PreparedUiSession) -> Option<SimulatorAppLogStream> {
@@ -277,6 +261,28 @@ pub(crate) fn doctor(project: &ProjectContext, platform: ApplePlatform) -> Resul
     }
 }
 
+pub(crate) fn clean_trace_temp(args: &UiCleanTraceTempArgs) -> Result<()> {
+    let temp_dir = std::env::temp_dir();
+    let summary = cleanup_macos_trace_temp_dir(
+        &temp_dir,
+        args.all,
+        Duration::from_secs(args.stale_minutes.unwrap_or(60).saturating_mul(60)),
+    )?;
+    println!("temp_dir: {}", temp_dir.display());
+    println!("scanned_temp_trace_files: {}", summary.scanned_files);
+    println!("removed_temp_trace_files: {}", summary.removed_files);
+    println!(
+        "skipped_recent_temp_trace_files: {}",
+        summary.skipped_recent_files
+    );
+    println!(
+        "freed_temp_trace_bytes: {} ({})",
+        summary.freed_bytes,
+        human_bytes(summary.freed_bytes)
+    );
+    Ok(())
+}
+
 pub(crate) fn attach_backend(
     project: &ProjectContext,
     platform: ApplePlatform,
@@ -316,6 +322,51 @@ fn print_macos_doctor_status(status: &MacosDoctorStatus) {
     );
 }
 
+fn cleanup_macos_trace_temp_dir(
+    temp_dir: &Path,
+    remove_all: bool,
+    stale_after: Duration,
+) -> Result<TempTraceCleanupSummary> {
+    let mut summary = TempTraceCleanupSummary::default();
+    let now = SystemTime::now();
+    for entry in
+        fs::read_dir(temp_dir).with_context(|| format!("failed to read {}", temp_dir.display()))?
+    {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        if !file_type.is_file() {
+            continue;
+        }
+
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if !name.starts_with("instruments") || !name.ends_with(".ktrace") {
+            continue;
+        }
+
+        summary.scanned_files += 1;
+        let metadata = entry.metadata()?;
+        if !remove_all {
+            let modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+            let age = now.duration_since(modified).unwrap_or(Duration::ZERO);
+            if age < stale_after {
+                summary.skipped_recent_files += 1;
+                continue;
+            }
+        }
+
+        let bytes = metadata.len();
+        fs::remove_file(&path)
+            .with_context(|| format!("failed to remove temp trace {}", path.display()))?;
+        println!("removed_temp_trace: {}", path.display());
+        summary.removed_files += 1;
+        summary.freed_bytes += bytes;
+    }
+    Ok(summary)
+}
+
 fn ensure_macos_ui_test_requirements(status: &MacosDoctorStatus) -> Result<()> {
     if status.accessibility_trusted && status.screen_capture_access {
         return Ok(());
@@ -337,47 +388,6 @@ fn ensure_macos_ui_test_requirements(status: &MacosDoctorStatus) -> Result<()> {
         "macOS UI automation is not ready.\nMissing:\n  - {}",
         missing.join("\n  - ")
     )
-}
-
-fn acquire_macos_ui_test_lock(project: &ProjectContext) -> Result<UiRunLockGuard> {
-    let lock_path = macos_ui_test_lock_path(project.app.global_paths.data_dir.as_path());
-    acquire_waiting_file_lock(
-        &lock_path,
-        "another Orbit macOS UI test run is active; waiting for the global macOS UI test lock",
-    )
-}
-
-fn macos_ui_test_lock_path(data_dir: &Path) -> std::path::PathBuf {
-    data_dir.join("locks").join("macos-ui-tests.lock")
-}
-
-fn acquire_waiting_file_lock(lock_path: &Path, wait_message: &str) -> Result<UiRunLockGuard> {
-    let lock_dir = lock_path
-        .parent()
-        .context("lock file path did not contain a parent directory")?;
-    ensure_dir(lock_dir)?;
-
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(lock_path)
-        .with_context(|| format!("failed to open {}", lock_path.display()))?;
-
-    match file.try_lock() {
-        Ok(()) => {}
-        Err(TryLockError::WouldBlock) => {
-            eprintln!("{wait_message}: {}", lock_path.display());
-            file.lock()
-                .with_context(|| format!("failed to lock {}", lock_path.display()))?;
-        }
-        Err(TryLockError::Error(error)) => {
-            return Err(error).with_context(|| format!("failed to lock {}", lock_path.display()));
-        }
-    }
-
-    Ok(UiRunLockGuard { _file: file })
 }
 
 fn prepare_ui_session(
@@ -426,67 +436,6 @@ fn ui_testing_destination(platform: ApplePlatform) -> DestinationKind {
     match platform {
         ApplePlatform::Macos => DestinationKind::Device,
         _ => DestinationKind::Simulator,
-    }
-}
-
-fn start_ui_trace_recording(
-    project: &ProjectContext,
-    args: &TestArgs,
-    bundle_id: &str,
-    prepared: &PreparedUiSession,
-    trace_plan: Option<&UiTracePlan>,
-) -> Result<
-    Option<(
-        crate::cli::ProfileKind,
-        crate::apple::profile::TraceRecording,
-    )>,
-> {
-    let Some(kind) = args.trace else {
-        return Ok(None);
-    };
-
-    match prepared.build_outcome.receipt.platform {
-        ApplePlatform::Macos => {
-            let plan = trace_plan.expect("macOS trace plan must be prepared when tracing UI tests");
-            let target = project.resolved_manifest.resolve_target(None)?;
-            crate::apple::signing::prepare_macos_bundle_for_debug_tracing(
-                project,
-                target,
-                &prepared.build_outcome.receipt.bundle_path,
-            )?;
-            apply_macos_ui_trace_prelaunch(prepared.backend.as_ref(), bundle_id, plan)?;
-            let launch_command = prepare_macos_ui_trace_launch_command(
-                project,
-                &prepared.build_outcome.receipt,
-                plan.launch.as_ref(),
-            )?;
-            let trace = crate::apple::profile::start_optional_launched_command_trace(
-                &project.root,
-                project.selected_xcode.as_ref(),
-                project.app.interactive,
-                Some(kind),
-                &launch_command,
-                None,
-            )?
-            .expect("trace kind should produce a launched trace");
-            let traced_executable = launch_command
-                .first()
-                .expect("macOS trace launch command must include an executable");
-            let recorder_pid = crate::apple::profile::trace_recording_process_id(&trace.1);
-            prepared.backend.pin_running_target_by_executable(
-                Path::new(traced_executable),
-                Some(recorder_pid),
-            )?;
-            Ok(Some(trace))
-        }
-        ApplePlatform::Ios => {
-            crate::apple::profile::ensure_simulator_profiling_supported(Some(kind))?;
-            Ok(None)
-        }
-        _ => bail!(
-            "UI test profiling currently supports only `--platform macos`; {} UI automation is not traceable yet",
-            prepared.build_outcome.receipt.platform
-        ),
     }
 }
 

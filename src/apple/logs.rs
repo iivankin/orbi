@@ -261,13 +261,17 @@ impl MacosInferiorLogRelay {
             })),
         }
     }
+
+    pub(crate) fn stop(&mut self) {
+        if let Some(handle) = self.forwarder.take() {
+            let _ = handle.join();
+        }
+    }
 }
 
 impl Drop for MacosInferiorLogRelay {
     fn drop(&mut self) {
-        if let Some(handle) = self.forwarder.take() {
-            let _ = handle.join();
-        }
+        self.stop();
     }
 }
 
@@ -389,6 +393,9 @@ fn write_terminal_stream_line(line: &str, stderr: bool) {
             let _ = write!(stream, "\r{}\r\n", line.trim_end_matches(['\n', '\r']));
         } else {
             let _ = write!(stream, "{line}");
+            if !line.ends_with('\n') {
+                let _ = writeln!(stream);
+            }
         }
         let _ = stream.flush();
         return;
@@ -399,6 +406,9 @@ fn write_terminal_stream_line(line: &str, stderr: bool) {
         let _ = write!(stream, "\r{}\r\n", line.trim_end_matches(['\n', '\r']));
     } else {
         let _ = write!(stream, "{line}");
+        if !line.ends_with('\n') {
+            let _ = writeln!(stream);
+        }
     }
     let _ = stream.flush();
 }
@@ -409,33 +419,50 @@ fn filter_macos_inferior_line<'a>(line: &'a str, bundle_id: &str) -> Option<&'a 
         return None;
     }
 
-    if is_macos_runtime_noise(trimmed) {
-        return None;
-    }
-
-    if !trimmed.starts_with("libLogRedirect:") {
-        return Some(trimmed);
-    }
-
-    if trimmed.contains("Initialization successful") {
-        return None;
-    }
-
-    if trimmed.contains("subsystem:\"") && !trimmed.contains(&format!("subsystem:\"{bundle_id}\""))
-    {
-        return None;
-    }
-
-    let message = trimmed.rsplit('\t').next().unwrap_or(trimmed);
+    let message = macos_inferior_message(trimmed, bundle_id);
     if is_macos_runtime_noise(message) {
+        return None;
+    }
+
+    if trimmed.starts_with("libLogRedirect:") && trimmed.contains("Initialization successful") {
         return None;
     }
 
     Some(message)
 }
 
+fn macos_inferior_message<'a>(line: &'a str, bundle_id: &str) -> &'a str {
+    if line.starts_with("libLogRedirect:") {
+        if line.contains("subsystem:\"") && !line.contains(&format!("subsystem:\"{bundle_id}\"")) {
+            return "";
+        }
+        return line.rsplit('\t').next().unwrap_or(line);
+    }
+
+    if starts_with_timestamp(line) {
+        return "";
+    }
+
+    line
+}
+
+fn starts_with_timestamp(line: &str) -> bool {
+    let bytes = line.as_bytes();
+    bytes.len() >= 4
+        && bytes[0].is_ascii_digit()
+        && bytes[1].is_ascii_digit()
+        && bytes[2].is_ascii_digit()
+        && bytes[3].is_ascii_digit()
+}
+
 fn is_macos_runtime_noise(line: &str) -> bool {
-    line.starts_with("os_unix.c:")
+    line.is_empty()
+        || line.starts_with("os_unix.c:")
+        || line.starts_with("cannot open file at line 51044")
+        || line.contains("Unable to obtain a task name port right")
+        || line.contains("finishAndSendReply(), sendToModernProcess returned -609")
+        || line.contains("AFIsDeviceGreymatterEligible Missing entitlements")
+        || line.contains("[NSInputAnalytics didInsertText:] called without session beginning")
         || line.contains("__delegate_identifier__:Performance Diagnostics__")
             && line.contains(
                 "This method should not be called on the main thread as it may lead to UI unresponsiveness.",
@@ -605,6 +632,24 @@ mod tests {
     #[test]
     fn macos_inferior_filter_drops_performance_diagnostics_noise_without_subsystem() {
         let line = "libLogRedirect: 7 80 L 5 {t:1775597903.762038}\t__delegate_identifier__:Performance Diagnostics__:::____message__:This method should not be called on the main thread as it may lead to UI unresponsiveness.\n";
+        assert_eq!(
+            filter_macos_inferior_line(line, "dev.orbit.examples.macos"),
+            None
+        );
+    }
+
+    #[test]
+    fn macos_inferior_filter_extracts_message_from_unified_log_lines() {
+        let line = "2026-04-18 22:24:06.938478+0300 OrbitTrace1776540245_ExampleMacApp[31337:6482071] [app] ExampleMacApp launched\n";
+        assert_eq!(
+            filter_macos_inferior_line(line, "dev.orbit.examples.macos"),
+            None
+        );
+    }
+
+    #[test]
+    fn macos_inferior_filter_drops_known_unified_log_noise() {
+        let line = "2026-04-18 22:24:07.112670+0300 OrbitTrace1776540245_ExampleMacApp[31337:6482460] [Common] Unable to obtain a task name port right for pid 395: (os/kern) failure (0x5)\n";
         assert_eq!(
             filter_macos_inferior_line(line, "dev.orbit.examples.macos"),
             None

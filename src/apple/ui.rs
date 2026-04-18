@@ -3,9 +3,9 @@ use anyhow::Result;
 use crate::apple::runtime;
 use crate::apple::testing::ui::{self, UiCrashDeleteRequest, UiCrashQuery, backend::UiBackend};
 use crate::cli::{
-    UiAddMediaArgs, UiCrashArgs, UiCrashCommand, UiDescribePointArgs, UiDoctorArgs, UiDumpTreeArgs,
-    UiFocusArgs, UiInstallDylibArgs, UiInstrumentsArgs, UiLogsArgs, UiOpenArgs, UiSchemaArgs,
-    UiUpdateContactsArgs,
+    UiAddMediaArgs, UiCleanTraceTempArgs, UiCrashArgs, UiCrashCommand, UiDescribePointArgs,
+    UiDoctorArgs, UiDumpTreeArgs, UiFocusArgs, UiInstallDylibArgs, UiInstrumentsArgs, UiLogsArgs,
+    UiOpenArgs, UiSchemaArgs, UiUpdateContactsArgs,
 };
 use crate::context::ProjectContext;
 
@@ -27,6 +27,10 @@ pub fn doctor(project: &ProjectContext, args: &UiDoctorArgs) -> Result<()> {
         "Select a platform to inspect",
     )?;
     ui::doctor(project, platform)
+}
+
+pub fn clean_trace_temp(args: &UiCleanTraceTempArgs) -> Result<()> {
+    ui::clean_trace_temp(args)
 }
 
 pub fn dump_tree(project: &ProjectContext, args: &UiDumpTreeArgs) -> Result<()> {

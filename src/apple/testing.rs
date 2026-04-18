@@ -46,6 +46,7 @@ pub fn run_tests(project: &ProjectContext, args: &TestArgs) -> Result<()> {
             project.app.interactive,
             Some(kind),
             &swift_testing_command(&package),
+            &[],
             None,
         )?
         .expect("trace kind should produce a launched trace");

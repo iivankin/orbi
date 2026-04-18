@@ -27,6 +27,7 @@ pub fn execute(app: &AppContext, cli: &Cli) -> Result<()> {
                 let project = app.load_project(cli.manifest.as_deref())?;
                 apple::ui::doctor(&project, args)
             }
+            UiCommand::CleanTraceTemp(args) => apple::ui::clean_trace_temp(args),
             UiCommand::DumpTree(args) => {
                 let project = app.load_project(cli.manifest.as_deref())?;
                 apple::ui::dump_tree(&project, args)

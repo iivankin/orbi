@@ -1,15 +1,16 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
+use serde::Deserialize;
 use serde_json::Value as JsonValue;
 use tempfile::{TempDir, tempdir};
 
-use super::super::matching::find_visible_element_by_selector;
+use super::super::matching::{find_visible_element_by_selector, find_visible_scroll_container};
 use super::super::{
     UiCrashDeleteRequest, UiCrashQuery, UiHardwareButton, UiKeyModifier, UiKeyPress,
     UiPermissionConfig, UiPressKey, UiSelector, UiSwipeDirection, UiTravel,
@@ -17,33 +18,86 @@ use super::super::{
 use super::{ActiveVideoRecording, MacosDoctorStatus, MacosWindowInfo, UiBackend};
 use crate::apple::build::pipeline::macos_executable_path;
 use crate::apple::logs::MacosInferiorLogRelay;
-use crate::apple::script::{
-    macos_quit_applescript, macos_xcode_log_redirect_env, shell_quote_arg, tcl_quote_arg,
+use crate::apple::xcode::{
+    SelectedXcode, log_redirect_dylib_path as selected_xcode_log_redirect_dylib_path, xcrun_command,
 };
-use crate::apple::xcode::{SelectedXcode, lldb_path as selected_xcode_lldb_path, xcrun_command};
 use crate::context::ProjectContext;
 use crate::util::{
     command_output, command_output_allow_failure, ensure_dir, run_command, run_command_capture,
+    timestamp_slug,
 };
 
 pub struct MacosBackend {
     helper_path: PathBuf,
+    bridge_dylib_path: PathBuf,
     bundle_id: String,
+    bundle_path: PathBuf,
     executable_path: PathBuf,
     selected_xcode: Option<SelectedXcode>,
     verbose: bool,
     pinned_target_pid: Mutex<Option<u32>>,
     launched_session: Mutex<Option<MacosLaunchedSession>>,
+    pending_trace_launch: Mutex<Option<PendingTraceLaunch>>,
     last_tap_point: Mutex<Option<(f64, f64)>>,
     active_video: Option<ActiveVideoRecording>,
 }
 
 struct MacosLaunchedSession {
     launched_pid: u32,
-    child: Child,
     _launch_dir: TempDir,
-    _log_pipe_anchor: fs::File,
-    _log_relay: MacosInferiorLogRelay,
+    log_pipe_anchor: Option<fs::File>,
+    log_relay: Option<MacosInferiorLogRelay>,
+    bridge_directory: PathBuf,
+    bridge_notification_name: String,
+    previous_frontmost_pid: Option<u32>,
+}
+
+impl MacosLaunchedSession {
+    fn finish_logging(&mut self) {
+        self.log_pipe_anchor.take();
+        if let Some(mut relay) = self.log_relay.take() {
+            relay.stop();
+        }
+    }
+}
+
+struct PendingTraceLaunch {
+    launch_dir: TempDir,
+    log_pipe_anchor: fs::File,
+    log_relay: MacosInferiorLogRelay,
+    launch_id: String,
+    registration_path: PathBuf,
+    bridge_directory: PathBuf,
+    bridge_notification_name: String,
+    previous_frontmost_pid: Option<u32>,
+}
+
+struct PreparedMacosLaunchSupport {
+    launch_dir: TempDir,
+    log_pipe_anchor: fs::File,
+    log_relay: MacosInferiorLogRelay,
+    bridge_directory: PathBuf,
+    bridge_notification_name: String,
+    launch_environment: Vec<(String, String)>,
+}
+
+#[derive(Deserialize)]
+struct MacosFrontmostApplication {
+    pid: Option<u32>,
+}
+
+#[derive(Deserialize)]
+struct MacosLaunchedApplication {
+    pid: u32,
+}
+
+#[derive(Deserialize)]
+struct MacosTraceLaunchRegistration {
+    pid: u32,
+    #[serde(rename = "launchId")]
+    launch_id: String,
+    #[serde(rename = "bundleId")]
+    bundle_id: String,
 }
 
 impl MacosBackend {
@@ -53,12 +107,15 @@ impl MacosBackend {
     ) -> Result<Self> {
         Ok(Self {
             helper_path: ensure_macos_driver_binary(project)?,
+            bridge_dylib_path: ensure_macos_bridge_dylib(project)?,
             bundle_id: receipt.bundle_id.clone(),
+            bundle_path: receipt.bundle_path.clone(),
             executable_path: macos_executable_path(receipt)?,
             selected_xcode: project.selected_xcode.clone(),
             verbose: project.app.verbose,
             pinned_target_pid: Mutex::new(None),
             launched_session: Mutex::new(None),
+            pending_trace_launch: Mutex::new(None),
             last_tap_point: Mutex::new(None),
             active_video: None,
         })
@@ -94,24 +151,8 @@ impl MacosBackend {
         let Some(mut session) = session.take() else {
             return Ok(());
         };
-        if session.child.try_wait()?.is_some() {
-            return Ok(());
-        }
-
-        let mut terminate = Command::new("kill");
-        terminate.args(["-TERM", &session.child.id().to_string()]);
-        let _ = command_output_allow_failure(&mut terminate)?;
-
-        let started = Instant::now();
-        while started.elapsed() < Duration::from_secs(2) {
-            if session.child.try_wait()?.is_some() {
-                return Ok(());
-            }
-            thread::sleep(Duration::from_millis(50));
-        }
-
-        let _ = session.child.kill();
-        let _ = session.child.wait();
+        terminate_macos_process_tree(session.launched_pid)?;
+        session.finish_logging();
         Ok(())
     }
 
@@ -126,7 +167,28 @@ impl MacosBackend {
         })
     }
 
-    fn pin_running_target_pid(&self, pid: u32) -> Result<()> {
+    fn bridge_arguments(&self) -> Result<Option<Vec<String>>> {
+        let session = self
+            .launched_session
+            .lock()
+            .map_err(|_| anyhow::anyhow!("failed to lock the macOS UI backend process state"))?;
+        let Some(session) = session.as_ref() else {
+            return Ok(None);
+        };
+
+        Ok(Some(vec![
+            "--bridge-dir".to_owned(),
+            session
+                .bridge_directory
+                .to_str()
+                .context("macOS UI bridge directory contains invalid UTF-8")?
+                .to_owned(),
+            "--bridge-name".to_owned(),
+            session.bridge_notification_name.clone(),
+        ]))
+    }
+
+    fn set_pinned_target_pid(&self, pid: u32) -> Result<()> {
         *self
             .pinned_target_pid
             .lock()
@@ -135,55 +197,19 @@ impl MacosBackend {
         Ok(())
     }
 
-    fn wait_for_running_process_pid(
-        &self,
-        executable_path: &Path,
-        ignored_pid: Option<u32>,
-    ) -> Result<u32> {
-        let executable = executable_path
-            .to_str()
-            .context("macOS traced executable path contains invalid UTF-8")?;
-        let started = Instant::now();
-        let mut last_seen_pids = Vec::new();
-        while started.elapsed() < Duration::from_secs(10) {
-            let mut command = Command::new("pgrep");
-            command.args(["-f", executable]);
-            let (success, stdout, _stderr) = command_output_allow_failure(&mut command)?;
-            if success {
-                let pids = traced_process_candidates(&stdout, ignored_pid);
-                if pids.len() == 1 {
-                    return Ok(pids[0]);
-                }
-                if !pids.is_empty() {
-                    last_seen_pids = pids;
-                }
-            }
-            thread::sleep(Duration::from_millis(50));
-        }
-
-        if last_seen_pids.len() > 1 {
-            bail!(
-                "timed out waiting for traced macOS app `{}` to settle to a single process; saw pids {:?}",
-                executable_path.display(),
-                last_seen_pids
-            );
-        }
-        bail!(
-            "timed out waiting for traced macOS app process `{}` to appear",
-            executable_path.display()
-        )
-    }
-
-    fn start_attached_log_session(
-        &self,
-        arguments: &[(String, String)],
-    ) -> Result<MacosLaunchedSession> {
-        let launch_dir = tempdir().context("failed to create macOS UI launch tempdir")?;
+    fn prepare_launch_support(&self, tempdir_context: &str) -> Result<PreparedMacosLaunchSupport> {
+        let launch_dir = tempdir().with_context(|| tempdir_context.to_owned())?;
+        let bridge_directory = launch_dir.path().join("ui-bridge");
+        ensure_dir(&bridge_directory)?;
+        let bridge_notification_name = format!(
+            "dev.orbit.ui.{}",
+            launch_dir
+                .path()
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or("bridge")
+        );
         let log_pipe = launch_dir.path().join("inferior-stdio.pipe");
-        let pid_file = launch_dir.path().join("inferior-pid.txt");
-        let lldb_script = launch_dir.path().join("run.expect");
-        let coordinator_script = launch_dir.path().join("coordinator.expect");
-        let wrapper_script = launch_dir.path().join("launch.zsh");
 
         let mut mkfifo = Command::new("mkfifo");
         mkfifo.arg(&log_pipe);
@@ -197,63 +223,152 @@ impl MacosBackend {
                 format!("failed to open macOS UI log pipe `{}`", log_pipe.display())
             })?;
         let log_relay = MacosInferiorLogRelay::start(&log_pipe, &self.bundle_id, self.verbose);
+        let launch_environment = macos_ui_bridge_launch_environment(
+            self.selected_xcode.as_ref(),
+            &self.bridge_dylib_path,
+            &bridge_directory,
+            &bridge_notification_name,
+            &log_pipe,
+        )?;
 
-        fs::write(
-            &lldb_script,
-            macos_lldb_run_script(self.selected_xcode.as_ref(), arguments)?.as_bytes(),
-        )
-        .with_context(|| format!("failed to write {}", lldb_script.display()))?;
+        Ok(PreparedMacosLaunchSupport {
+            launch_dir,
+            log_pipe_anchor,
+            log_relay,
+            bridge_directory,
+            bridge_notification_name,
+            launch_environment,
+        })
+    }
 
-        fs::write(
-            &wrapper_script,
-            macos_attached_launch_wrapper(
-                self.bundle_id.as_str(),
-                self.executable_path.as_path(),
-                lldb_script.as_path(),
-                log_pipe.as_path(),
-                pid_file.as_path(),
-            )?
-            .as_bytes(),
-        )
-        .with_context(|| format!("failed to write {}", wrapper_script.display()))?;
-
-        fs::write(
-            &coordinator_script,
-            macos_expect_wrapper_coordinator().as_bytes(),
-        )
-        .with_context(|| format!("failed to write {}", coordinator_script.display()))?;
-
-        let mut chmod = Command::new("chmod");
-        chmod.args(["+x"]);
-        chmod.arg(&wrapper_script);
-        run_command(&mut chmod)?;
-
-        let mut child = Command::new("expect");
-        child.args(["-f"]);
-        child.arg(&coordinator_script);
-        child.arg(&wrapper_script);
-        child.stdin(Stdio::inherit());
-        child.stdout(Stdio::inherit());
-        child.stderr(Stdio::inherit());
-        let mut child = child
-            .spawn()
-            .with_context(|| format!("failed to start `{}` under LLDB", self.bundle_id))?;
-        let launched_pid = match wait_for_launched_app_pid(&pid_file) {
-            Ok(pid) => pid,
-            Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(error);
+    fn wait_for_trace_launch_registration(
+        &self,
+        pending: &PendingTraceLaunch,
+    ) -> Result<MacosTraceLaunchRegistration> {
+        let started = Instant::now();
+        let mut last_error = None;
+        while started.elapsed() < Duration::from_secs(10) {
+            if let Some(registration) = read_trace_launch_registration(&pending.registration_path)?
+            {
+                if registration.launch_id != pending.launch_id {
+                    last_error = Some(format!(
+                        "trace launch registration `{}` reported unexpected launch id `{}`",
+                        pending.registration_path.display(),
+                        registration.launch_id
+                    ));
+                } else if registration.bundle_id != self.bundle_id {
+                    last_error = Some(format!(
+                        "trace launch registration `{}` reported unexpected bundle `{}`",
+                        pending.registration_path.display(),
+                        registration.bundle_id
+                    ));
+                } else if !process_is_running(registration.pid)? {
+                    last_error = Some(format!(
+                        "trace launch registration `{}` reported stale pid `{}`",
+                        pending.registration_path.display(),
+                        registration.pid
+                    ));
+                } else {
+                    return Ok(registration);
+                }
             }
-        };
+            thread::sleep(Duration::from_millis(50));
+        }
+
+        match last_error {
+            Some(detail) => Err(anyhow::anyhow!(detail)),
+            None => bail!(
+                "timed out waiting for traced macOS app `{}` to register launch `{}`",
+                self.bundle_id,
+                pending.launch_id
+            ),
+        }
+    }
+
+    fn start_attached_log_session(
+        &self,
+        arguments: &[(String, String)],
+    ) -> Result<MacosLaunchedSession> {
+        let PreparedMacosLaunchSupport {
+            launch_dir,
+            log_pipe_anchor,
+            log_relay,
+            bridge_directory,
+            bridge_notification_name,
+            launch_environment,
+        } = self.prepare_launch_support("failed to create macOS UI launch tempdir")?;
+        let launch_arguments = macos_launch_arguments(arguments);
+        let bundle_path = self
+            .bundle_path
+            .to_str()
+            .context("macOS app bundle path contains invalid UTF-8")?;
+        let mut command = Command::new(&self.helper_path);
+        command.args(["launch-app", "--app-path", bundle_path]);
+        for argument in launch_arguments {
+            command.arg("--argument").arg(argument);
+        }
+        for (key, value) in launch_environment {
+            command.arg("--env").arg(format!("{key}={value}"));
+        }
+        let output = command_output(&mut command)
+            .with_context(|| format!("failed to launch `{}` without activation", self.bundle_id))?;
+        let launched: MacosLaunchedApplication =
+            serde_json::from_str(&output).context("failed to parse macOS launch helper output")?;
 
         Ok(MacosLaunchedSession {
-            launched_pid,
-            child,
+            launched_pid: launched.pid,
             _launch_dir: launch_dir,
-            _log_pipe_anchor: log_pipe_anchor,
-            _log_relay: log_relay,
+            log_pipe_anchor: Some(log_pipe_anchor),
+            log_relay: Some(log_relay),
+            bridge_directory,
+            bridge_notification_name,
+            previous_frontmost_pid: None,
         })
+    }
+
+    fn prepare_pending_trace_launch(
+        &self,
+        previous_frontmost_pid: Option<u32>,
+    ) -> Result<Vec<(String, String)>> {
+        let PreparedMacosLaunchSupport {
+            launch_dir,
+            log_pipe_anchor,
+            log_relay,
+            bridge_directory,
+            bridge_notification_name,
+            mut launch_environment,
+        } = self.prepare_launch_support("failed to create macOS traced-session tempdir")?;
+        let launch_id = timestamp_slug();
+        let registration_path = bridge_directory.join(format!("trace-launch-{launch_id}.json"));
+        launch_environment.push((
+            "ORBIT_MACOS_UI_TRACE_LAUNCH_ID".to_owned(),
+            launch_id.clone(),
+        ));
+        launch_environment.push((
+            "ORBIT_MACOS_UI_TRACE_REGISTRATION_PATH".to_owned(),
+            registration_path.display().to_string(),
+        ));
+        launch_environment.push((
+            "ORBIT_MACOS_UI_TRACE_EXPECTED_BUNDLE_ID".to_owned(),
+            self.bundle_id.clone(),
+        ));
+
+        *self
+            .pending_trace_launch
+            .lock()
+            .map_err(|_| anyhow::anyhow!("failed to lock the macOS traced launch state"))? =
+            Some(PendingTraceLaunch {
+                launch_dir,
+                log_pipe_anchor,
+                log_relay,
+                launch_id,
+                registration_path,
+                bridge_directory,
+                bridge_notification_name,
+                previous_frontmost_pid,
+            });
+
+        Ok(launch_environment)
     }
 
     fn window_capture_info(&self) -> Result<MacosWindowInfo> {
@@ -284,12 +399,12 @@ impl MacosBackend {
         }
     }
 
-    fn wait_for_focusable_app(&self) -> Result<()> {
+    fn wait_for_actionable_app(&self) -> Result<()> {
         let started = Instant::now();
         let mut last_error = None;
         while started.elapsed() < Duration::from_secs(10) {
             let mut command = Command::new(&self.helper_path);
-            let mut arguments = vec!["focus".to_owned()];
+            let mut arguments = vec!["describe-all".to_owned()];
             arguments.extend(self.target_selector_arguments()?);
             command.args(arguments);
             let (success, _stdout, stderr) = command_output_allow_failure(&mut command)?;
@@ -305,22 +420,79 @@ impl MacosBackend {
 
         match last_error {
             Some(error) => Err(anyhow::anyhow!(error)),
-            None => bail!("timed out waiting for macOS app focus"),
+            None => bail!("timed out waiting for macOS app accessibility tree"),
         }
+    }
+
+    fn wait_for_bridge_ready(&self) -> Result<()> {
+        let Some(bridge_arguments) = self.bridge_arguments()? else {
+            return Ok(());
+        };
+
+        let started = Instant::now();
+        let mut last_error = None;
+        while started.elapsed() < Duration::from_secs(5) {
+            let mut command = Command::new(&self.helper_path);
+            let mut arguments = vec!["bridge-ping".to_owned()];
+            arguments.extend(bridge_arguments.clone());
+            command.args(arguments);
+            let (success, _stdout, stderr) = command_output_allow_failure(&mut command)?;
+            if success {
+                return Ok(());
+            }
+            let detail = stderr.trim();
+            if !detail.is_empty() {
+                last_error = Some(detail.to_owned());
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+
+        match last_error {
+            Some(error) => Err(anyhow::anyhow!(error)),
+            None => bail!("timed out waiting for the injected macOS UI bridge"),
+        }
+    }
+
+    fn frontmost_application_pid(&self) -> Result<Option<u32>> {
+        let mut command = Command::new(&self.helper_path);
+        command.arg("frontmost-application");
+        let (success, stdout, _stderr) = command_output_allow_failure(&mut command)?;
+        if !success {
+            return Ok(None);
+        }
+        let info: MacosFrontmostApplication =
+            serde_json::from_str(&stdout).context("failed to parse macOS frontmost app")?;
+        Ok(info.pid)
+    }
+
+    fn restore_frontmost_application(
+        &self,
+        pid: Option<u32>,
+        ignored_pid: Option<u32>,
+    ) -> Result<()> {
+        let Some(pid) = pid else {
+            return Ok(());
+        };
+        if Some(pid) == ignored_pid {
+            return Ok(());
+        }
+
+        let pid_string = pid.to_string();
+        let mut command = Command::new(&self.helper_path);
+        command.args(["focus", "--pid", pid_string.as_str()]);
+        let _ = command_output_allow_failure(&mut command)?;
+        Ok(())
     }
 
     fn reopen_window(&self) -> Result<()> {
         let started = Instant::now();
         let mut last_error = None;
         while started.elapsed() < Duration::from_secs(10) {
-            let mut script = Command::new("osascript");
-            script.args([
-                "-e",
-                &format!("tell application id \"{}\" to activate", self.bundle_id),
-                "-e",
-                &format!("tell application id \"{}\" to reopen", self.bundle_id),
-            ]);
-            let (success, _stdout, stderr) = command_output_allow_failure(&mut script)?;
+            let mut command = Command::new(&self.helper_path);
+            let mut arguments = vec!["reopen-app".to_owned()];
+            arguments.extend(self.target_selector_arguments()?);
+            command.args(arguments);
+            let (success, _stdout, stderr) = command_output_allow_failure(&mut command)?;
             if success {
                 return Ok(());
             }
@@ -398,53 +570,64 @@ impl UiBackend for MacosBackend {
         if stop_app {
             self.stop_app(bundle_id)?;
         }
-        if !stop_app
-            && self
-                .launched_session
-                .lock()
-                .map_err(|_| anyhow::anyhow!("failed to lock the macOS UI backend process state"))?
-                .is_some()
-        {
-            self.reopen_window()?;
-            self.window_capture_info()?;
-            return self.wait_for_focusable_app();
+        let has_running_session = if stop_app {
+            false
+        } else {
+            let mut launched_session = self.launched_session.lock().map_err(|_| {
+                anyhow::anyhow!("failed to lock the macOS UI backend process state")
+            })?;
+            if let Some(existing_session) = launched_session.as_ref() {
+                if process_is_running(existing_session.launched_pid)? {
+                    true
+                } else {
+                    launched_session.take();
+                    *self.pinned_target_pid.lock().map_err(|_| {
+                        anyhow::anyhow!("failed to lock the macOS UI backend target state")
+                    })? = None;
+                    false
+                }
+            } else {
+                false
+            }
+        };
+        if has_running_session {
+            let result = (|| -> Result<()> {
+                self.reopen_window()?;
+                self.window_capture_info()?;
+                self.wait_for_actionable_app()?;
+                self.wait_for_bridge_ready()
+            })();
+            return result;
         }
 
         let session = self.start_attached_log_session(arguments)?;
-        self.pin_running_target_pid(session.launched_pid)?;
+        let launched_pid = session.launched_pid;
+        self.set_pinned_target_pid(launched_pid)?;
         *self
             .launched_session
             .lock()
             .map_err(|_| anyhow::anyhow!("failed to lock the macOS UI backend process state"))? =
             Some(session);
-        self.window_capture_info()?;
-        self.wait_for_focusable_app()
+        (|| -> Result<()> {
+            self.reopen_window()?;
+            self.window_capture_info()?;
+            self.wait_for_actionable_app()?;
+            self.wait_for_bridge_ready()
+        })()
     }
 
     fn stop_app(&self, bundle_id: &str) -> Result<()> {
         self.ensure_owned_bundle(bundle_id, "stopApp")?;
         self.stop_launched_process()?;
 
-        let mut script = Command::new("osascript");
-        script.args([
-            "-e",
-            &format!("tell application id \"{bundle_id}\" to quit"),
-        ]);
-        let _ = command_output_allow_failure(&mut script)?;
-
-        let process_name = self
-            .executable_path
-            .file_name()
-            .and_then(|value| value.to_str())
-            .unwrap_or(bundle_id);
-        let mut killall = Command::new("killall");
-        killall.args(["-TERM", process_name]);
-        let _ = command_output_allow_failure(&mut killall)?;
-        *self
+        let mut pinned_target_pid = self
             .pinned_target_pid
             .lock()
-            .map_err(|_| anyhow::anyhow!("failed to lock the macOS UI backend target state"))? =
-            None;
+            .map_err(|_| anyhow::anyhow!("failed to lock the macOS UI backend target state"))?;
+        if let Some(pid) = *pinned_target_pid {
+            terminate_macos_process_tree(pid)?;
+        }
+        *pinned_target_pid = None;
         Ok(())
     }
 
@@ -495,18 +678,105 @@ impl UiBackend for MacosBackend {
         self.run_helper(&arguments)
     }
 
-    fn pin_running_target_by_executable(
+    fn frontmost_application_pid(&self) -> Result<Option<u32>> {
+        MacosBackend::frontmost_application_pid(self)
+    }
+
+    fn pin_pending_trace_launch(&self) -> Result<()> {
+        let pending_trace_launch = self
+            .pending_trace_launch
+            .lock()
+            .map_err(|_| anyhow::anyhow!("failed to lock the macOS traced launch state"))?
+            .take();
+        let session = if let Some(mut pending) = pending_trace_launch {
+            let pid = match self.wait_for_trace_launch_registration(&pending) {
+                Ok(registration) => registration.pid,
+                Err(error) => {
+                    pending.log_relay.stop();
+                    return Err(error);
+                }
+            };
+            self.set_pinned_target_pid(pid)?;
+            MacosLaunchedSession {
+                launched_pid: pid,
+                _launch_dir: pending.launch_dir,
+                log_pipe_anchor: Some(pending.log_pipe_anchor),
+                log_relay: Some(pending.log_relay),
+                bridge_directory: pending.bridge_directory,
+                bridge_notification_name: pending.bridge_notification_name,
+                previous_frontmost_pid: pending.previous_frontmost_pid,
+            }
+        } else {
+            bail!("missing pending macOS trace launch registration")
+        };
+        *self
+            .launched_session
+            .lock()
+            .map_err(|_| anyhow::anyhow!("failed to lock the macOS UI backend process state"))? =
+            Some(session);
+        Ok(())
+    }
+
+    fn prepare_trace_launch_environment(
         &self,
-        executable_path: &Path,
-        ignored_pid: Option<u32>,
-    ) -> Result<()> {
-        let pid = self.wait_for_running_process_pid(executable_path, ignored_pid)?;
-        self.pin_running_target_pid(pid)
+        previous_frontmost_pid: Option<u32>,
+    ) -> Result<Vec<(String, String)>> {
+        self.prepare_pending_trace_launch(previous_frontmost_pid)
+    }
+
+    fn abort_pending_trace_launch(&self) -> Result<()> {
+        let pending = self
+            .pending_trace_launch
+            .lock()
+            .map_err(|_| anyhow::anyhow!("failed to lock the macOS traced launch state"))?
+            .take();
+        let Some(mut pending) = pending else {
+            return Ok(());
+        };
+
+        if let Some(registration) = read_trace_launch_registration(&pending.registration_path)?
+            && registration.launch_id == pending.launch_id
+            && registration.bundle_id == self.bundle_id
+        {
+            terminate_macos_process_tree(registration.pid)?;
+        }
+        pending.log_relay.stop();
+        Ok(())
+    }
+
+    fn prepare_external_running_target(&self) -> Result<()> {
+        if let Err(error) = self.reopen_window()
+            && !error.to_string().contains("procNotFound")
+        {
+            return Err(error);
+        }
+        self.window_capture_info()?;
+        self.wait_for_actionable_app()?;
+        self.wait_for_bridge_ready()?;
+
+        let restore_target = self
+            .launched_session
+            .lock()
+            .map_err(|_| anyhow::anyhow!("failed to lock the macOS UI backend process state"))?
+            .as_ref()
+            .and_then(|session| session.previous_frontmost_pid);
+        if let Some(previous_frontmost_pid) = restore_target {
+            let ignored_pid = *self
+                .pinned_target_pid
+                .lock()
+                .map_err(|_| anyhow::anyhow!("failed to lock the macOS UI backend target state"))?;
+            let restore_deadline = Instant::now() + Duration::from_secs(2);
+            while Instant::now() < restore_deadline {
+                if self.frontmost_application_pid()? == ignored_pid {
+                    self.restore_frontmost_application(Some(previous_frontmost_pid), ignored_pid)?;
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
+        Ok(())
     }
 
     fn tap_point(&self, x: f64, y: f64, duration_ms: Option<u32>) -> Result<()> {
-        self.focus()?;
-        thread::sleep(Duration::from_millis(80));
         let mut arguments = vec![
             "tap".to_owned(),
             "--x".to_owned(),
@@ -514,6 +784,10 @@ impl UiBackend for MacosBackend {
             "--y".to_owned(),
             y.to_string(),
         ];
+        if let Some(bridge_arguments) = self.bridge_arguments()? {
+            arguments.extend(bridge_arguments);
+        }
+        arguments.extend(self.target_selector_arguments()?);
         if let Some(duration_ms) = duration_ms {
             arguments.push("--duration-ms".to_owned());
             arguments.push(duration_ms.to_string());
@@ -531,9 +805,6 @@ impl UiBackend for MacosBackend {
         if selector.id.is_none() && selector.text.is_none() {
             return Ok(false);
         }
-
-        self.focus()?;
-        thread::sleep(Duration::from_millis(80));
 
         let matched_center = self
             .describe_all()
@@ -563,23 +834,33 @@ impl UiBackend for MacosBackend {
     }
 
     fn hover_point(&self, x: f64, y: f64) -> Result<()> {
-        self.run_helper(&[
+        let mut arguments = vec![
             "move".to_owned(),
             "--x".to_owned(),
             x.to_string(),
             "--y".to_owned(),
             y.to_string(),
-        ])
+        ];
+        if let Some(bridge_arguments) = self.bridge_arguments()? {
+            arguments.extend(bridge_arguments);
+        }
+        arguments.extend(self.target_selector_arguments()?);
+        self.run_helper(&arguments)
     }
 
     fn right_click_point(&self, x: f64, y: f64) -> Result<()> {
-        self.run_helper(&[
+        let mut arguments = vec![
             "right-click".to_owned(),
             "--x".to_owned(),
             x.to_string(),
             "--y".to_owned(),
             y.to_string(),
-        ])
+        ];
+        if let Some(bridge_arguments) = self.bridge_arguments()? {
+            arguments.extend(bridge_arguments);
+        }
+        arguments.extend(self.target_selector_arguments()?);
+        self.run_helper(&arguments)
     }
 
     fn swipe_points(
@@ -606,6 +887,7 @@ impl UiBackend for MacosBackend {
             arguments.push("--delta".to_owned());
             arguments.push(delta.to_string());
         }
+        arguments.extend(self.target_selector_arguments()?);
         self.run_helper(&arguments)
     }
 
@@ -630,6 +912,10 @@ impl UiBackend for MacosBackend {
         duration_ms: Option<u32>,
         delta: Option<u32>,
     ) -> Result<()> {
+        let previous_frontmost_pid = self.frontmost_application_pid()?;
+        self.focus()?;
+        thread::sleep(Duration::from_millis(150));
+
         let mut arguments = vec![
             "drag".to_owned(),
             "--start-x".to_owned(),
@@ -647,7 +933,13 @@ impl UiBackend for MacosBackend {
             arguments.push("--delta".to_owned());
             arguments.push(delta.to_string());
         }
-        self.run_helper(&arguments)
+        let result = self.run_helper(&arguments);
+        let target_pid = *self
+            .pinned_target_pid
+            .lock()
+            .map_err(|_| anyhow::anyhow!("failed to lock the macOS UI backend target state"))?;
+        let _ = self.restore_frontmost_application(previous_frontmost_pid, target_pid);
+        result
     }
 
     fn input_text(&self, text: &str) -> Result<()> {
@@ -697,8 +989,6 @@ impl UiBackend for MacosBackend {
                 )
             }
         };
-        self.focus()?;
-        thread::sleep(Duration::from_millis(120));
         let mut arguments = vec![
             "key".to_owned(),
             "--keycode".to_owned(),
@@ -728,8 +1018,6 @@ impl UiBackend for MacosBackend {
         duration_ms: Option<u32>,
         modifiers: &[UiKeyModifier],
     ) -> Result<()> {
-        self.focus()?;
-        thread::sleep(Duration::from_millis(120));
         let mut arguments = vec![
             "key".to_owned(),
             "--keycode".to_owned(),
@@ -842,8 +1130,26 @@ impl UiBackend for MacosBackend {
     }
 
     fn scroll_in_direction(&self, direction: UiSwipeDirection) -> Result<()> {
-        self.run_helper(&[
+        let point = self
+            .describe_all()
+            .ok()
+            .and_then(|tree| find_visible_scroll_container(&tree))
+            .map(|frame| frame.center())
+            .or_else(|| {
+                self.window_capture_info().ok().map(|window| {
+                    (
+                        window.frame.x + (window.frame.width / 2.0),
+                        window.frame.y + (window.frame.height / 2.0),
+                    )
+                })
+            })
+            .unwrap_or((0.0, 0.0));
+        let mut arguments = vec![
             "scroll".to_owned(),
+            "--x".to_owned(),
+            point.0.to_string(),
+            "--y".to_owned(),
+            point.1.to_string(),
             "--direction".to_owned(),
             match direction {
                 UiSwipeDirection::Left => "left",
@@ -852,11 +1158,16 @@ impl UiBackend for MacosBackend {
                 UiSwipeDirection::Down => "down",
             }
             .to_owned(),
-        ])
+        ];
+        if let Some(bridge_arguments) = self.bridge_arguments()? {
+            arguments.extend(bridge_arguments);
+        }
+        arguments.extend(self.target_selector_arguments()?);
+        self.run_helper(&arguments)
     }
 
     fn scroll_at_point(&self, direction: UiSwipeDirection, point: (f64, f64)) -> Result<()> {
-        self.run_helper(&[
+        let mut arguments = vec![
             "scroll-at-point".to_owned(),
             "--x".to_owned(),
             point.0.to_string(),
@@ -870,7 +1181,12 @@ impl UiBackend for MacosBackend {
                 UiSwipeDirection::Down => "down",
             }
             .to_owned(),
-        ])
+        ];
+        if let Some(bridge_arguments) = self.bridge_arguments()? {
+            arguments.extend(bridge_arguments);
+        }
+        arguments.extend(self.target_selector_arguments()?);
+        self.run_helper(&arguments)
     }
 
     fn hide_keyboard(&self) -> Result<()> {
@@ -953,19 +1269,6 @@ impl UiBackend for MacosBackend {
     }
 }
 
-fn traced_process_candidates(stdout: &str, ignored_pid: Option<u32>) -> Vec<u32> {
-    let mut pids = stdout
-        .lines()
-        .filter_map(|line| line.trim().parse::<u32>().ok())
-        .collect::<Vec<_>>();
-    pids.sort_unstable();
-    pids.dedup();
-    if let Some(ignored_pid) = ignored_pid {
-        pids.retain(|pid| *pid != ignored_pid);
-    }
-    pids
-}
-
 fn remove_path_if_exists(path: &Path) -> Result<()> {
     if !path.exists() {
         return Ok(());
@@ -978,206 +1281,67 @@ fn remove_path_if_exists(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn wait_for_launched_app_pid(pid_file: &Path) -> Result<u32> {
+fn read_trace_launch_registration(path: &Path) -> Result<Option<MacosTraceLaunchRegistration>> {
+    let contents = match fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to read {}", path.display()));
+        }
+    };
+    let registration = serde_json::from_str(&contents).with_context(|| {
+        format!(
+            "failed to parse macOS trace launch registration {}",
+            path.display()
+        )
+    })?;
+    Ok(Some(registration))
+}
+
+fn process_is_running(pid: u32) -> Result<bool> {
+    let mut command = Command::new("kill");
+    command.args(["-0", &pid.to_string()]);
+    let (success, _stdout, _stderr) = command_output_allow_failure(&mut command)?;
+    Ok(success)
+}
+
+fn terminate_macos_process_tree(pid: u32) -> Result<()> {
+    if !process_is_running(pid)? {
+        return Ok(());
+    }
+
+    terminate_macos_launch_descendants(pid, "TERM")?;
+    let mut terminate = Command::new("kill");
+    terminate.args(["-TERM", &pid.to_string()]);
+    let _ = command_output_allow_failure(&mut terminate)?;
+
     let started = Instant::now();
-    while started.elapsed() < Duration::from_secs(10) {
-        if let Ok(contents) = fs::read_to_string(pid_file) {
-            let pid_text = contents.trim();
-            if !pid_text.is_empty() {
-                let pid = pid_text.parse::<u32>().with_context(|| {
-                    format!(
-                        "failed to parse launched macOS app pid from `{}`",
-                        pid_file.display()
-                    )
-                })?;
-                return Ok(pid);
-            }
+    while started.elapsed() < Duration::from_secs(2) {
+        if !process_is_running(pid)? {
+            return Ok(());
         }
         thread::sleep(Duration::from_millis(50));
     }
-    bail!(
-        "timed out waiting for the launched macOS app pid in `{}`",
-        pid_file.display()
-    )
+
+    terminate_macos_launch_descendants(pid, "KILL")?;
+    let mut kill = Command::new("kill");
+    kill.args(["-KILL", &pid.to_string()]);
+    let _ = command_output_allow_failure(&mut kill)?;
+    Ok(())
 }
 
-fn macos_lldb_launch_arguments(arguments: &[(String, String)]) -> Vec<String> {
+fn terminate_macos_launch_descendants(parent_pid: u32, signal: &str) -> Result<()> {
+    let mut command = Command::new("pkill");
+    command.args([format!("-{signal}").as_str(), "-P", &parent_pid.to_string()]);
+    let _ = command_output_allow_failure(&mut command)?;
+    Ok(())
+}
+
+fn macos_launch_arguments(arguments: &[(String, String)]) -> Vec<String> {
     arguments
         .iter()
         .flat_map(|(key, value)| [format!("-{key}"), value.clone()])
         .collect()
-}
-
-fn macos_tcl_list_items(values: &[String]) -> String {
-    values
-        .iter()
-        .map(|value| format!("\"{}\"", tcl_quote_arg(value)))
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-fn macos_lldb_launch_command_setup(arguments: &[(String, String)]) -> String {
-    let launch_arguments = macos_lldb_launch_arguments(arguments);
-    let launch_argument_items = macos_tcl_list_items(&launch_arguments);
-    format!(
-        r#"set launch_arguments [list {launch_argument_items}]
-set launch_parts [list process launch -s -o $log_pipe -e $log_pipe]
-if {{[llength $launch_arguments] > 0}} {{
-    lappend launch_parts --
-    foreach arg $launch_arguments {{
-        set escaped_arg [string map [list "\\" "\\\\" "\"" "\\\""] $arg]
-        lappend launch_parts "\"$escaped_arg\""
-    }}
-}}
-set launch_command [join $launch_parts " "]
-"#
-    )
-}
-
-fn macos_lldb_run_script(
-    selected_xcode: Option<&SelectedXcode>,
-    arguments: &[(String, String)],
-) -> Result<String> {
-    let lldb_path = selected_xcode_lldb_path(selected_xcode)?;
-    let launch_command_setup = macos_lldb_launch_command_setup(arguments);
-    Ok(format!(
-        r#"set timeout -1
-log_user 0
-
-proc wait_for_prompt {{}} {{
-    expect {{
-        -re {{\(lldb\)}} {{ return }}
-        timeout {{ send_user "timed out waiting for LLDB prompt\n"; exit 1 }}
-        eof {{ send_user "LLDB exited before it became interactive\n"; exit 1 }}
-    }}
-}}
-
-proc wait_for_message {{pattern message}} {{
-    expect {{
-        -re $pattern {{ return }}
-        timeout {{ send_user "$message\n"; exit 1 }}
-        eof {{ send_user "LLDB exited unexpectedly\n"; exit 1 }}
-    }}
-}}
-
-proc wait_for_launch_and_record_pid {{pattern pid_file message}} {{
-    expect {{
-        -re $pattern {{
-            set inferior_pid $expect_out(1,string)
-            set file_handle [open $pid_file "w"]
-            puts $file_handle $inferior_pid
-            close $file_handle
-            return
-        }}
-        timeout {{ send_user "$message\n"; exit 1 }}
-        eof {{ send_user "LLDB exited unexpectedly\n"; exit 1 }}
-    }}
-}}
-
-set exe [lindex $argv 0]
-set log_pipe [lindex $argv 1]
-set pid_file [lindex $argv 2]
-set lldb_path "{lldb_path}"
-{launch_command_setup}
-
-spawn $lldb_path $exe
-wait_for_prompt
-send -- "settings set target.env-vars {env_vars}\r"
-wait_for_prompt
-send -- "$launch_command\r"
-wait_for_launch_and_record_pid {{Process ([0-9]+) launched}} $pid_file "timed out waiting for LLDB to launch the macOS app"
-wait_for_prompt
-send -- "continue\r"
-wait_for_message {{Process [0-9]+ resuming}} "timed out waiting for LLDB to continue the macOS app"
-expect {{
-    -re {{Process [0-9]+ exited}} {{}}
-    -re {{Process [0-9]+ stopped}} {{}}
-    eof {{ exit 0 }}
-}}
-"#,
-        lldb_path = tcl_quote_arg(
-            lldb_path
-                .to_str()
-                .context("macOS LLDB path contains invalid UTF-8")?,
-        ),
-        env_vars = tcl_quote_arg(&macos_xcode_log_redirect_env(selected_xcode)?),
-        launch_command_setup = launch_command_setup,
-    ))
-}
-
-fn macos_attached_launch_wrapper(
-    bundle_id: &str,
-    executable_path: &Path,
-    lldb_script_path: &Path,
-    log_pipe_path: &Path,
-    pid_file_path: &Path,
-) -> Result<String> {
-    Ok(format!(
-        r#"#!/bin/zsh
-set -uo pipefail
-
-cleanup() {{
-  local exit_code="${{1:-0}}"
-  trap - INT TERM HUP EXIT
-
-  if [[ -n "${{launcher_pid:-}}" ]]; then
-    /usr/bin/osascript -e {quit_script} >/dev/null 2>&1 || true
-    for _ in {{1..20}}; do
-      if ! /usr/bin/pgrep -f {executable} >/dev/null 2>&1; then
-        break
-      fi
-      sleep 0.1
-    done
-    /usr/bin/pkill -f {executable} >/dev/null 2>&1 || true
-    kill -TERM "${{launcher_pid}}" >/dev/null 2>&1 || true
-    wait "${{launcher_pid}}" 2>/dev/null || true
-  fi
-
-  exit "${{exit_code}}"
-}}
-
-trap 'cleanup 130' INT
-trap 'cleanup 143' TERM HUP
-trap 'cleanup $?' EXIT
-
- /usr/bin/expect -f {lldb_script} {executable} {log_pipe} {pid_file} &
-launcher_pid=$!
-wait "${{launcher_pid}}"
-launcher_status=$?
-cleanup "${{launcher_status}}"
-"#,
-        quit_script = shell_quote_arg(&macos_quit_applescript(bundle_id)),
-        executable = shell_quote_arg(
-            executable_path
-                .to_str()
-                .context("macOS executable path contains invalid UTF-8")?,
-        ),
-        lldb_script = shell_quote_arg(
-            lldb_script_path
-                .to_str()
-                .context("macOS LLDB script path contains invalid UTF-8")?,
-        ),
-        log_pipe = shell_quote_arg(
-            log_pipe_path
-                .to_str()
-                .context("macOS log pipe path contains invalid UTF-8")?,
-        ),
-        pid_file = shell_quote_arg(
-            pid_file_path
-                .to_str()
-                .context("macOS pid file path contains invalid UTF-8")?,
-        ),
-    ))
-}
-
-fn macos_expect_wrapper_coordinator() -> String {
-    r"set timeout -1
-set wrapper [lindex $argv 0]
-
-spawn -noecho /bin/zsh $wrapper
-expect eof
-"
-    .to_owned()
 }
 
 fn macos_keycode_for_character(character: char) -> Result<u32> {
@@ -1249,6 +1413,87 @@ fn macos_requirement_message() -> &'static str {
     "Orbit macOS UI automation requires Accessibility access and the built-in Swift toolchain on this Mac"
 }
 
+fn should_rebuild_macos_ui_artifact(source_path: &Path, binary_path: &Path) -> Result<bool> {
+    if !binary_path.exists() {
+        return Ok(true);
+    }
+
+    let source_modified = fs::metadata(source_path)
+        .and_then(|metadata| metadata.modified())
+        .with_context(|| format!("failed to read {}", source_path.display()))?;
+    let binary_modified = fs::metadata(binary_path)
+        .and_then(|metadata| metadata.modified())
+        .with_context(|| format!("failed to read {}", binary_path.display()))?;
+    Ok(source_modified > binary_modified)
+}
+
+fn compile_macos_ui_artifact(
+    project: &ProjectContext,
+    source_path: &Path,
+    binary_path: &Path,
+    compiler_arguments: &[&str],
+    description: &str,
+) -> Result<()> {
+    let mut command = xcrun_command(project.selected_xcode.as_ref());
+    command.args(compiler_arguments);
+    command.arg(source_path);
+    command.arg("-o");
+    command.arg(binary_path);
+    let _ = run_command_capture(&mut command).with_context(|| {
+        format!(
+            "failed to compile {description} from {}",
+            source_path.display()
+        )
+    })?;
+    Ok(())
+}
+
+fn macos_ui_bridge_launch_environment(
+    selected_xcode: Option<&SelectedXcode>,
+    bridge_dylib_path: &Path,
+    bridge_directory: &Path,
+    bridge_notification_name: &str,
+    log_pipe_path: &Path,
+) -> Result<Vec<(String, String)>> {
+    let log_redirect_dylib = selected_xcode_log_redirect_dylib_path(selected_xcode)?;
+    let bridge_dylib_path = bridge_dylib_path
+        .to_str()
+        .context("macOS UI bridge dylib path contains invalid UTF-8")?;
+    let bridge_directory = bridge_directory
+        .to_str()
+        .context("macOS UI bridge directory contains invalid UTF-8")?;
+    let log_pipe_path = log_pipe_path
+        .to_str()
+        .context("macOS UI log pipe path contains invalid UTF-8")?;
+
+    Ok(vec![
+        ("NSUnbufferedIO".to_owned(), "YES".to_owned()),
+        ("OS_LOG_TRANSLATE_PRINT_MODE".to_owned(), "0x80".to_owned()),
+        (
+            "IDE_DISABLED_OS_ACTIVITY_DT_MODE".to_owned(),
+            "1".to_owned(),
+        ),
+        ("OS_LOG_DT_HOOK_MODE".to_owned(), "0x07".to_owned()),
+        ("CFLOG_FORCE_DISABLE_STDERR".to_owned(), "1".to_owned()),
+        (
+            "DYLD_INSERT_LIBRARIES".to_owned(),
+            format!("{}:{bridge_dylib_path}", log_redirect_dylib.display()),
+        ),
+        (
+            "ORBIT_MACOS_UI_BRIDGE_DIR".to_owned(),
+            bridge_directory.to_owned(),
+        ),
+        (
+            "ORBIT_MACOS_UI_BRIDGE_NOTIFICATION".to_owned(),
+            bridge_notification_name.to_owned(),
+        ),
+        (
+            "ORBIT_MACOS_UI_LOG_PIPE".to_owned(),
+            log_pipe_path.to_owned(),
+        ),
+    ])
+}
+
 pub(crate) fn macos_doctor(project: &ProjectContext) -> Result<MacosDoctorStatus> {
     let helper_path = ensure_macos_driver_binary(project)?;
     let mut command = Command::new(helper_path);
@@ -1268,71 +1513,74 @@ fn ensure_macos_driver_binary(project: &ProjectContext) -> Result<PathBuf> {
         .join("ui")
         .join("macos_driver.swift");
 
-    let should_build = if !binary_path.exists() {
-        true
-    } else {
-        let source_modified = fs::metadata(&source_path)
-            .and_then(|metadata| metadata.modified())
-            .with_context(|| format!("failed to read {}", source_path.display()))?;
-        let binary_modified = fs::metadata(&binary_path)
-            .and_then(|metadata| metadata.modified())
-            .with_context(|| format!("failed to read {}", binary_path.display()))?;
-        source_modified > binary_modified
-    };
-    if !should_build {
+    if !should_rebuild_macos_ui_artifact(&source_path, &binary_path)? {
         return Ok(binary_path);
     }
 
-    let mut command = xcrun_command(project.selected_xcode.as_ref());
-    command.args(["--sdk", "macosx", "swiftc", "-O"]);
-    command.arg(&source_path);
-    command.arg("-o");
-    command.arg(&binary_path);
-    let (stdout, stderr) = run_command_capture(&mut command).with_context(|| {
-        format!(
-            "failed to compile macOS UI helper from {}",
-            source_path.display()
-        )
-    })?;
-    if !stdout.trim().is_empty() {
-        eprintln!("{stdout}");
+    compile_macos_ui_artifact(
+        project,
+        &source_path,
+        &binary_path,
+        &["--sdk", "macosx", "swiftc", "-O"],
+        "macOS UI helper",
+    )?;
+    Ok(binary_path)
+}
+
+fn ensure_macos_bridge_dylib(project: &ProjectContext) -> Result<PathBuf> {
+    let tools_dir = project.project_paths.orbit_dir.join("tools");
+    ensure_dir(&tools_dir)?;
+    let binary_path = tools_dir.join("orbit-macos-ui-bridge.dylib");
+    let source_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("src")
+        .join("apple")
+        .join("testing")
+        .join("ui")
+        .join("macos_bridge.m");
+
+    if !should_rebuild_macos_ui_artifact(&source_path, &binary_path)? {
+        return Ok(binary_path);
     }
-    if !stderr.trim().is_empty() {
-        eprintln!("{stderr}");
-    }
+
+    compile_macos_ui_artifact(
+        project,
+        &source_path,
+        &binary_path,
+        &[
+            "--sdk",
+            "macosx",
+            "clang",
+            "-dynamiclib",
+            "-fobjc-arc",
+            "-framework",
+            "Foundation",
+            "-framework",
+            "AppKit",
+            "-framework",
+            "CoreGraphics",
+        ],
+        "macOS UI bridge",
+    )?;
     Ok(binary_path)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        MacosBackend, macos_attached_launch_wrapper, macos_lldb_launch_arguments,
-        macos_lldb_launch_command_setup, traced_process_candidates, wait_for_launched_app_pid,
+        MacosBackend, macos_launch_arguments, macos_ui_bridge_launch_environment,
+        read_trace_launch_registration,
     };
     use crate::apple::testing::ui::backend::UiBackend;
+    use crate::apple::xcode::SelectedXcode;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::sync::Mutex;
-    use std::thread;
-    use std::time::Duration;
     use tempfile::tempdir;
 
     #[test]
-    fn filters_launch_recorder_pid_from_traced_process_candidates() {
-        let pids = traced_process_candidates("30368\n30421\n", Some(30368));
-        assert_eq!(pids, vec![30421]);
-    }
-
-    #[test]
-    fn keeps_unique_sorted_traced_process_candidates() {
-        let pids = traced_process_candidates("42\n7\n42\n", None);
-        assert_eq!(pids, vec![7, 42]);
-    }
-
-    #[test]
-    fn flattens_launch_argument_pairs_for_lldb() {
-        let arguments = macos_lldb_launch_arguments(&[
+    fn flattens_launch_argument_pairs_for_direct_launch() {
+        let arguments = macos_launch_arguments(&[
             ("mockOpenAIOAuth".to_owned(), "instant_success".to_owned()),
             ("mockOpenAIEmail".to_owned(), "qa@example.com".to_owned()),
         ]);
@@ -1348,48 +1596,67 @@ mod tests {
     }
 
     #[test]
-    fn lldb_launch_setup_uses_tcl_list_instead_of_inline_quoted_send() {
-        let setup = macos_lldb_launch_command_setup(&[
-            ("mockOpenAIOAuth".to_owned(), "instant_success".to_owned()),
-            ("mockOpenAIEmail".to_owned(), "qa@example.com".to_owned()),
-        ]);
-        assert!(setup.contains(
-            r#"set launch_arguments [list "-mockOpenAIOAuth" "instant_success" "-mockOpenAIEmail" "qa@example.com"]"#
-        ));
-        assert!(setup.contains(r#"foreach arg $launch_arguments {"#));
-        assert!(setup.contains(r#"lappend launch_parts "\"$escaped_arg\"""#));
-    }
+    fn launch_environment_includes_log_redirect_and_bridge_injection() {
+        let temp = tempdir().unwrap();
+        let developer_dir = temp.path().join("Xcode.app/Contents/Developer");
+        let log_redirect = developer_dir.join("usr/lib/libLogRedirect.dylib");
+        fs::create_dir_all(log_redirect.parent().unwrap()).unwrap();
+        fs::write(&log_redirect, b"").unwrap();
 
-    #[test]
-    fn attached_launch_wrapper_passes_pid_file_to_expect() {
-        let wrapper = macos_attached_launch_wrapper(
-            "sh.orbit.desktop",
-            Path::new("/tmp/Accord.app/Contents/MacOS/Accord"),
-            Path::new("/tmp/run.expect"),
-            Path::new("/tmp/inferior-stdio.pipe"),
-            Path::new("/tmp/inferior-pid.txt"),
+        let selected_xcode = SelectedXcode {
+            version: "26.4".to_owned(),
+            build_version: "17E192".to_owned(),
+            app_path: PathBuf::from("/Applications/Xcode-26.4.app"),
+            developer_dir,
+        };
+        let bridge_dylib = temp.path().join("orbit-macos-ui-bridge.dylib");
+        let bridge_directory = temp.path().join("ui-bridge");
+        let log_pipe_path = temp.path().join("inferior-stdio.pipe");
+
+        let environment = macos_ui_bridge_launch_environment(
+            Some(&selected_xcode),
+            &bridge_dylib,
+            &bridge_directory,
+            "dev.orbit.ui.test",
+            &log_pipe_path,
         )
         .unwrap();
-        assert!(wrapper.contains("/usr/bin/expect -f"));
-        assert!(wrapper.contains("/tmp/run.expect"));
-        assert!(wrapper.contains("/tmp/Accord.app/Contents/MacOS/Accord"));
-        assert!(wrapper.contains("/tmp/inferior-stdio.pipe"));
-        assert!(wrapper.contains("/tmp/inferior-pid.txt"));
+
+        assert!(environment.contains(&("NSUnbufferedIO".to_owned(), "YES".to_owned())));
+        assert!(environment.contains(&(
+            "DYLD_INSERT_LIBRARIES".to_owned(),
+            format!("{}:{}", log_redirect.display(), bridge_dylib.display()),
+        )));
+        assert!(environment.contains(&(
+            "ORBIT_MACOS_UI_BRIDGE_DIR".to_owned(),
+            bridge_directory.display().to_string(),
+        )));
+        assert!(environment.contains(&(
+            "ORBIT_MACOS_UI_BRIDGE_NOTIFICATION".to_owned(),
+            "dev.orbit.ui.test".to_owned(),
+        )));
+        assert!(environment.contains(&(
+            "ORBIT_MACOS_UI_LOG_PIPE".to_owned(),
+            log_pipe_path.display().to_string(),
+        )));
     }
 
     #[test]
-    fn waits_for_launched_app_pid_file() {
+    fn reads_trace_launch_registration_file() {
         let temp = tempdir().unwrap();
-        let pid_file = temp.path().join("inferior-pid.txt");
-        let writer_path = pid_file.clone();
-        let writer = thread::spawn(move || {
-            thread::sleep(Duration::from_millis(120));
-            fs::write(writer_path, "43210\n").unwrap();
-        });
+        let registration_path = temp.path().join("trace-launch.json");
+        fs::write(
+            &registration_path,
+            r#"{"pid":4242,"launchId":"launch-1","bundleId":"sh.orbit.desktop"}"#,
+        )
+        .unwrap();
 
-        let pid = wait_for_launched_app_pid(&pid_file).unwrap();
-        writer.join().unwrap();
-        assert_eq!(pid, 43210);
+        let registration = read_trace_launch_registration(&registration_path)
+            .unwrap()
+            .expect("registration should be present");
+        assert_eq!(registration.pid, 4242);
+        assert_eq!(registration.launch_id, "launch-1");
+        assert_eq!(registration.bundle_id, "sh.orbit.desktop");
     }
 
     #[test]
@@ -1413,12 +1680,15 @@ mod tests {
 
         let backend = MacosBackend {
             helper_path,
+            bridge_dylib_path: temp.path().join("bridge.dylib"),
             bundle_id: "sh.orbit.desktop".to_owned(),
+            bundle_path: Path::new("/tmp/Accord.app").to_path_buf(),
             executable_path: Path::new("/tmp/Accord.app/Contents/MacOS/Accord").to_path_buf(),
             selected_xcode: None,
             verbose: false,
             pinned_target_pid: Mutex::new(None),
             launched_session: Mutex::new(None),
+            pending_trace_launch: Mutex::new(None),
             last_tap_point: Mutex::new(None),
             active_video: None,
         };
@@ -1434,6 +1704,98 @@ mod tests {
                 "sh.orbit.desktop",
                 "--output",
                 screenshot_path.to_str().unwrap(),
+            ]
+        );
+    }
+
+    #[test]
+    fn tap_point_routes_events_to_the_pinned_target_pid() {
+        let temp = tempdir().unwrap();
+        let helper_path = temp.path().join("helper.sh");
+        let args_path = temp.path().join("helper-args.txt");
+
+        fs::write(
+            &helper_path,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\n",
+                args_path.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&helper_path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&helper_path, permissions).unwrap();
+
+        let backend = MacosBackend {
+            helper_path,
+            bridge_dylib_path: temp.path().join("bridge.dylib"),
+            bundle_id: "sh.orbit.desktop".to_owned(),
+            bundle_path: Path::new("/tmp/Accord.app").to_path_buf(),
+            executable_path: Path::new("/tmp/Accord.app/Contents/MacOS/Accord").to_path_buf(),
+            selected_xcode: None,
+            verbose: false,
+            pinned_target_pid: Mutex::new(Some(4242)),
+            launched_session: Mutex::new(None),
+            pending_trace_launch: Mutex::new(None),
+            last_tap_point: Mutex::new(None),
+            active_video: None,
+        };
+
+        backend.tap_point(12.0, 34.0, None).unwrap();
+
+        let arguments = fs::read_to_string(args_path).unwrap();
+        assert_eq!(
+            arguments.lines().collect::<Vec<_>>(),
+            vec!["tap", "--x", "12", "--y", "34", "--pid", "4242"]
+        );
+    }
+
+    #[test]
+    fn hover_point_routes_events_to_the_target_bundle() {
+        let temp = tempdir().unwrap();
+        let helper_path = temp.path().join("helper.sh");
+        let args_path = temp.path().join("helper-args.txt");
+
+        fs::write(
+            &helper_path,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\n",
+                args_path.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&helper_path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&helper_path, permissions).unwrap();
+
+        let backend = MacosBackend {
+            helper_path,
+            bridge_dylib_path: temp.path().join("bridge.dylib"),
+            bundle_id: "sh.orbit.desktop".to_owned(),
+            bundle_path: Path::new("/tmp/Accord.app").to_path_buf(),
+            executable_path: Path::new("/tmp/Accord.app/Contents/MacOS/Accord").to_path_buf(),
+            selected_xcode: None,
+            verbose: false,
+            pinned_target_pid: Mutex::new(None),
+            launched_session: Mutex::new(None),
+            pending_trace_launch: Mutex::new(None),
+            last_tap_point: Mutex::new(None),
+            active_video: None,
+        };
+
+        backend.hover_point(90.0, 120.0).unwrap();
+
+        let arguments = fs::read_to_string(args_path).unwrap();
+        assert_eq!(
+            arguments.lines().collect::<Vec<_>>(),
+            vec![
+                "move",
+                "--x",
+                "90",
+                "--y",
+                "120",
+                "--bundle-id",
+                "sh.orbit.desktop",
             ]
         );
     }
