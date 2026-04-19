@@ -2,6 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+use asc_sync::config::DeviceFamily;
 use serde_json::{Map as JsonMap, Value as JsonValue, json};
 
 use crate::manifest::ManifestSchema;
@@ -17,13 +18,59 @@ const DEFAULT_WATCH_APP_SOURCE_DIR: &str = "Sources/WatchApp";
 const DEFAULT_WATCH_EXTENSION_SOURCE_DIR: &str = "Sources/WatchExtension";
 const HOME_VIEW_NAME: &str = "HomeView";
 const MANIFEST_DESCRIPTION: &str = "This file is documented by its `$schema`. Start with `orbit --help` for the common workflow and `orbit ui schema` for the `tests.ui` DSL.";
-const ASC_TEAM_ID_PLACEHOLDER: &str = "YOUR_TEAM_ID";
+const ASC_MANIFEST_DESCRIPTION: &str = "This embedded config is documented by its `$schema`. Start with `orbit asc --help` for the common workflow.";
 const ASC_IOS_DEVICE_ID: &str = "local-ios-device";
-const ASC_IOS_DEVICE_UDID: &str = "YOUR_IOS_DEVICE_UDID";
 const ASC_TVOS_DEVICE_ID: &str = "local-apple-tv";
-const ASC_TVOS_DEVICE_UDID: &str = "YOUR_TVOS_DEVICE_UDID";
 const ASC_MAC_DEVICE_ID: &str = "local-mac";
-const ASC_MAC_DEVICE_UDID: &str = "YOUR_MAC_DEVICE_UDID";
+const IOS_DEVICE_FAMILIES: [DeviceFamily; 2] = [DeviceFamily::Ios, DeviceFamily::Ipados];
+const WATCH_HOST_DEVICE_FAMILIES: [DeviceFamily; 1] = [DeviceFamily::Ios];
+const TVOS_DEVICE_FAMILIES: [DeviceFamily; 1] = [DeviceFamily::Tvos];
+const MACOS_DEVICE_FAMILIES: [DeviceFamily; 1] = [DeviceFamily::Macos];
+
+const IOS_TEMPLATE_DEVICE_SLOTS: [InitDeviceSlot; 1] = [InitDeviceSlot::new(
+    ASC_IOS_DEVICE_ID,
+    "Development Device",
+    "My iPhone",
+    &IOS_DEVICE_FAMILIES,
+    true,
+)];
+const WATCH_TEMPLATE_DEVICE_SLOTS: [InitDeviceSlot; 1] = [InitDeviceSlot::new(
+    ASC_IOS_DEVICE_ID,
+    "Paired iPhone",
+    "My iPhone",
+    &WATCH_HOST_DEVICE_FAMILIES,
+    true,
+)];
+const TVOS_TEMPLATE_DEVICE_SLOTS: [InitDeviceSlot; 1] = [InitDeviceSlot::new(
+    ASC_TVOS_DEVICE_ID,
+    "Apple TV",
+    "My Apple TV",
+    &TVOS_DEVICE_FAMILIES,
+    false,
+)];
+const MACOS_TEMPLATE_DEVICE_SLOTS: [InitDeviceSlot; 1] = [InitDeviceSlot::new(
+    ASC_MAC_DEVICE_ID,
+    "Mac Development Device",
+    "This Mac",
+    &MACOS_DEVICE_FAMILIES,
+    false,
+)];
+const APPLE_MULTIPLATFORM_DEVICE_SLOTS: [InitDeviceSlot; 2] = [
+    InitDeviceSlot::new(
+        ASC_IOS_DEVICE_ID,
+        "iPhone Or iPad",
+        "My iPhone",
+        &IOS_DEVICE_FAMILIES,
+        true,
+    ),
+    InitDeviceSlot::new(
+        ASC_MAC_DEVICE_ID,
+        "Mac Development Device",
+        "This Mac",
+        &MACOS_DEVICE_FAMILIES,
+        false,
+    ),
+];
 
 const APPLE_TEMPLATE_CHOICES: [TemplateChoice; 6] = [
     TemplateChoice {
@@ -134,11 +181,63 @@ pub(super) enum InitTemplate {
     Visionos,
 }
 
+impl InitTemplate {
+    pub(super) const fn required_device_slots(self) -> &'static [InitDeviceSlot] {
+        match self {
+            Self::Ios => &IOS_TEMPLATE_DEVICE_SLOTS,
+            Self::Macos => &MACOS_TEMPLATE_DEVICE_SLOTS,
+            Self::AppleMultiplatform => &APPLE_MULTIPLATFORM_DEVICE_SLOTS,
+            Self::IosWatchCompanion => &WATCH_TEMPLATE_DEVICE_SLOTS,
+            Self::Tvos => &TVOS_TEMPLATE_DEVICE_SLOTS,
+            Self::Visionos => &[],
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(super) struct TemplateChoice {
     pub(super) kind: InitTemplate,
     pub(super) label: &'static str,
     pub(super) description: &'static str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct InitDeviceSlot {
+    pub(super) logical_id: &'static str,
+    pub(super) prompt: &'static str,
+    pub(super) default_name: &'static str,
+    pub(super) compatible_families: &'static [DeviceFamily],
+    pub(super) allow_registration: bool,
+}
+
+impl InitDeviceSlot {
+    pub(super) const fn new(
+        logical_id: &'static str,
+        prompt: &'static str,
+        default_name: &'static str,
+        compatible_families: &'static [DeviceFamily],
+        allow_registration: bool,
+    ) -> Self {
+        Self {
+            logical_id,
+            prompt,
+            default_name,
+            compatible_families,
+            allow_registration,
+        }
+    }
+
+    pub(super) fn supports_family(self, family: DeviceFamily) -> bool {
+        self.compatible_families.contains(&family)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct InitAscDevice {
+    pub(super) logical_id: &'static str,
+    pub(super) family: DeviceFamily,
+    pub(super) udid: String,
+    pub(super) name: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -147,6 +246,8 @@ pub(super) struct InitAnswers {
     pub(super) name: String,
     pub(super) bundle_id: String,
     pub(super) template: InitTemplate,
+    pub(super) asc_team_id: String,
+    pub(super) asc_devices: Vec<InitAscDevice>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -396,51 +497,57 @@ fn with_scaffolded_asc(answers: &InitAnswers, mut manifest: JsonValue) -> JsonVa
 }
 
 fn asc_manifest(answers: &InitAnswers) -> JsonValue {
-    match answers.template {
-        InitTemplate::Ios => ios_asc_manifest(&answers.name, &answers.bundle_id),
-        InitTemplate::Macos => macos_asc_manifest(&answers.name, &answers.bundle_id),
-        InitTemplate::AppleMultiplatform => {
-            multiplatform_asc_manifest(&answers.name, &answers.bundle_id)
-        }
-        InitTemplate::IosWatchCompanion => {
-            watch_companion_asc_manifest(&answers.name, &answers.bundle_id)
-        }
-        InitTemplate::Tvos => tvos_asc_manifest(&answers.name, &answers.bundle_id),
-        InitTemplate::Visionos => visionos_asc_manifest(&answers.name, &answers.bundle_id),
-    }
+    with_asc_description(match answers.template {
+        InitTemplate::Ios => ios_asc_manifest(answers),
+        InitTemplate::Macos => macos_asc_manifest(answers),
+        InitTemplate::AppleMultiplatform => multiplatform_asc_manifest(answers),
+        InitTemplate::IosWatchCompanion => watch_companion_asc_manifest(answers),
+        InitTemplate::Tvos => tvos_asc_manifest(answers),
+        InitTemplate::Visionos => visionos_asc_manifest(answers),
+    })
 }
 
-fn ios_asc_manifest(name: &str, bundle_id: &str) -> JsonValue {
+fn with_asc_description(mut manifest: JsonValue) -> JsonValue {
+    manifest
+        .as_object_mut()
+        .expect("init ASC manifests always serialize as JSON objects")
+        .insert(
+            "_description".to_owned(),
+            JsonValue::String(ASC_MANIFEST_DESCRIPTION.to_owned()),
+        );
+    manifest
+}
+
+fn ios_asc_manifest(answers: &InitAnswers) -> JsonValue {
+    let device = required_device(answers, ASC_IOS_DEVICE_ID);
     json!({
         "$schema": asc_sync::schema::PUBLISHED_SCHEMA_URL,
-        "team_id": ASC_TEAM_ID_PLACEHOLDER,
+        "team_id": answers.asc_team_id,
         "bundle_ids": {
-            "app": asc_bundle_id(bundle_id, name, "ios")
+            "app": asc_bundle_id(&answers.bundle_id, &answers.name, "ios")
         },
-        "devices": {
-            (ASC_IOS_DEVICE_ID): asc_device("ios", ASC_IOS_DEVICE_UDID, "Your iPhone")
-        },
+        "devices": asc_devices_manifest(&[device]),
         "certs": {
-            "development": asc_cert("development", format!("{name} Development")),
-            "distribution": asc_cert("distribution", format!("{name} Distribution"))
+            "development": asc_cert("development", format!("{} Development", answers.name)),
+            "distribution": asc_cert("distribution", format!("{} Distribution", answers.name))
         },
         "profiles": {
             "app-development": asc_profile(
-                format!("{name} Development"),
+                format!("{} Development", answers.name),
                 "ios_app_development",
                 "app",
                 &["development"],
-                &[ASC_IOS_DEVICE_ID],
+                &[device.logical_id],
             ),
             "app-adhoc": asc_profile(
-                format!("{name} Ad Hoc"),
+                format!("{} Ad Hoc", answers.name),
                 "ios_app_adhoc",
                 "app",
                 &["distribution"],
-                &[ASC_IOS_DEVICE_ID],
+                &[device.logical_id],
             ),
             "app-store": asc_profile(
-                format!("{name} App Store"),
+                format!("{} App Store", answers.name),
                 "ios_app_store",
                 "app",
                 &["distribution"],
@@ -450,37 +557,36 @@ fn ios_asc_manifest(name: &str, bundle_id: &str) -> JsonValue {
     })
 }
 
-fn tvos_asc_manifest(name: &str, bundle_id: &str) -> JsonValue {
+fn tvos_asc_manifest(answers: &InitAnswers) -> JsonValue {
+    let device = required_device(answers, ASC_TVOS_DEVICE_ID);
     json!({
         "$schema": asc_sync::schema::PUBLISHED_SCHEMA_URL,
-        "team_id": ASC_TEAM_ID_PLACEHOLDER,
+        "team_id": answers.asc_team_id,
         "bundle_ids": {
-            "app": asc_bundle_id(bundle_id, name, "ios")
+            "app": asc_bundle_id(&answers.bundle_id, &answers.name, "ios")
         },
-        "devices": {
-            (ASC_TVOS_DEVICE_ID): asc_device("tvos", ASC_TVOS_DEVICE_UDID, "Your Apple TV")
-        },
+        "devices": asc_devices_manifest(&[device]),
         "certs": {
-            "development": asc_cert("development", format!("{name} Development")),
-            "distribution": asc_cert("distribution", format!("{name} Distribution"))
+            "development": asc_cert("development", format!("{} Development", answers.name)),
+            "distribution": asc_cert("distribution", format!("{} Distribution", answers.name))
         },
         "profiles": {
             "app-development": asc_profile(
-                format!("{name} Development"),
+                format!("{} Development", answers.name),
                 "tvos_app_development",
                 "app",
                 &["development"],
-                &[ASC_TVOS_DEVICE_ID],
+                &[device.logical_id],
             ),
             "app-adhoc": asc_profile(
-                format!("{name} Ad Hoc"),
+                format!("{} Ad Hoc", answers.name),
                 "tvos_app_adhoc",
                 "app",
                 &["distribution"],
-                &[ASC_TVOS_DEVICE_ID],
+                &[device.logical_id],
             ),
             "app-store": asc_profile(
-                format!("{name} App Store"),
+                format!("{} App Store", answers.name),
                 "tvos_app_store",
                 "app",
                 &["distribution"],
@@ -490,38 +596,37 @@ fn tvos_asc_manifest(name: &str, bundle_id: &str) -> JsonValue {
     })
 }
 
-fn macos_asc_manifest(name: &str, bundle_id: &str) -> JsonValue {
+fn macos_asc_manifest(answers: &InitAnswers) -> JsonValue {
+    let device = required_device(answers, ASC_MAC_DEVICE_ID);
     json!({
         "$schema": asc_sync::schema::PUBLISHED_SCHEMA_URL,
-        "team_id": ASC_TEAM_ID_PLACEHOLDER,
+        "team_id": answers.asc_team_id,
         "bundle_ids": {
-            "app": asc_bundle_id(bundle_id, name, "mac_os")
+            "app": asc_bundle_id(&answers.bundle_id, &answers.name, "mac_os")
         },
-        "devices": {
-            (ASC_MAC_DEVICE_ID): asc_device("macos", ASC_MAC_DEVICE_UDID, "This Mac")
-        },
+        "devices": asc_devices_manifest(&[device]),
         "certs": {
-            "development": asc_cert("development", format!("{name} Development")),
-            "distribution": asc_cert("distribution", format!("{name} Distribution")),
-            "developer-id": asc_cert("developer_id_application", format!("{name} Developer ID"))
+            "development": asc_cert("development", format!("{} Development", answers.name)),
+            "distribution": asc_cert("distribution", format!("{} Distribution", answers.name)),
+            "developer-id": asc_cert("developer_id_application", format!("{} Developer ID", answers.name))
         },
         "profiles": {
             "app-development": asc_profile(
-                format!("{name} Development"),
+                format!("{} Development", answers.name),
                 "mac_app_development",
                 "app",
                 &["development"],
-                &[ASC_MAC_DEVICE_ID],
+                &[device.logical_id],
             ),
             "app-store": asc_profile(
-                format!("{name} Mac App Store"),
+                format!("{} Mac App Store", answers.name),
                 "mac_app_store",
                 "app",
                 &["distribution"],
                 &[],
             ),
             "developer-id": asc_profile(
-                format!("{name} Developer ID"),
+                format!("{} Developer ID", answers.name),
                 "mac_app_direct",
                 "app",
                 &["developer-id"],
@@ -531,60 +636,59 @@ fn macos_asc_manifest(name: &str, bundle_id: &str) -> JsonValue {
     })
 }
 
-fn multiplatform_asc_manifest(name: &str, bundle_id: &str) -> JsonValue {
+fn multiplatform_asc_manifest(answers: &InitAnswers) -> JsonValue {
+    let ios_device = required_device(answers, ASC_IOS_DEVICE_ID);
+    let mac_device = required_device(answers, ASC_MAC_DEVICE_ID);
     json!({
         "$schema": asc_sync::schema::PUBLISHED_SCHEMA_URL,
-        "team_id": ASC_TEAM_ID_PLACEHOLDER,
+        "team_id": answers.asc_team_id,
         "bundle_ids": {
-            "app": asc_bundle_id(bundle_id, name, "universal")
+            "app": asc_bundle_id(&answers.bundle_id, &answers.name, "universal")
         },
-        "devices": {
-            (ASC_IOS_DEVICE_ID): asc_device("ios", ASC_IOS_DEVICE_UDID, "Your iPhone"),
-            (ASC_MAC_DEVICE_ID): asc_device("macos", ASC_MAC_DEVICE_UDID, "This Mac")
-        },
+        "devices": asc_devices_manifest(&[ios_device, mac_device]),
         "certs": {
-            "development": asc_cert("development", format!("{name} Development")),
-            "distribution": asc_cert("distribution", format!("{name} Distribution")),
-            "developer-id": asc_cert("developer_id_application", format!("{name} Developer ID"))
+            "development": asc_cert("development", format!("{} Development", answers.name)),
+            "distribution": asc_cert("distribution", format!("{} Distribution", answers.name)),
+            "developer-id": asc_cert("developer_id_application", format!("{} Developer ID", answers.name))
         },
         "profiles": {
             "ios-development": asc_profile(
-                format!("{name} iOS Development"),
+                format!("{} iOS Development", answers.name),
                 "ios_app_development",
                 "app",
                 &["development"],
-                &[ASC_IOS_DEVICE_ID],
+                &[ios_device.logical_id],
             ),
             "ios-adhoc": asc_profile(
-                format!("{name} iOS Ad Hoc"),
+                format!("{} iOS Ad Hoc", answers.name),
                 "ios_app_adhoc",
                 "app",
                 &["distribution"],
-                &[ASC_IOS_DEVICE_ID],
+                &[ios_device.logical_id],
             ),
             "ios-app-store": asc_profile(
-                format!("{name} iOS App Store"),
+                format!("{} iOS App Store", answers.name),
                 "ios_app_store",
                 "app",
                 &["distribution"],
                 &[],
             ),
             "mac-development": asc_profile(
-                format!("{name} Mac Development"),
+                format!("{} Mac Development", answers.name),
                 "mac_app_development",
                 "app",
                 &["development"],
-                &[ASC_MAC_DEVICE_ID],
+                &[mac_device.logical_id],
             ),
             "mac-app-store": asc_profile(
-                format!("{name} Mac App Store"),
+                format!("{} Mac App Store", answers.name),
                 "mac_app_store",
                 "app",
                 &["distribution"],
                 &[],
             ),
             "developer-id": asc_profile(
-                format!("{name} Developer ID"),
+                format!("{} Developer ID", answers.name),
                 "mac_app_direct",
                 "app",
                 &["developer-id"],
@@ -594,49 +698,48 @@ fn multiplatform_asc_manifest(name: &str, bundle_id: &str) -> JsonValue {
     })
 }
 
-fn watch_companion_asc_manifest(name: &str, bundle_id: &str) -> JsonValue {
-    let watch_app_name = format!("{name} Watch App");
-    let watch_extension_name = format!("{name} Watch Extension");
+fn watch_companion_asc_manifest(answers: &InitAnswers) -> JsonValue {
+    let device = required_device(answers, ASC_IOS_DEVICE_ID);
+    let watch_app_name = format!("{} Watch App", answers.name);
+    let watch_extension_name = format!("{} Watch Extension", answers.name);
     json!({
         "$schema": asc_sync::schema::PUBLISHED_SCHEMA_URL,
-        "team_id": ASC_TEAM_ID_PLACEHOLDER,
+        "team_id": answers.asc_team_id,
         "bundle_ids": {
-            "app": asc_bundle_id(bundle_id, name, "ios"),
+            "app": asc_bundle_id(&answers.bundle_id, &answers.name, "ios"),
             "watch-app": asc_bundle_id(
-                &format!("{bundle_id}.watchkitapp"),
+                &format!("{}.watchkitapp", answers.bundle_id),
                 &watch_app_name,
                 "ios",
             ),
             "watch-extension": asc_bundle_id(
-                &format!("{bundle_id}.watchkitapp.watchkitextension"),
+                &format!("{}.watchkitapp.watchkitextension", answers.bundle_id),
                 &watch_extension_name,
                 "ios",
             )
         },
-        "devices": {
-            (ASC_IOS_DEVICE_ID): asc_device("ios", ASC_IOS_DEVICE_UDID, "Your iPhone")
-        },
+        "devices": asc_devices_manifest(&[device]),
         "certs": {
-            "development": asc_cert("development", format!("{name} Development")),
-            "distribution": asc_cert("distribution", format!("{name} Distribution"))
+            "development": asc_cert("development", format!("{} Development", answers.name)),
+            "distribution": asc_cert("distribution", format!("{} Distribution", answers.name))
         },
         "profiles": {
             "app-development": asc_profile(
-                format!("{name} Development"),
+                format!("{} Development", answers.name),
                 "ios_app_development",
                 "app",
                 &["development"],
-                &[ASC_IOS_DEVICE_ID],
+                &[device.logical_id],
             ),
             "app-adhoc": asc_profile(
-                format!("{name} Ad Hoc"),
+                format!("{} Ad Hoc", answers.name),
                 "ios_app_adhoc",
                 "app",
                 &["distribution"],
-                &[ASC_IOS_DEVICE_ID],
+                &[device.logical_id],
             ),
             "app-store": asc_profile(
-                format!("{name} App Store"),
+                format!("{} App Store", answers.name),
                 "ios_app_store",
                 "app",
                 &["distribution"],
@@ -647,14 +750,14 @@ fn watch_companion_asc_manifest(name: &str, bundle_id: &str) -> JsonValue {
                 "ios_app_development",
                 "watch-app",
                 &["development"],
-                &[ASC_IOS_DEVICE_ID],
+                &[device.logical_id],
             ),
             "watch-app-adhoc": asc_profile(
                 format!("{watch_app_name} Ad Hoc"),
                 "ios_app_adhoc",
                 "watch-app",
                 &["distribution"],
-                &[ASC_IOS_DEVICE_ID],
+                &[device.logical_id],
             ),
             "watch-app-store": asc_profile(
                 format!("{watch_app_name} App Store"),
@@ -668,14 +771,14 @@ fn watch_companion_asc_manifest(name: &str, bundle_id: &str) -> JsonValue {
                 "ios_app_development",
                 "watch-extension",
                 &["development"],
-                &[ASC_IOS_DEVICE_ID],
+                &[device.logical_id],
             ),
             "watch-extension-adhoc": asc_profile(
                 format!("{watch_extension_name} Ad Hoc"),
                 "ios_app_adhoc",
                 "watch-extension",
                 &["distribution"],
-                &[ASC_IOS_DEVICE_ID],
+                &[device.logical_id],
             ),
             "watch-extension-store": asc_profile(
                 format!("{watch_extension_name} App Store"),
@@ -688,20 +791,20 @@ fn watch_companion_asc_manifest(name: &str, bundle_id: &str) -> JsonValue {
     })
 }
 
-fn visionos_asc_manifest(name: &str, bundle_id: &str) -> JsonValue {
+fn visionos_asc_manifest(answers: &InitAnswers) -> JsonValue {
     json!({
         "$schema": asc_sync::schema::PUBLISHED_SCHEMA_URL,
-        "team_id": ASC_TEAM_ID_PLACEHOLDER,
+        "team_id": answers.asc_team_id,
         "bundle_ids": {
-            "app": asc_bundle_id(bundle_id, name, "ios")
+            "app": asc_bundle_id(&answers.bundle_id, &answers.name, "ios")
         },
         "devices": {},
         "certs": {
-            "distribution": asc_cert("distribution", format!("{name} Distribution"))
+            "distribution": asc_cert("distribution", format!("{} Distribution", answers.name))
         },
         "profiles": {
             "app-store": asc_profile(
-                format!("{name} App Store"),
+                format!("{} App Store", answers.name),
                 "ios_app_store",
                 "app",
                 &["distribution"],
@@ -709,6 +812,14 @@ fn visionos_asc_manifest(name: &str, bundle_id: &str) -> JsonValue {
             )
         }
     })
+}
+
+fn required_device<'a>(answers: &'a InitAnswers, logical_id: &str) -> &'a InitAscDevice {
+    answers
+        .asc_devices
+        .iter()
+        .find(|device| device.logical_id == logical_id)
+        .unwrap_or_else(|| panic!("missing required init ASC device {logical_id}"))
 }
 
 fn asc_bundle_id(bundle_id: &str, name: &str, platform: &str) -> JsonValue {
@@ -719,11 +830,20 @@ fn asc_bundle_id(bundle_id: &str, name: &str, platform: &str) -> JsonValue {
     })
 }
 
-fn asc_device(family: &str, udid: &str, name: &str) -> JsonValue {
+fn asc_devices_manifest(devices: &[&InitAscDevice]) -> JsonValue {
+    JsonValue::Object(
+        devices
+            .iter()
+            .map(|device| (device.logical_id.to_owned(), asc_device(device)))
+            .collect::<JsonMap<_, _>>(),
+    )
+}
+
+fn asc_device(device: &InitAscDevice) -> JsonValue {
     json!({
-        "family": family,
-        "udid": udid,
-        "name": name
+        "family": device.family.to_string(),
+        "udid": device.udid,
+        "name": device.name
     })
 }
 
@@ -827,6 +947,24 @@ mod tests {
     use super::*;
     use crate::util::read_json_file;
 
+    const TEST_ASC_TEAM_ID: &str = "TEAM123456";
+    const TEST_IOS_UDID: &str = "00008110-0000000000000001";
+    const TEST_MAC_UDID: &str = "00000000-0000-0000-0000-000000000001";
+
+    fn test_init_device(
+        logical_id: &'static str,
+        family: DeviceFamily,
+        udid: &str,
+        name: &str,
+    ) -> InitAscDevice {
+        InitAscDevice {
+            logical_id,
+            family,
+            udid: udid.to_owned(),
+            name: name.to_owned(),
+        }
+    }
+
     #[test]
     fn gitignore_appends_bsp_entry_once() {
         let temp = tempfile::tempdir().unwrap();
@@ -861,6 +999,13 @@ mod tests {
                 name: "Example App".to_owned(),
                 bundle_id: "dev.orbit.exampleapp".to_owned(),
                 template: InitTemplate::Ios,
+                asc_team_id: TEST_ASC_TEAM_ID.to_owned(),
+                asc_devices: vec![test_init_device(
+                    ASC_IOS_DEVICE_ID,
+                    DeviceFamily::Ios,
+                    TEST_IOS_UDID,
+                    "Your iPhone",
+                )],
             },
             schema_path,
         );
@@ -881,7 +1026,8 @@ mod tests {
                 "resources": ["Resources"],
                 "asc": {
                     "$schema": asc_sync::schema::PUBLISHED_SCHEMA_URL,
-                    "team_id": ASC_TEAM_ID_PLACEHOLDER,
+                    "_description": ASC_MANIFEST_DESCRIPTION,
+                    "team_id": TEST_ASC_TEAM_ID,
                     "bundle_ids": {
                         "app": {
                             "bundle_id": "dev.orbit.exampleapp",
@@ -892,7 +1038,7 @@ mod tests {
                     "devices": {
                         (ASC_IOS_DEVICE_ID): {
                             "family": "ios",
-                            "udid": ASC_IOS_DEVICE_UDID,
+                            "udid": TEST_IOS_UDID,
                             "name": "Your iPhone"
                         }
                     },
@@ -957,6 +1103,13 @@ mod tests {
                 name: "Example App".to_owned(),
                 bundle_id: "dev.orbit.exampleapp".to_owned(),
                 template: InitTemplate::IosWatchCompanion,
+                asc_team_id: TEST_ASC_TEAM_ID.to_owned(),
+                asc_devices: vec![test_init_device(
+                    ASC_IOS_DEVICE_ID,
+                    DeviceFamily::Ios,
+                    TEST_IOS_UDID,
+                    "Your iPhone",
+                )],
             },
             schema_path,
         );
@@ -987,7 +1140,8 @@ mod tests {
                 },
                 "asc": {
                     "$schema": asc_sync::schema::PUBLISHED_SCHEMA_URL,
-                    "team_id": ASC_TEAM_ID_PLACEHOLDER,
+                    "_description": ASC_MANIFEST_DESCRIPTION,
+                    "team_id": TEST_ASC_TEAM_ID,
                     "bundle_ids": {
                         "app": {
                             "bundle_id": "dev.orbit.exampleapp",
@@ -1008,7 +1162,7 @@ mod tests {
                     "devices": {
                         (ASC_IOS_DEVICE_ID): {
                             "family": "ios",
-                            "udid": ASC_IOS_DEVICE_UDID,
+                            "udid": TEST_IOS_UDID,
                             "name": "Your iPhone"
                         }
                     },
@@ -1103,10 +1257,29 @@ mod tests {
                 name: "Example App".to_owned(),
                 bundle_id: "dev.orbit.exampleapp".to_owned(),
                 template: InitTemplate::AppleMultiplatform,
+                asc_team_id: TEST_ASC_TEAM_ID.to_owned(),
+                asc_devices: vec![
+                    test_init_device(
+                        ASC_IOS_DEVICE_ID,
+                        DeviceFamily::Ios,
+                        TEST_IOS_UDID,
+                        "Your iPhone",
+                    ),
+                    test_init_device(
+                        ASC_MAC_DEVICE_ID,
+                        DeviceFamily::Macos,
+                        TEST_MAC_UDID,
+                        "This Mac",
+                    ),
+                ],
             },
             "/tmp/.orbit/schemas/apple-app.v1.json",
         );
 
+        assert_eq!(
+            plan.manifest["asc"]["_description"],
+            json!(ASC_MANIFEST_DESCRIPTION)
+        );
         assert_eq!(
             plan.manifest["asc"]["bundle_ids"]["app"]["platform"],
             "universal"
@@ -1133,11 +1306,17 @@ mod tests {
                 name: "Vision Example".to_owned(),
                 bundle_id: "dev.orbit.visionexample".to_owned(),
                 template: InitTemplate::Visionos,
+                asc_team_id: TEST_ASC_TEAM_ID.to_owned(),
+                asc_devices: vec![],
             },
             "/tmp/.orbit/schemas/apple-app.v1.json",
         );
 
         assert_eq!(plan.manifest["asc"]["bundle_ids"]["app"]["platform"], "ios");
+        assert_eq!(
+            plan.manifest["asc"]["_description"],
+            json!(ASC_MANIFEST_DESCRIPTION)
+        );
         assert_eq!(
             plan.manifest["asc"]["profiles"]["app-store"]["type"],
             "ios_app_store"
@@ -1167,6 +1346,21 @@ mod tests {
                 name: "Example App".to_owned(),
                 bundle_id: "dev.orbit.exampleapp".to_owned(),
                 template: InitTemplate::AppleMultiplatform,
+                asc_team_id: TEST_ASC_TEAM_ID.to_owned(),
+                asc_devices: vec![
+                    test_init_device(
+                        ASC_IOS_DEVICE_ID,
+                        DeviceFamily::Ios,
+                        TEST_IOS_UDID,
+                        "Your iPhone",
+                    ),
+                    test_init_device(
+                        ASC_MAC_DEVICE_ID,
+                        DeviceFamily::Macos,
+                        TEST_MAC_UDID,
+                        "This Mac",
+                    ),
+                ],
             },
             "/tmp/.orbit/schemas/apple-app.v1.json",
         );

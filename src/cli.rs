@@ -94,7 +94,7 @@ pub enum Command {
     Submit(SubmitArgs),
     /// Remove local and/or remote Orbit-managed state.
     Clean(CleanArgs),
-    /// App Store Connect sync and signing utilities backed by embedded `asc` config.
+    /// App Store Connect auth, device, signing, and submission workflows backed by embedded `asc` config.
     Asc(Box<AscArgs>),
 }
 
@@ -757,7 +757,8 @@ pub struct CleanArgs {
 
 #[derive(Debug, Args)]
 #[command(
-    about = "App Store Connect sync and signing utilities backed by the embedded `asc` section in `orbit.json`."
+    about = "App Store Connect auth, device, signing, and submission workflows backed by the embedded `asc` section in `orbit.json`.",
+    after_help = "More help:\n  Use `orbit asc <command> --help` for flags, arguments, and command-specific examples.\n  For example:\n    orbit asc device add --help\n    orbit asc submit --help\n    orbit asc signing merge --help\n\nCommon workflows:\n  Check the embedded ASC config:\n    orbit asc validate\n    orbit asc plan\n\n  Apply ASC-managed signing state:\n    orbit asc apply\n\n  Add the current Mac as a development device and refresh profiles:\n    orbit asc device add-local --current-mac --apply\n\n  Register an iPhone and refresh profiles:\n    orbit asc device add --name \"My iPhone\" --apply\n\n  Print Xcode-style build settings from installed profiles:\n    orbit asc signing print-build-settings\n\n  Submit an artifact directly through ASC:\n    orbit asc submit --file build/MyApp.ipa\n\n  Notarize a Developer ID artifact:\n    orbit asc notarize --file build/MyApp.dmg"
 )]
 #[command(arg_required_else_help = true)]
 pub struct AscArgs {
@@ -986,6 +987,22 @@ mod tests {
         assert!(help.contains("Select the packaging and signing mode"));
         assert!(help.contains("App Store and TestFlight upload artifacts"));
         assert!(help.contains("developer-id"));
+    }
+
+    #[test]
+    fn asc_help_surfaces_workflows_and_command_help_hint() {
+        let mut command = Cli::command();
+        let asc = command.find_subcommand_mut("asc").unwrap();
+        let help = asc.render_long_help().to_string();
+
+        assert!(help.contains("App Store Connect auth, device, signing, and submission workflows"));
+        assert!(help.contains("More help:"));
+        assert!(help.contains("Common workflows:"));
+        assert!(help.contains("orbit asc validate"));
+        assert!(help.contains("orbit asc apply"));
+        assert!(help.contains("orbit asc device add --name \"My iPhone\" --apply"));
+        assert!(help.contains("Use `orbit asc <command> --help`"));
+        assert!(help.contains("orbit asc submit --help"));
     }
 
     #[test]
