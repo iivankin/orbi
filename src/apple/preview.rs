@@ -15,8 +15,10 @@ use crate::apple::analysis::{
 };
 use crate::apple::build;
 use crate::apple::build::toolchain::DestinationKind;
-use crate::apple::runtime::{self, apple_platform_from_cli, build_target_for_platform};
-use crate::apple::testing::ui::backend::{IosSimulatorBackend, MacosBackend, UiBackend};
+use crate::apple::runtime::{self, apple_platform_from_cli};
+use crate::apple::simulator::{SimulatorDevice, select_simulator_device};
+use crate::apple::testing::ui::backend::{MacosBackend, UiBackend};
+use crate::apple::xcode::{SelectedXcode, xcrun_command};
 use crate::cli::{PreviewListArgs, PreviewShotArgs};
 use crate::context::{AppContext, ProjectContext, ProjectPaths};
 use crate::manifest::{
@@ -24,8 +26,8 @@ use crate::manifest::{
     TargetKind, TargetManifest, XcframeworkDependency,
 };
 use crate::util::{
-    combine_command_output, copy_file, ensure_dir, ensure_parent_dir, prompt_select, resolve_path,
-    run_command_capture, timestamp_slug, write_json_file,
+    combine_command_output, command_output_allow_failure, copy_file, ensure_dir, ensure_parent_dir,
+    prompt_select, resolve_path, run_command, run_command_capture, timestamp_slug, write_json_file,
 };
 
 const PREVIEW_HELPER_NAME: &str = "__orbi_make_preview_view";
@@ -64,6 +66,21 @@ struct GeneratedPreviewProject {
     screenshot_path: PathBuf,
     ignored_traits: Vec<String>,
     applied_traits: Vec<String>,
+}
+
+struct PreviewTargetPlan<'a> {
+    runtime_target: &'a TargetManifest,
+    source_target: &'a TargetManifest,
+}
+
+enum PreviewRuntimeBackend {
+    Simulator(SimulatorPreviewBackend),
+    Macos(Box<MacosBackend>),
+}
+
+struct SimulatorPreviewBackend {
+    device: SimulatorDevice,
+    selected_xcode: Option<SelectedXcode>,
 }
 
 pub fn list(
@@ -152,8 +169,11 @@ fn resolve_preview_platform(
         "Select a platform to preview",
     )?;
     match platform {
-        ApplePlatform::Ios | ApplePlatform::Macos => Ok(platform),
-        _ => bail!("`preview` currently supports only `--platform ios` and `--platform macos`"),
+        ApplePlatform::Ios
+        | ApplePlatform::Macos
+        | ApplePlatform::Tvos
+        | ApplePlatform::Visionos
+        | ApplePlatform::Watchos => Ok(platform),
     }
 }
 
@@ -162,12 +182,13 @@ fn discover_previews(
     analysis_project: &ProjectContext,
     platform: ApplePlatform,
 ) -> Result<Vec<DiscoveredPreview>> {
-    let app_target = build_target_for_platform(project, platform)?;
+    let preview_target_names =
+        discoverable_preview_target_names(&project.resolved_manifest, platform)?;
     let cached_artifact =
         build_cached_semantic_compilation_artifact_with_status(analysis_project, Some(platform))?;
     let mut previews = Vec::new();
     for invocation in &cached_artifact.artifact.invocations {
-        if invocation.language != "swift" || invocation.target != app_target.name {
+        if invocation.language != "swift" || !preview_target_names.contains(&invocation.target) {
             continue;
         }
         previews.extend(discover_invocation_previews(invocation)?);
@@ -179,6 +200,28 @@ fn discover_previews(
             .then(left.column.cmp(&right.column))
     });
     Ok(previews)
+}
+
+fn discoverable_preview_target_names(
+    manifest: &ResolvedManifest,
+    platform: ApplePlatform,
+) -> Result<Vec<String>> {
+    let app_target = manifest.default_build_target_for_platform(platform)?;
+    let mut names = vec![app_target.name.clone()];
+    if platform == ApplePlatform::Watchos {
+        names.extend(
+            manifest
+                .topological_targets(&app_target.name)?
+                .into_iter()
+                .filter(|target| {
+                    target.kind == TargetKind::WatchExtension && target.supports_platform(platform)
+                })
+                .map(|target| target.name.clone()),
+        );
+    }
+    names.sort();
+    names.dedup();
+    Ok(names)
 }
 
 fn discover_invocation_previews(
@@ -657,19 +700,70 @@ fn preview_location_display(root: &Path, preview: &DiscoveredPreview) -> String 
     format!("{display_path}:{}:{}", preview.line, preview.column)
 }
 
+fn preview_target_plan<'a>(
+    manifest: &'a ResolvedManifest,
+    platform: ApplePlatform,
+    preview_target_name: &str,
+) -> Result<PreviewTargetPlan<'a>> {
+    let runtime_target = manifest.default_build_target_for_platform(platform)?;
+    let source_target = manifest.resolve_target(Some(preview_target_name))?;
+
+    if !source_target.supports_platform(platform) {
+        bail!("target `{preview_target_name}` does not support platform `{platform}`");
+    }
+
+    if platform == ApplePlatform::Watchos {
+        if source_target.name == runtime_target.name {
+            return Ok(PreviewTargetPlan {
+                runtime_target,
+                source_target,
+            });
+        }
+        if source_target.kind != TargetKind::WatchExtension {
+            bail!(
+                "`preview shot --platform watchos` supports previews only in `{}` or its WatchExtension dependency",
+                runtime_target.name
+            );
+        }
+        let is_runtime_dependency = manifest
+            .topological_targets(&runtime_target.name)?
+            .into_iter()
+            .any(|target| target.name == source_target.name);
+        if !is_runtime_dependency {
+            bail!(
+                "watchOS preview target `{}` is not embedded by runtime target `{}`",
+                source_target.name,
+                runtime_target.name
+            );
+        }
+        return Ok(PreviewTargetPlan {
+            runtime_target,
+            source_target,
+        });
+    }
+
+    if source_target.name != runtime_target.name {
+        bail!(
+            "`preview shot` currently supports previews only in the default app target `{}`",
+            runtime_target.name
+        );
+    }
+    Ok(PreviewTargetPlan {
+        runtime_target,
+        source_target,
+    })
+}
+
 fn generate_preview_project(
     project: &ProjectContext,
     platform: ApplePlatform,
     preview: &DiscoveredPreview,
     output: Option<&Path>,
 ) -> Result<GeneratedPreviewProject> {
-    let app_target = build_target_for_platform(project, platform)?;
-    if preview.target_name != app_target.name {
-        bail!(
-            "`preview shot` currently supports previews only in the default app target `{}`",
-            app_target.name
-        );
-    }
+    let target_plan =
+        preview_target_plan(&project.resolved_manifest, platform, &preview.target_name)?;
+    let app_target = target_plan.runtime_target;
+    let source_target = target_plan.source_target;
 
     let run_root = project
         .project_paths
@@ -691,7 +785,7 @@ fn generate_preview_project(
     ensure_dir(&receipts_dir)?;
 
     let helper_code = render_preview_helper(preview);
-    let dependency_targets = collect_library_dependency_targets(project, app_target)?;
+    let dependency_targets = collect_library_dependency_targets(project, source_target)?;
     let mut synthetic_targets = Vec::new();
     for dependency in &dependency_targets {
         synthetic_targets.push(clone_preview_target(
@@ -711,16 +805,23 @@ fn generate_preview_project(
     let mut cloned_app_target = clone_preview_target(
         project,
         &run_root,
-        app_target,
+        source_target,
         Some(&preview.source_file),
         Some(&helper_code),
     )?;
+    cloned_app_target.name = app_target.name.clone();
+    cloned_app_target.kind = app_target.kind;
     cloned_app_target.bundle_id = format!("{}.orbi.previewshot", app_target.bundle_id);
+    cloned_app_target.display_name = app_target.display_name.clone();
+    cloned_app_target.build_number = app_target.build_number.clone();
+    cloned_app_target.platforms = app_target.platforms.clone();
     cloned_app_target.sources.push(host_source_root);
     cloned_app_target.dependencies = dependency_targets
         .iter()
         .map(|target| target.name.clone())
         .collect();
+    cloned_app_target.info_plist = app_target.info_plist.clone();
+    cloned_app_target.ios = app_target.ios.clone();
     synthetic_targets.push(cloned_app_target);
 
     let mut platforms = BTreeMap::new();
@@ -1075,7 +1176,7 @@ fn render_preview_shot(
     let outcome = build::build_for_testing_destination(project, platform, destination)?;
     ensure_parent_dir(screenshot_path)?;
     let backend = preview_backend(project, platform, &outcome.receipt)?;
-    backend.launch_app(&outcome.receipt.bundle_id, true, &[])?;
+    backend.launch_app(&outcome.receipt.bundle_id)?;
     thread::sleep(Duration::from_millis(delay_ms));
     backend.take_screenshot(screenshot_path)?;
     let _ = backend.stop_app(&outcome.receipt.bundle_id);
@@ -1093,11 +1194,117 @@ fn preview_backend(
     project: &ProjectContext,
     platform: ApplePlatform,
     receipt: &crate::apple::build::receipt::BuildReceipt,
-) -> Result<Box<dyn UiBackend>> {
+) -> Result<PreviewRuntimeBackend> {
     match platform {
-        ApplePlatform::Ios => Ok(Box::new(IosSimulatorBackend::prepare(project, receipt)?)),
-        ApplePlatform::Macos => Ok(Box::new(MacosBackend::prepare(project, receipt)?)),
-        _ => bail!("`preview shot` currently supports only iOS simulators and macOS"),
+        ApplePlatform::Ios
+        | ApplePlatform::Tvos
+        | ApplePlatform::Visionos
+        | ApplePlatform::Watchos => Ok(PreviewRuntimeBackend::Simulator(
+            SimulatorPreviewBackend::prepare(project, platform, receipt)?,
+        )),
+        ApplePlatform::Macos => Ok(PreviewRuntimeBackend::Macos(Box::new(
+            MacosBackend::prepare(project, receipt)?,
+        ))),
+    }
+}
+
+impl PreviewRuntimeBackend {
+    fn launch_app(&self, bundle_id: &str) -> Result<()> {
+        match self {
+            Self::Simulator(backend) => backend.launch_app(bundle_id),
+            Self::Macos(backend) => backend.launch_app(bundle_id, true, &[]),
+        }
+    }
+
+    fn stop_app(&self, bundle_id: &str) -> Result<()> {
+        match self {
+            Self::Simulator(backend) => backend.stop_app(bundle_id),
+            Self::Macos(backend) => backend.stop_app(bundle_id),
+        }
+    }
+
+    fn take_screenshot(&self, path: &Path) -> Result<()> {
+        match self {
+            Self::Simulator(backend) => backend.take_screenshot(path),
+            Self::Macos(backend) => backend.take_screenshot(path),
+        }
+    }
+}
+
+impl SimulatorPreviewBackend {
+    fn prepare(
+        project: &ProjectContext,
+        platform: ApplePlatform,
+        receipt: &crate::apple::build::receipt::BuildReceipt,
+    ) -> Result<Self> {
+        let backend = Self::attach(project, platform)?;
+        let mut install = xcrun_command(backend.selected_xcode.as_ref());
+        install.args([
+            "simctl",
+            "install",
+            &backend.device.udid,
+            receipt
+                .bundle_path
+                .to_str()
+                .context("bundle path contains invalid UTF-8")?,
+        ]);
+        run_command(&mut install)?;
+        Ok(backend)
+    }
+
+    fn attach(project: &ProjectContext, platform: ApplePlatform) -> Result<Self> {
+        let device = select_simulator_device(project, platform)?;
+        if !device.is_booted() {
+            let mut boot = xcrun_command(project.selected_xcode.as_ref());
+            boot.args(["simctl", "boot", &device.udid]);
+            run_command(&mut boot)?;
+        }
+
+        let mut bootstatus = xcrun_command(project.selected_xcode.as_ref());
+        bootstatus.args(["simctl", "bootstatus", &device.udid, "-b"]);
+        run_command(&mut bootstatus)?;
+
+        Ok(Self {
+            device,
+            selected_xcode: project.selected_xcode.clone(),
+        })
+    }
+
+    fn launch_app(&self, bundle_id: &str) -> Result<()> {
+        self.stop_app(bundle_id)?;
+        let mut command = xcrun_command(self.selected_xcode.as_ref());
+        command.args(["simctl", "launch", &self.device.udid, bundle_id]);
+        run_command_capture(&mut command).map(|_| ())
+    }
+
+    fn stop_app(&self, bundle_id: &str) -> Result<()> {
+        let mut command = xcrun_command(self.selected_xcode.as_ref());
+        command.args(["simctl", "terminate", &self.device.udid, bundle_id]);
+        let (success, stdout, stderr) = command_output_allow_failure(&mut command)?;
+        if success {
+            return Ok(());
+        }
+        let combined = format!("{stdout}\n{stderr}").to_ascii_lowercase();
+        if combined.contains("found nothing to terminate") || combined.contains("not running") {
+            return Ok(());
+        }
+        bail!("failed to stop `{bundle_id}` on {}", self.device.name)
+    }
+
+    fn take_screenshot(&self, path: &Path) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            ensure_dir(parent)?;
+        }
+        let mut command = xcrun_command(self.selected_xcode.as_ref());
+        command.args([
+            "simctl",
+            "io",
+            &self.device.udid,
+            "screenshot",
+            path.to_str()
+                .context("screenshot path contains invalid UTF-8")?,
+        ]);
+        run_command_capture(&mut command).map(|_| ())
     }
 }
 
@@ -1176,10 +1383,183 @@ impl TapIfEmpty for String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::{
-        extract_function_body, extract_preview_constructor, parse_macro_expansion_sections,
-        parse_preview_name, parse_preview_traits, strip_main_attribute_line, trim_common_indent,
+        discoverable_preview_target_names, extract_function_body, extract_preview_constructor,
+        parse_macro_expansion_sections, parse_preview_name, parse_preview_traits,
+        preview_target_plan, strip_main_attribute_line, trim_common_indent,
     };
+    use crate::manifest::{
+        ApplePlatform, PlatformManifest, ResolvedManifest, TargetKind, TargetManifest,
+    };
+
+    fn target(
+        name: &str,
+        kind: TargetKind,
+        platforms: Vec<ApplePlatform>,
+        dependencies: Vec<&str>,
+    ) -> TargetManifest {
+        TargetManifest {
+            name: name.to_owned(),
+            kind,
+            bundle_id: format!("dev.orbi.tests.{}", name.to_ascii_lowercase()),
+            display_name: None,
+            build_number: None,
+            platforms,
+            sources: Vec::new(),
+            resources: Vec::new(),
+            dependencies: dependencies.into_iter().map(ToOwned::to_owned).collect(),
+            frameworks: Vec::new(),
+            weak_frameworks: Vec::new(),
+            system_libraries: Vec::new(),
+            xcframeworks: Vec::new(),
+            swift_packages: Vec::new(),
+            info_plist: BTreeMap::new(),
+            ios: None,
+            entitlements: None,
+            push: None,
+            extension: None,
+        }
+    }
+
+    fn manifest(platforms: Vec<ApplePlatform>, targets: Vec<TargetManifest>) -> ResolvedManifest {
+        ResolvedManifest {
+            name: "PreviewTests".to_owned(),
+            version: "0.1.0".to_owned(),
+            xcode: None,
+            hooks: Default::default(),
+            tests: Default::default(),
+            quality: Default::default(),
+            platforms: platforms
+                .into_iter()
+                .map(|platform| {
+                    (
+                        platform,
+                        PlatformManifest {
+                            deployment_target: "1.0".to_owned(),
+                            universal_binary: false,
+                        },
+                    )
+                })
+                .collect(),
+            targets,
+        }
+    }
+
+    #[test]
+    fn watchos_discovery_includes_watch_extension_dependency() {
+        let manifest = manifest(
+            vec![ApplePlatform::Watchos],
+            vec![
+                target(
+                    "WatchExtension",
+                    TargetKind::WatchExtension,
+                    vec![ApplePlatform::Watchos],
+                    vec![],
+                ),
+                target(
+                    "WatchApp",
+                    TargetKind::WatchApp,
+                    vec![ApplePlatform::Watchos],
+                    vec!["WatchExtension"],
+                ),
+            ],
+        );
+
+        let names = discoverable_preview_target_names(&manifest, ApplePlatform::Watchos).unwrap();
+
+        assert_eq!(names, vec!["WatchApp", "WatchExtension"]);
+    }
+
+    #[test]
+    fn watch_extension_preview_uses_watch_app_runtime_target() {
+        let manifest = manifest(
+            vec![ApplePlatform::Watchos],
+            vec![
+                target(
+                    "WatchExtension",
+                    TargetKind::WatchExtension,
+                    vec![ApplePlatform::Watchos],
+                    vec![],
+                ),
+                target(
+                    "WatchApp",
+                    TargetKind::WatchApp,
+                    vec![ApplePlatform::Watchos],
+                    vec!["WatchExtension"],
+                ),
+            ],
+        );
+
+        let plan =
+            preview_target_plan(&manifest, ApplePlatform::Watchos, "WatchExtension").unwrap();
+
+        assert_eq!(plan.runtime_target.name, "WatchApp");
+        assert_eq!(plan.source_target.name, "WatchExtension");
+    }
+
+    #[test]
+    fn tvos_discovery_uses_app_target() {
+        let manifest = manifest(
+            vec![ApplePlatform::Tvos],
+            vec![target(
+                "TVApp",
+                TargetKind::App,
+                vec![ApplePlatform::Tvos],
+                vec![],
+            )],
+        );
+
+        let names = discoverable_preview_target_names(&manifest, ApplePlatform::Tvos).unwrap();
+
+        assert_eq!(names, vec!["TVApp"]);
+    }
+
+    #[test]
+    fn visionos_discovery_uses_app_target() {
+        let manifest = manifest(
+            vec![ApplePlatform::Visionos],
+            vec![target(
+                "VisionApp",
+                TargetKind::App,
+                vec![ApplePlatform::Visionos],
+                vec![],
+            )],
+        );
+
+        let names = discoverable_preview_target_names(&manifest, ApplePlatform::Visionos).unwrap();
+
+        assert_eq!(names, vec!["VisionApp"]);
+    }
+
+    #[test]
+    fn non_watch_preview_rejects_non_runtime_target() {
+        let manifest = manifest(
+            vec![ApplePlatform::Tvos],
+            vec![
+                target(
+                    "Helper",
+                    TargetKind::Framework,
+                    vec![ApplePlatform::Tvos],
+                    vec![],
+                ),
+                target(
+                    "TVApp",
+                    TargetKind::App,
+                    vec![ApplePlatform::Tvos],
+                    vec!["Helper"],
+                ),
+            ],
+        );
+
+        let error = preview_target_plan(&manifest, ApplePlatform::Tvos, "Helper")
+            .err()
+            .unwrap()
+            .to_string();
+
+        assert!(error.contains("default app target `TVApp`"));
+    }
 
     #[test]
     fn parses_preview_sections_from_macro_output() {

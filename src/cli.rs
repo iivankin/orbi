@@ -179,6 +179,9 @@ pub enum PreviewCommand {
 }
 
 #[derive(Debug, Args)]
+#[command(
+    after_help = "Supported platforms: ios, macos, tvos, visionos, watchos.\nwatchOS preview discovery includes the WatchApp target and its embedded WatchExtension dependency."
+)]
 pub struct PreviewListArgs {
     #[arg(
         long,
@@ -190,6 +193,9 @@ pub struct PreviewListArgs {
 }
 
 #[derive(Debug, Args)]
+#[command(
+    after_help = "Supported platforms: ios, macos, tvos, visionos, watchos.\nwatchOS preview discovery includes the WatchApp target and its embedded WatchExtension dependency."
+)]
 pub struct PreviewShotArgs {
     #[arg(
         long,
