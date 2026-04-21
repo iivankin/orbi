@@ -10,7 +10,7 @@ pub(crate) mod ui;
 use crate::apple::build::external::resolve_swift_package_dependency;
 use crate::cli::TestArgs;
 use crate::context::ProjectContext;
-use crate::manifest::{SwiftPackageDependency, SwiftPackageSource, TargetManifest};
+use crate::manifest::{ApplePlatform, SwiftPackageDependency, SwiftPackageSource, TargetManifest};
 use crate::util::{
     collect_files_with_extensions, ensure_dir, print_success, resolve_path, run_command,
 };
@@ -152,6 +152,7 @@ fn materialize_swift_testing_package(
     let package_manifest = render_package_manifest(
         root_target.name.as_str(),
         test_target_name.as_str(),
+        swift_testing_macos_deployment_target(project),
         &app_layout,
         &test_layout,
         &package_dependencies,
@@ -288,6 +289,7 @@ fn resolve_package_dependencies(
 fn render_package_manifest(
     app_target_name: &str,
     test_target_name: &str,
+    macos_deployment_target: &str,
     app_layout: &GeneratedTargetLayout,
     test_layout: &GeneratedTargetLayout,
     package_dependencies: &[GeneratedPackageDependency],
@@ -317,8 +319,9 @@ fn render_package_manifest(
             .map(|dependency| dependency.target_dependency.clone()),
     );
     format!(
-        "// swift-tools-version: 6.0\nimport PackageDescription\n\nlet package = Package(\n    name: {package_name},\n{dependency_section}    targets: [\n{app_target},\n{test_target}\n    ]\n)\n",
+        "// swift-tools-version: 6.0\nimport PackageDescription\n\nlet package = Package(\n    name: {package_name},\n    platforms: [.macOS({macos_deployment_target})],\n{dependency_section}    targets: [\n{app_target},\n{test_target}\n    ]\n)\n",
         package_name = swift_string_literal(GENERATED_PACKAGE_NAME),
+        macos_deployment_target = swift_string_literal(macos_deployment_target),
         dependency_section = dependency_section,
         app_target = render_target_block(
             "executableTarget",
@@ -338,6 +341,15 @@ fn render_package_manifest(
             test_layout
         )
     )
+}
+
+fn swift_testing_macos_deployment_target(project: &ProjectContext) -> &str {
+    project
+        .resolved_manifest
+        .platforms
+        .get(&ApplePlatform::Macos)
+        .map(|platform| platform.deployment_target.as_str())
+        .unwrap_or("15.0")
 }
 
 fn render_target_block(
@@ -508,6 +520,7 @@ mod tests {
         let manifest = render_package_manifest(
             "ExampleApp",
             "ExampleAppUnitTests",
+            "15.0",
             &GeneratedTargetLayout {
                 target_path: "Targets/ExampleApp".to_owned(),
                 source_entries: vec!["Sources/input-0".to_owned()],

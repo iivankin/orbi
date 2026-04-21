@@ -2,6 +2,7 @@ mod naming;
 mod plan;
 
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 use asc_sync::{
@@ -14,7 +15,10 @@ use asc_sync::{
 use crate::apple;
 use crate::context::{AppContext, ProjectContext};
 use crate::manifest::{ApplePlatform, TargetKind};
-use crate::util::{print_success, prompt_input, prompt_select, resolve_path};
+use crate::util::{
+    command_output_allow_failure, print_success, prompt_confirm, prompt_input, prompt_select,
+    resolve_path, run_command,
+};
 
 use self::naming::{bundle_id_suffix, looks_like_bundle_id, suggested_product_name};
 use self::plan::{
@@ -54,11 +58,19 @@ pub fn execute(app: &AppContext, requested_manifest: Option<&Path>) -> Result<()
         .parent()
         .context("manifest path did not contain a parent directory")?;
     let answers = collect_init_answers(app, project_root)?;
+    let initialize_git = prompt_git_init(project_root)?;
     let schema_reference = published_schema_reference(answers.ecosystem);
     let plan = scaffold_plan(&answers, &schema_reference);
 
     create_scaffold(project_root, &manifest_path, &plan)?;
     print_success(format!("Created {}", manifest_path.display()));
+    if initialize_git {
+        initialize_git_repository(project_root)?;
+        print_success(format!(
+            "Initialized Git repository in {}",
+            project_root.display()
+        ));
+    }
     let bsp_path = apple::bsp::install_connection_file_for_manifest(&manifest_path)?;
     print_success(format!("Installed {}", bsp_path.display()));
 
@@ -75,6 +87,49 @@ fn init_manifest_path(app: &AppContext, requested_manifest: Option<&Path>) -> Pa
         || app.cwd.join("orbi.json"),
         |path| resolve_path(&app.cwd, path),
     )
+}
+
+fn prompt_git_init(project_root: &Path) -> Result<bool> {
+    if is_inside_git_work_tree(project_root) {
+        return Ok(false);
+    }
+    prompt_confirm("Initialize a Git repository?", true)
+}
+
+fn initialize_git_repository(project_root: &Path) -> Result<()> {
+    run_command(
+        Command::new("git")
+            .arg("-C")
+            .arg(project_root)
+            .args(["init", "-q"]),
+    )
+    .with_context(|| {
+        format!(
+            "failed to initialize Git repository in {}",
+            project_root.display()
+        )
+    })
+}
+
+fn is_inside_git_work_tree(path: &Path) -> bool {
+    let Some(directory) = nearest_existing_directory(path) else {
+        return false;
+    };
+    let Ok((true, stdout, _)) = command_output_allow_failure(
+        Command::new("git")
+            .arg("-C")
+            .arg(directory)
+            .args(["rev-parse", "--is-inside-work-tree"]),
+    ) else {
+        return false;
+    };
+    stdout.trim() == "true"
+}
+
+fn nearest_existing_directory(path: &Path) -> Option<PathBuf> {
+    path.ancestors()
+        .find(|candidate| candidate.is_dir())
+        .map(Path::to_path_buf)
 }
 
 fn collect_init_answers(_app: &AppContext, project_root: &Path) -> Result<InitAnswers> {
@@ -446,5 +501,29 @@ fn prompt_validated(
             return Ok(value.to_owned());
         }
         println!("{error_message}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{initialize_git_repository, is_inside_git_work_tree, nearest_existing_directory};
+
+    #[test]
+    fn nearest_existing_directory_uses_existing_parent_for_nested_init_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let nested_manifest_parent = temp.path().join("nested/project");
+
+        assert_eq!(
+            nearest_existing_directory(&nested_manifest_parent).as_deref(),
+            Some(temp.path())
+        );
+    }
+
+    #[test]
+    fn git_work_tree_detection_sees_parent_repository_for_missing_project_root() {
+        let temp = tempfile::tempdir().unwrap();
+        initialize_git_repository(temp.path()).unwrap();
+
+        assert!(is_inside_git_work_tree(&temp.path().join("nested/project")));
     }
 }

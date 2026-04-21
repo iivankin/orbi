@@ -8,18 +8,27 @@ use serde_json::{Map as JsonMap, Value as JsonValue, json};
 use crate::manifest::ManifestSchema;
 use crate::util::{ensure_dir, ensure_parent_dir, resolve_path, write_json_file};
 
-use super::naming::swift_type_name;
+use super::naming::swift_module_name;
 
 const DEFAULT_VERSION: &str = "1.0.0";
 const DEFAULT_BUILD: u64 = 1;
 const DEFAULT_SOURCE_DIR: &str = "Sources/App";
 const DEFAULT_RESOURCES_DIR: &str = "Resources";
+const DEFAULT_UNIT_TESTS_DIR: &str = "Tests/Unit";
+const DEFAULT_UI_TESTS_DIR: &str = "Tests/UI";
 const DEFAULT_WATCH_APP_SOURCE_DIR: &str = "Sources/WatchApp";
 const DEFAULT_WATCH_EXTENSION_SOURCE_DIR: &str = "Sources/WatchExtension";
 const HOME_VIEW_NAME: &str = "HomeView";
 const HOME_VIEW_CONTROLLER_NAME: &str = "HomeViewController";
-const MANIFEST_DESCRIPTION: &str = "This file is documented by its `$schema`. Start with `orbi --help` for the common workflow and `orbi ui init --help` for scaffolding `tests.ui` flows.";
+const MANIFEST_DESCRIPTION: &str = "This file is documented by its `$schema`. Start with `orbi test` for the scaffolded unit tests and `orbi test --ui --platform ...` for scaffolded UI flows.";
 const ASC_MANIFEST_DESCRIPTION: &str = "This embedded config is documented by its `$schema`. Start with `orbi asc --help` for the common workflow.";
+const UI_FLOW_SCHEMA_URL: &str = concat!(
+    "https://orbitstorage.dev/schemas/orbi-ui-test.v1-orbi-",
+    env!("CARGO_PKG_VERSION"),
+    ".json"
+);
+const AGENTS_FILE_NAME: &str = "AGENTS.md";
+const AGENTS_FILE_CONTENTS: &str = "Use recommendations from `orbi --help`\n";
 const ASC_IOS_DEVICE_ID: &str = "local-ios-device";
 const ASC_TVOS_DEVICE_ID: &str = "local-apple-tv";
 const ASC_MAC_DEVICE_ID: &str = "local-mac";
@@ -358,24 +367,29 @@ fn ios_uikit_plan(
     schema_reference: &str,
     template: &AppTemplateSpec,
 ) -> ScaffoldPlan {
-    let swift_name = swift_type_name(&answers.name);
+    let module_name = swift_module_name(&answers.name);
     ScaffoldPlan {
         manifest: app_manifest(answers, schema_reference, template.platforms),
         directories: base_directories(),
-        files: vec![
-            generated_file(
-                "Sources/App/App.swift",
-                uikit_app_file_contents(&format!("{swift_name}App"), HOME_VIEW_CONTROLLER_NAME),
-            ),
-            generated_file(
-                "Sources/App/HomeViewController.swift",
-                uikit_home_view_controller_file_contents(
-                    HOME_VIEW_CONTROLLER_NAME,
-                    template.home_view_title,
-                    template.home_view_detail,
+        files: app_scaffold_files(
+            answers,
+            &module_name,
+            template.home_view_title,
+            template.home_view_detail,
+            vec![
+                generated_file(
+                    "Sources/App/App.swift",
+                    uikit_app_file_contents(
+                        &format!("{module_name}App"),
+                        HOME_VIEW_CONTROLLER_NAME,
+                    ),
                 ),
-            ),
-        ],
+                generated_file(
+                    "Sources/App/HomeViewController.swift",
+                    uikit_home_view_controller_file_contents(HOME_VIEW_CONTROLLER_NAME),
+                ),
+            ],
+        ),
         next_commands: next_commands(answers, template.next_commands),
     }
 }
@@ -385,28 +399,30 @@ fn macos_appkit_plan(
     schema_reference: &str,
     template: &AppTemplateSpec,
 ) -> ScaffoldPlan {
-    let swift_name = swift_type_name(&answers.name);
+    let module_name = swift_module_name(&answers.name);
     ScaffoldPlan {
         manifest: app_manifest(answers, schema_reference, template.platforms),
         directories: base_directories(),
-        files: vec![
-            generated_file(
-                "Sources/App/App.swift",
-                appkit_app_file_contents(
-                    &format!("{swift_name}App"),
-                    HOME_VIEW_CONTROLLER_NAME,
-                    &answers.name,
+        files: app_scaffold_files(
+            answers,
+            &module_name,
+            template.home_view_title,
+            template.home_view_detail,
+            vec![
+                generated_file(
+                    "Sources/App/App.swift",
+                    appkit_app_file_contents(
+                        &format!("{module_name}App"),
+                        HOME_VIEW_CONTROLLER_NAME,
+                        &answers.name,
+                    ),
                 ),
-            ),
-            generated_file(
-                "Sources/App/HomeViewController.swift",
-                appkit_home_view_controller_file_contents(
-                    HOME_VIEW_CONTROLLER_NAME,
-                    template.home_view_title,
-                    template.home_view_detail,
+                generated_file(
+                    "Sources/App/HomeViewController.swift",
+                    appkit_home_view_controller_file_contents(HOME_VIEW_CONTROLLER_NAME),
                 ),
-            ),
-        ],
+            ],
+        ),
         next_commands: next_commands(answers, template.next_commands),
     }
 }
@@ -455,6 +471,7 @@ pub(super) fn create_scaffold(
     }
     ensure_gitignore_entry(project_root, ".bsp/")?;
     ensure_gitignore_entry(project_root, ".orbi/")?;
+    ensure_agents_file(project_root)?;
 
     Ok(())
 }
@@ -464,94 +481,83 @@ fn app_template_plan(
     schema_reference: &str,
     template: &AppTemplateSpec,
 ) -> ScaffoldPlan {
-    let swift_name = swift_type_name(&answers.name);
+    let module_name = swift_module_name(&answers.name);
     ScaffoldPlan {
         manifest: app_manifest(answers, schema_reference, template.platforms),
         directories: base_directories(),
-        files: vec![
-            generated_file(
-                "Sources/App/App.swift",
-                app_file_contents(&format!("{swift_name}App"), HOME_VIEW_NAME),
-            ),
-            generated_file(
-                "Sources/App/HomeView.swift",
-                home_view_file_contents(
-                    HOME_VIEW_NAME,
-                    template.home_view_title,
-                    template.home_view_detail,
+        files: app_scaffold_files(
+            answers,
+            &module_name,
+            template.home_view_title,
+            template.home_view_detail,
+            vec![
+                generated_file(
+                    "Sources/App/App.swift",
+                    app_file_contents(&format!("{module_name}App"), HOME_VIEW_NAME),
                 ),
-            ),
-        ],
+                generated_file(
+                    "Sources/App/HomeView.swift",
+                    home_view_file_contents_from_scaffold(HOME_VIEW_NAME),
+                ),
+            ],
+        ),
         next_commands: next_commands(answers, template.next_commands),
     }
 }
 
 fn watch_companion_plan(answers: &InitAnswers, schema_reference: &str) -> ScaffoldPlan {
-    let swift_name = swift_type_name(&answers.name);
+    let module_name = swift_module_name(&answers.name);
+    let phone_title = "Orbi host app";
+    let phone_detail = "Edit the host iOS app here, then run the iPhone simulator again.";
     let manifest = with_optional_scaffolded_asc(
         answers,
-        json!({
-            "$schema": schema_reference,
-            "_description": MANIFEST_DESCRIPTION,
-            "name": answers.name,
-            "bundle_id": answers.bundle_id,
-            "version": DEFAULT_VERSION,
-            "build": DEFAULT_BUILD,
-            "platforms": platform_manifest(&IOS_WATCH_PLATFORMS),
-            "sources": [DEFAULT_SOURCE_DIR],
-            "resources": [DEFAULT_RESOURCES_DIR],
-            "watch": {
-                "sources": [DEFAULT_WATCH_APP_SOURCE_DIR],
-                "extension": {
-                    "sources": [DEFAULT_WATCH_EXTENSION_SOURCE_DIR],
-                    "entry": {
-                        "class": "WatchExtensionDelegate"
-                    }
-                }
-            }
-        }),
+        watch_companion_manifest(answers, schema_reference, &module_name),
     );
     ScaffoldPlan {
         manifest,
         directories: [
             DEFAULT_SOURCE_DIR,
             DEFAULT_RESOURCES_DIR,
+            DEFAULT_UNIT_TESTS_DIR,
+            DEFAULT_UI_TESTS_DIR,
             DEFAULT_WATCH_APP_SOURCE_DIR,
             DEFAULT_WATCH_EXTENSION_SOURCE_DIR,
         ]
         .into_iter()
         .map(PathBuf::from)
         .collect(),
-        files: vec![
-            generated_file(
-                "Sources/App/App.swift",
-                app_file_contents(&format!("{swift_name}App"), "PhoneHomeView"),
-            ),
-            generated_file(
-                "Sources/App/PhoneHomeView.swift",
-                home_view_file_contents(
-                    "PhoneHomeView",
-                    "Orbi host app",
-                    "Edit the host iOS app here, then run the iPhone simulator again.",
+        files: app_scaffold_files(
+            answers,
+            &module_name,
+            phone_title,
+            phone_detail,
+            vec![
+                generated_file(
+                    "Sources/App/App.swift",
+                    app_file_contents(&format!("{module_name}App"), "PhoneHomeView"),
                 ),
-            ),
-            generated_file(
-                "Sources/WatchApp/App.swift",
-                app_file_contents(&format!("{swift_name}WatchApp"), "WatchHomeView"),
-            ),
-            generated_file(
-                "Sources/WatchApp/WatchHomeView.swift",
-                home_view_file_contents(
-                    "WatchHomeView",
-                    "Orbi watch companion",
-                    "Edit the watch UI here, then launch the watch simulator from Orbi.",
+                generated_file(
+                    "Sources/App/PhoneHomeView.swift",
+                    home_view_file_contents_from_scaffold("PhoneHomeView"),
                 ),
-            ),
-            generated_file(
-                "Sources/WatchExtension/Extension.swift",
-                watch_extension_file_contents(),
-            ),
-        ],
+                generated_file(
+                    "Sources/WatchApp/App.swift",
+                    app_file_contents(&format!("{module_name}WatchApp"), "WatchHomeView"),
+                ),
+                generated_file(
+                    "Sources/WatchApp/WatchHomeView.swift",
+                    home_view_file_contents(
+                        "WatchHomeView",
+                        "Orbi watch companion",
+                        "Edit the watch UI here, then launch the watch simulator from Orbi.",
+                    ),
+                ),
+                generated_file(
+                    "Sources/WatchExtension/Extension.swift",
+                    watch_extension_file_contents(),
+                ),
+            ],
+        ),
         next_commands: next_commands(
             answers,
             &[
@@ -567,20 +573,59 @@ fn app_manifest(
     schema_reference: &str,
     platforms: &[ManifestPlatform],
 ) -> JsonValue {
+    let module_name = swift_module_name(&answers.name);
     with_optional_scaffolded_asc(
         answers,
         json!({
             "$schema": schema_reference,
             "_description": MANIFEST_DESCRIPTION,
-            "name": answers.name,
+            "name": module_name,
+            "display_name": answers.name,
             "bundle_id": answers.bundle_id,
             "version": DEFAULT_VERSION,
             "build": DEFAULT_BUILD,
             "platforms": platform_manifest(platforms),
             "sources": [DEFAULT_SOURCE_DIR],
-            "resources": [DEFAULT_RESOURCES_DIR]
+            "resources": [DEFAULT_RESOURCES_DIR],
+            "tests": tests_manifest()
         }),
     )
+}
+
+fn watch_companion_manifest(
+    answers: &InitAnswers,
+    schema_reference: &str,
+    module_name: &str,
+) -> JsonValue {
+    json!({
+        "$schema": schema_reference,
+        "_description": MANIFEST_DESCRIPTION,
+        "name": module_name,
+        "display_name": answers.name,
+        "bundle_id": answers.bundle_id,
+        "version": DEFAULT_VERSION,
+        "build": DEFAULT_BUILD,
+        "platforms": platform_manifest(&IOS_WATCH_PLATFORMS),
+        "sources": [DEFAULT_SOURCE_DIR],
+        "resources": [DEFAULT_RESOURCES_DIR],
+        "tests": tests_manifest(),
+        "watch": {
+            "sources": [DEFAULT_WATCH_APP_SOURCE_DIR],
+            "extension": {
+                "sources": [DEFAULT_WATCH_EXTENSION_SOURCE_DIR],
+                "entry": {
+                    "class": "WatchExtensionDelegate"
+                }
+            }
+        }
+    })
+}
+
+fn tests_manifest() -> JsonValue {
+    json!({
+        "unit": [DEFAULT_UNIT_TESTS_DIR],
+        "ui": [DEFAULT_UI_TESTS_DIR]
+    })
 }
 
 fn with_optional_scaffolded_asc(answers: &InitAnswers, mut manifest: JsonValue) -> JsonValue {
@@ -611,6 +656,7 @@ fn next_commands(answers: &InitAnswers, template_commands: &[&str]) -> Vec<Strin
     if answers.asc.is_some() {
         commands.push("orbi asc apply".to_owned());
     }
+    commands.push("orbi test".to_owned());
     commands.extend(template_commands.iter().map(ToString::to_string));
     commands
 }
@@ -1009,10 +1055,15 @@ fn platform_manifest(platforms: &[ManifestPlatform]) -> JsonValue {
 }
 
 fn base_directories() -> Vec<PathBuf> {
-    [DEFAULT_SOURCE_DIR, DEFAULT_RESOURCES_DIR]
-        .into_iter()
-        .map(PathBuf::from)
-        .collect()
+    [
+        DEFAULT_SOURCE_DIR,
+        DEFAULT_RESOURCES_DIR,
+        DEFAULT_UNIT_TESTS_DIR,
+        DEFAULT_UI_TESTS_DIR,
+    ]
+    .into_iter()
+    .map(PathBuf::from)
+    .collect()
 }
 
 fn generated_file(path: &str, contents: String) -> GeneratedFile {
@@ -1020,6 +1071,30 @@ fn generated_file(path: &str, contents: String) -> GeneratedFile {
         path: PathBuf::from(path),
         contents,
     }
+}
+
+fn app_scaffold_files(
+    answers: &InitAnswers,
+    module_name: &str,
+    title: &str,
+    detail: &str,
+    source_files: Vec<GeneratedFile>,
+) -> Vec<GeneratedFile> {
+    let mut files = Vec::with_capacity(source_files.len() + 3);
+    files.push(generated_file(
+        "Sources/App/AppScaffold.swift",
+        app_scaffold_file_contents(title, detail),
+    ));
+    files.extend(source_files);
+    files.push(generated_file(
+        "Tests/Unit/AppTests.swift",
+        unit_test_file_contents(module_name, title),
+    ));
+    files.push(generated_file(
+        "Tests/UI/smoke.json",
+        ui_smoke_flow_contents(&answers.bundle_id, title),
+    ));
+    files
 }
 
 fn ensure_gitignore_entry(project_root: &Path, entry: &str) -> Result<()> {
@@ -1050,9 +1125,74 @@ fn ensure_gitignore_entry(project_root: &Path, entry: &str) -> Result<()> {
         .with_context(|| format!("failed to write {}", gitignore_path.display()))
 }
 
+fn ensure_agents_file(project_root: &Path) -> Result<()> {
+    let agents_path = project_root.join(AGENTS_FILE_NAME);
+    if agents_path.exists() {
+        return Ok(());
+    }
+    fs::write(&agents_path, AGENTS_FILE_CONTENTS)
+        .with_context(|| format!("failed to write {}", agents_path.display()))
+}
+
+fn app_scaffold_file_contents(title: &str, detail: &str) -> String {
+    format!(
+        "enum AppScaffold {{\n    static let title = {title}\n    static let detail = {detail}\n}}\n",
+        title = swift_string_literal(title),
+        detail = swift_string_literal(detail)
+    )
+}
+
+fn unit_test_file_contents(module_name: &str, expected_title: &str) -> String {
+    format!(
+        "import Testing\n@testable import {module_name}\n\n@Test func generatedScaffoldCopyIsAvailable() {{\n    #expect(AppScaffold.title == {expected_title})\n    #expect(AppScaffold.detail.isEmpty == false)\n}}\n",
+        expected_title = swift_string_literal(expected_title)
+    )
+}
+
+fn ui_smoke_flow_contents(app_id: &str, expected_title: &str) -> String {
+    let document = json!({
+        "$schema": UI_FLOW_SCHEMA_URL,
+        "appId": app_id,
+        "name": "smoke",
+        "steps": [
+            "launchApp",
+            {
+                "assertVisible": expected_title
+            }
+        ]
+    });
+    let mut contents =
+        serde_json::to_string_pretty(&document).expect("UI smoke flow must serialize as JSON");
+    contents.push('\n');
+    contents
+}
+
+fn swift_string_literal(value: &str) -> String {
+    let mut literal = String::with_capacity(value.len() + 2);
+    literal.push('"');
+    for character in value.chars() {
+        match character {
+            '\\' => literal.push_str("\\\\"),
+            '"' => literal.push_str("\\\""),
+            '\n' => literal.push_str("\\n"),
+            '\r' => literal.push_str("\\r"),
+            '\t' => literal.push_str("\\t"),
+            _ => literal.push(character),
+        }
+    }
+    literal.push('"');
+    literal
+}
+
 fn app_file_contents(app_type_name: &str, root_view_name: &str) -> String {
     format!(
         "import SwiftUI\n\n@main\nstruct {app_type_name}: App {{\n    var body: some Scene {{\n        WindowGroup {{\n            {root_view_name}()\n        }}\n    }}\n}}\n"
+    )
+}
+
+fn home_view_file_contents_from_scaffold(view_name: &str) -> String {
+    format!(
+        "import SwiftUI\n\nstruct {view_name}: View {{\n    var body: some View {{\n        VStack(spacing: 16) {{\n            Image(systemName: \"sparkles\")\n                .font(.system(size: 44))\n                .foregroundStyle(.tint)\n            Text(AppScaffold.title)\n                .font(.largeTitle.bold())\n            Text(AppScaffold.detail)\n                .multilineTextAlignment(.center)\n                .foregroundStyle(.secondary)\n        }}\n        .padding(32)\n    }}\n}}\n\n#Preview {{\n    {view_name}()\n}}\n"
     )
 }
 
@@ -1064,17 +1204,13 @@ fn home_view_file_contents(view_name: &str, title: &str, detail: &str) -> String
 
 fn uikit_app_file_contents(app_type_name: &str, root_controller_name: &str) -> String {
     format!(
-        "import UIKit\n\n@main\nfinal class {app_type_name}: UIResponder, UIApplicationDelegate {{\n    var window: UIWindow?\n\n    func application(\n        _ application: UIApplication,\n        didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?\n    ) -> Bool {{\n        let window = UIWindow(frame: UIScreen.main.bounds)\n        window.rootViewController = {root_controller_name}()\n        window.makeKeyAndVisible()\n        self.window = window\n        return true\n    }}\n}}\n"
+        "#if canImport(UIKit)\nimport UIKit\n\n@main\nfinal class {app_type_name}: UIResponder, UIApplicationDelegate {{\n    var window: UIWindow?\n\n    func application(\n        _ application: UIApplication,\n        didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?\n    ) -> Bool {{\n        let window = UIWindow(frame: UIScreen.main.bounds)\n        window.rootViewController = {root_controller_name}()\n        window.makeKeyAndVisible()\n        self.window = window\n        return true\n    }}\n}}\n#else\n@main\nstruct {app_type_name} {{\n    static func main() {{}}\n}}\n#endif\n"
     )
 }
 
-fn uikit_home_view_controller_file_contents(
-    controller_name: &str,
-    title: &str,
-    detail: &str,
-) -> String {
+fn uikit_home_view_controller_file_contents(controller_name: &str) -> String {
     format!(
-        "import UIKit\n\nfinal class {controller_name}: UIViewController {{\n    override func viewDidLoad() {{\n        super.viewDidLoad()\n        view.backgroundColor = .systemBackground\n\n        let symbolView = UIImageView(image: UIImage(systemName: \"sparkles\"))\n        symbolView.tintColor = .tintColor\n        symbolView.preferredSymbolConfiguration = UIImage.SymbolConfiguration(pointSize: 44, weight: .regular)\n\n        let titleLabel = UILabel()\n        titleLabel.text = \"{title}\"\n        titleLabel.font = .preferredFont(forTextStyle: .largeTitle)\n        titleLabel.adjustsFontForContentSizeCategory = true\n        titleLabel.textAlignment = .center\n\n        let detailLabel = UILabel()\n        detailLabel.text = \"{detail}\"\n        detailLabel.font = .preferredFont(forTextStyle: .body)\n        detailLabel.adjustsFontForContentSizeCategory = true\n        detailLabel.textColor = .secondaryLabel\n        detailLabel.textAlignment = .center\n        detailLabel.numberOfLines = 0\n\n        let stack = UIStackView(arrangedSubviews: [symbolView, titleLabel, detailLabel])\n        stack.axis = .vertical\n        stack.alignment = .center\n        stack.spacing = 16\n        stack.translatesAutoresizingMaskIntoConstraints = false\n\n        view.addSubview(stack)\n        NSLayoutConstraint.activate([\n            stack.centerXAnchor.constraint(equalTo: view.centerXAnchor),\n            stack.centerYAnchor.constraint(equalTo: view.centerYAnchor),\n            stack.leadingAnchor.constraint(greaterThanOrEqualTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 32),\n            stack.trailingAnchor.constraint(lessThanOrEqualTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -32),\n            detailLabel.widthAnchor.constraint(lessThanOrEqualToConstant: 360),\n        ])\n    }}\n}}\n\n#Preview {{\n    {controller_name}()\n}}\n"
+        "#if canImport(UIKit)\nimport UIKit\n\nfinal class {controller_name}: UIViewController {{\n    override func viewDidLoad() {{\n        super.viewDidLoad()\n        view.backgroundColor = .systemBackground\n\n        let symbolView = UIImageView(image: UIImage(systemName: \"sparkles\"))\n        symbolView.tintColor = .tintColor\n        symbolView.preferredSymbolConfiguration = UIImage.SymbolConfiguration(pointSize: 44, weight: .regular)\n\n        let titleLabel = UILabel()\n        titleLabel.text = AppScaffold.title\n        titleLabel.font = .preferredFont(forTextStyle: .largeTitle)\n        titleLabel.adjustsFontForContentSizeCategory = true\n        titleLabel.textAlignment = .center\n\n        let detailLabel = UILabel()\n        detailLabel.text = AppScaffold.detail\n        detailLabel.font = .preferredFont(forTextStyle: .body)\n        detailLabel.adjustsFontForContentSizeCategory = true\n        detailLabel.textColor = .secondaryLabel\n        detailLabel.textAlignment = .center\n        detailLabel.numberOfLines = 0\n\n        let stack = UIStackView(arrangedSubviews: [symbolView, titleLabel, detailLabel])\n        stack.axis = .vertical\n        stack.alignment = .center\n        stack.spacing = 16\n        stack.translatesAutoresizingMaskIntoConstraints = false\n\n        view.addSubview(stack)\n        NSLayoutConstraint.activate([\n            stack.centerXAnchor.constraint(equalTo: view.centerXAnchor),\n            stack.centerYAnchor.constraint(equalTo: view.centerYAnchor),\n            stack.leadingAnchor.constraint(greaterThanOrEqualTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 32),\n            stack.trailingAnchor.constraint(lessThanOrEqualTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -32),\n            detailLabel.widthAnchor.constraint(lessThanOrEqualToConstant: 360),\n        ])\n    }}\n}}\n\n#Preview {{\n    {controller_name}()\n}}\n#endif\n"
     )
 }
 
@@ -1088,13 +1224,9 @@ fn appkit_app_file_contents(
     )
 }
 
-fn appkit_home_view_controller_file_contents(
-    controller_name: &str,
-    title: &str,
-    detail: &str,
-) -> String {
+fn appkit_home_view_controller_file_contents(controller_name: &str) -> String {
     format!(
-        "import AppKit\n\nfinal class {controller_name}: NSViewController {{\n    override func loadView() {{\n        view = NSView()\n    }}\n\n    override func viewDidLoad() {{\n        super.viewDidLoad()\n\n        let eyebrowLabel = NSTextField(labelWithString: \"Orbi\")\n        eyebrowLabel.font = .systemFont(ofSize: 15, weight: .semibold)\n        eyebrowLabel.textColor = .controlAccentColor\n\n        let titleLabel = NSTextField(labelWithString: \"{title}\")\n        titleLabel.font = .systemFont(ofSize: 30, weight: .bold)\n\n        let detailLabel = NSTextField(wrappingLabelWithString: \"{detail}\")\n        detailLabel.alignment = .center\n        detailLabel.textColor = .secondaryLabelColor\n\n        let stack = NSStackView(views: [eyebrowLabel, titleLabel, detailLabel])\n        stack.orientation = .vertical\n        stack.alignment = .centerX\n        stack.spacing = 16\n        stack.translatesAutoresizingMaskIntoConstraints = false\n\n        view.addSubview(stack)\n        NSLayoutConstraint.activate([\n            stack.centerXAnchor.constraint(equalTo: view.centerXAnchor),\n            stack.centerYAnchor.constraint(equalTo: view.centerYAnchor),\n            stack.leadingAnchor.constraint(greaterThanOrEqualTo: view.leadingAnchor, constant: 32),\n            stack.trailingAnchor.constraint(lessThanOrEqualTo: view.trailingAnchor, constant: -32),\n            detailLabel.widthAnchor.constraint(lessThanOrEqualToConstant: 360),\n        ])\n    }}\n}}\n\n#Preview {{\n    {controller_name}()\n}}\n"
+        "import AppKit\n\nfinal class {controller_name}: NSViewController {{\n    override func loadView() {{\n        view = NSView()\n    }}\n\n    override func viewDidLoad() {{\n        super.viewDidLoad()\n\n        let eyebrowLabel = NSTextField(labelWithString: \"Orbi\")\n        eyebrowLabel.font = .systemFont(ofSize: 15, weight: .semibold)\n        eyebrowLabel.textColor = .controlAccentColor\n\n        let titleLabel = NSTextField(labelWithString: AppScaffold.title)\n        titleLabel.font = .systemFont(ofSize: 30, weight: .bold)\n\n        let detailLabel = NSTextField(wrappingLabelWithString: AppScaffold.detail)\n        detailLabel.alignment = .center\n        detailLabel.textColor = .secondaryLabelColor\n\n        let stack = NSStackView(views: [eyebrowLabel, titleLabel, detailLabel])\n        stack.orientation = .vertical\n        stack.alignment = .centerX\n        stack.spacing = 16\n        stack.translatesAutoresizingMaskIntoConstraints = false\n\n        view.addSubview(stack)\n        NSLayoutConstraint.activate([\n            stack.centerXAnchor.constraint(equalTo: view.centerXAnchor),\n            stack.centerYAnchor.constraint(equalTo: view.centerYAnchor),\n            stack.leadingAnchor.constraint(greaterThanOrEqualTo: view.leadingAnchor, constant: 32),\n            stack.trailingAnchor.constraint(lessThanOrEqualTo: view.trailingAnchor, constant: -32),\n            detailLabel.widthAnchor.constraint(lessThanOrEqualToConstant: 360),\n        ])\n    }}\n}}\n\n#Preview {{\n    {controller_name}()\n}}\n"
     )
 }
 
@@ -1181,7 +1313,8 @@ mod tests {
             json!({
                 "$schema": schema_path,
                 "_description": MANIFEST_DESCRIPTION,
-                "name": "Example App",
+                "name": "ExampleApp",
+                "display_name": "Example App",
                 "bundle_id": "dev.orbi.exampleapp",
                 "version": "1.0.0",
                 "build": 1,
@@ -1190,6 +1323,10 @@ mod tests {
                 },
                 "sources": ["Sources/App"],
                 "resources": ["Resources"],
+                "tests": {
+                    "unit": ["Tests/Unit"],
+                    "ui": ["Tests/UI"]
+                },
                 "asc": {
                     "$schema": asc_sync::schema::PUBLISHED_SCHEMA_URL,
                     "_description": ASC_MANIFEST_DESCRIPTION,
@@ -1250,8 +1387,11 @@ mod tests {
                 .map(|file| file.path.clone())
                 .collect::<Vec<_>>(),
             vec![
+                PathBuf::from("Sources/App/AppScaffold.swift"),
                 PathBuf::from("Sources/App/App.swift"),
                 PathBuf::from("Sources/App/HomeView.swift"),
+                PathBuf::from("Tests/Unit/AppTests.swift"),
+                PathBuf::from("Tests/UI/smoke.json"),
             ]
         );
         assert!(plan.files.iter().any(|file| {
@@ -1259,10 +1399,25 @@ mod tests {
                 && file.contents.contains("#Preview")
                 && file.contents.contains("HomeView()")
         }));
+        assert!(plan.files.iter().any(|file| {
+            file.path == Path::new("Tests/Unit/AppTests.swift")
+                && file.contents.contains("@testable import ExampleApp")
+                && file
+                    .contents
+                    .contains("#expect(AppScaffold.title == \"Orbi is ready for iOS\")")
+        }));
+        assert!(plan.files.iter().any(|file| {
+            file.path == Path::new("Tests/UI/smoke.json")
+                && file.contents.contains("\"appId\": \"dev.orbi.exampleapp\"")
+                && file
+                    .contents
+                    .contains("\"assertVisible\": \"Orbi is ready for iOS\"")
+        }));
         assert_eq!(
             plan.next_commands,
             vec![
                 "orbi asc apply".to_owned(),
+                "orbi test".to_owned(),
                 "orbi run --platform ios --simulator".to_owned()
             ]
         );
@@ -1284,7 +1439,10 @@ mod tests {
         assert!(plan.manifest.get("asc").is_none());
         assert_eq!(
             plan.next_commands,
-            vec!["orbi run --platform ios --simulator".to_owned()]
+            vec![
+                "orbi test".to_owned(),
+                "orbi run --platform ios --simulator".to_owned()
+            ]
         );
     }
 
@@ -1312,14 +1470,18 @@ mod tests {
                 .map(|file| file.path.clone())
                 .collect::<Vec<_>>(),
             vec![
+                PathBuf::from("Sources/App/AppScaffold.swift"),
                 PathBuf::from("Sources/App/App.swift"),
                 PathBuf::from("Sources/App/HomeViewController.swift"),
+                PathBuf::from("Tests/Unit/AppTests.swift"),
+                PathBuf::from("Tests/UI/smoke.json"),
             ]
         );
         assert!(plan.files.iter().any(|file| {
             file.path == Path::new("Sources/App/App.swift")
                 && file.contents.contains("import UIKit")
                 && file.contents.contains("UIApplicationDelegate")
+                && file.contents.contains("static func main() {}")
         }));
         assert!(plan.files.iter().any(|file| {
             file.path == Path::new("Sources/App/HomeViewController.swift")
@@ -1328,11 +1490,13 @@ mod tests {
                     .contains("final class HomeViewController: UIViewController")
                 && file.contents.contains("#Preview")
                 && file.contents.contains("HomeViewController()")
+                && file.contents.contains("AppScaffold.title")
         }));
         assert_eq!(
             plan.next_commands,
             vec![
                 "orbi asc apply".to_owned(),
+                "orbi test".to_owned(),
                 "orbi run --platform ios --simulator".to_owned()
             ]
         );
@@ -1362,8 +1526,11 @@ mod tests {
                 .map(|file| file.path.clone())
                 .collect::<Vec<_>>(),
             vec![
+                PathBuf::from("Sources/App/AppScaffold.swift"),
                 PathBuf::from("Sources/App/App.swift"),
                 PathBuf::from("Sources/App/HomeViewController.swift"),
+                PathBuf::from("Tests/Unit/AppTests.swift"),
+                PathBuf::from("Tests/UI/smoke.json"),
             ]
         );
         assert!(plan.files.iter().any(|file| {
@@ -1383,11 +1550,13 @@ mod tests {
                     .contains("final class HomeViewController: NSViewController")
                 && file.contents.contains("#Preview")
                 && file.contents.contains("HomeViewController()")
+                && file.contents.contains("AppScaffold.title")
         }));
         assert_eq!(
             plan.next_commands,
             vec![
                 "orbi asc apply".to_owned(),
+                "orbi test".to_owned(),
                 "orbi run --platform macos".to_owned()
             ]
         );
@@ -1417,7 +1586,8 @@ mod tests {
             json!({
                 "$schema": schema_path,
                 "_description": MANIFEST_DESCRIPTION,
-                "name": "Example App",
+                "name": "ExampleApp",
+                "display_name": "Example App",
                 "bundle_id": "dev.orbi.exampleapp",
                 "version": "1.0.0",
                 "build": 1,
@@ -1427,6 +1597,10 @@ mod tests {
                 },
                 "sources": ["Sources/App"],
                 "resources": ["Resources"],
+                "tests": {
+                    "unit": ["Tests/Unit"],
+                    "ui": ["Tests/UI"]
+                },
                 "watch": {
                     "sources": ["Sources/WatchApp"],
                     "extension": {
@@ -1688,5 +1862,30 @@ mod tests {
         let gitignore =
             std::fs::read_to_string(manifest_path.parent().unwrap().join(".gitignore")).unwrap();
         assert_eq!(gitignore, ".bsp/\n.orbi/\n");
+        let agents =
+            std::fs::read_to_string(manifest_path.parent().unwrap().join("AGENTS.md")).unwrap();
+        assert_eq!(agents, AGENTS_FILE_CONTENTS);
+    }
+
+    #[test]
+    fn create_scaffold_does_not_overwrite_existing_agents_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let manifest_path = temp.path().join("orbi.json");
+        std::fs::write(temp.path().join("AGENTS.md"), "Existing instructions\n").unwrap();
+        let plan = scaffold_plan(
+            &InitAnswers {
+                ecosystem: InitEcosystem::Apple,
+                name: "Example App".to_owned(),
+                bundle_id: "dev.orbi.exampleapp".to_owned(),
+                template: InitTemplate::Ios,
+                asc: None,
+            },
+            "/tmp/.orbi/schemas/apple-app.v1.json",
+        );
+
+        create_scaffold(temp.path(), &manifest_path, &plan).unwrap();
+
+        let agents = std::fs::read_to_string(temp.path().join("AGENTS.md")).unwrap();
+        assert_eq!(agents, "Existing instructions\n");
     }
 }

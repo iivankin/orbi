@@ -33,6 +33,14 @@ pub(super) fn swift_type_name(name: &str) -> String {
     type_name
 }
 
+pub(super) fn swift_module_name(name: &str) -> String {
+    if is_swift_identifier(name) {
+        name.to_owned()
+    } else {
+        swift_type_name(name)
+    }
+}
+
 pub(super) fn looks_like_bundle_id(value: &str) -> bool {
     let parts = value.split('.').collect::<Vec<_>>();
     parts.len() >= 2
@@ -69,4 +77,13 @@ fn is_bundle_id_component(value: &str) -> bool {
     value
         .chars()
         .all(|character| character.is_ascii_alphanumeric() || character == '-')
+}
+
+fn is_swift_identifier(value: &str) -> bool {
+    let mut characters = value.chars();
+    let Some(first) = characters.next() else {
+        return false;
+    };
+    (first.is_ascii_alphabetic() || first == '_')
+        && characters.all(|character| character.is_ascii_alphanumeric() || character == '_')
 }
