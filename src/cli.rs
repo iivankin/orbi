@@ -1355,8 +1355,22 @@ pub struct AscNotarizeArgs {
 #[derive(Debug, Subcommand)]
 pub enum AscSigningCommand {
     Import,
+    Inspect(AscSigningInspectArgs),
     PrintBuildSettings,
+    Adopt(AscSigningAdoptArgs),
     Merge(AscSigningMergeArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct AscSigningInspectArgs {
+    #[arg(long, value_name = "FILE")]
+    pub from: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+pub struct AscSigningAdoptArgs {
+    #[arg(long, value_name = "FILE")]
+    pub from: PathBuf,
 }
 
 #[derive(Debug, Args)]

@@ -3,7 +3,10 @@ use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 use std::thread;
 use std::time::Duration;
 
@@ -12,6 +15,7 @@ use base64::Engine as _;
 pub struct AscMockServer {
     pub base_url: String,
     requests: Arc<Mutex<Vec<String>>>,
+    running: Arc<AtomicBool>,
     handle: Option<thread::JoinHandle<()>>,
 }
 
@@ -21,6 +25,7 @@ impl AscMockServer {
     }
 
     pub fn shutdown(mut self) {
+        self.running.store(false, Ordering::Release);
         if let Some(handle) = self.handle.take() {
             handle.join().unwrap();
         }
@@ -58,6 +63,8 @@ pub fn spawn_asc_mock(
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let base_url = format!("http://{}", listener.local_addr().unwrap());
+    let running = Arc::new(AtomicBool::new(true));
+    let running_clone = Arc::clone(&running);
     let requests = Arc::new(Mutex::new(Vec::new()));
     let requests_clone = Arc::clone(&requests);
     let state = Arc::new(Mutex::new(AscMockState {
@@ -73,18 +80,10 @@ pub fn spawn_asc_mock(
     let app_name = app_name.to_owned();
 
     let handle = thread::spawn(move || {
-        let mut idle_polls = 0_u32;
-        loop {
+        while running_clone.load(Ordering::Acquire) {
             let (mut stream, _) = match listener.accept() {
-                Ok(connection) => {
-                    idle_polls = 0;
-                    connection
-                }
+                Ok(connection) => connection,
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    if idle_polls > 500 {
-                        break;
-                    }
-                    idle_polls += 1;
                     thread::sleep(Duration::from_millis(20));
                     continue;
                 }
@@ -133,6 +132,7 @@ pub fn spawn_asc_mock(
     AscMockServer {
         base_url,
         requests,
+        running,
         handle: Some(handle),
     }
 }

@@ -134,46 +134,6 @@ pub(super) fn delete_p12_password(account: &str) -> Result<()> {
     crate::util::command_output(&mut command).map(|_| ())
 }
 
-pub(super) fn read_certificate_common_name(path: &Path) -> Result<Option<String>> {
-    read_certificate_common_name_with_format(path, None)
-}
-
-fn read_certificate_common_name_with_format(
-    path: &Path,
-    inform: Option<&str>,
-) -> Result<Option<String>> {
-    let mut command = Command::new("openssl");
-    command.arg("x509");
-    if let Some(inform) = inform {
-        command.args(["-inform", inform]);
-    }
-    command.args([
-        "-in",
-        path.to_str()
-            .context("certificate path contains invalid UTF-8")?,
-        "-noout",
-        "-subject",
-    ]);
-    let output = crate::util::command_output(&mut command)?;
-    Ok(parse_certificate_common_name(output.trim()))
-}
-
-pub(super) fn parse_certificate_common_name(subject: &str) -> Option<String> {
-    subject
-        .split(',')
-        .find_map(|segment| {
-            let segment = segment.trim();
-            segment
-                .strip_prefix("subject=")
-                .unwrap_or(segment)
-                .trim()
-                .strip_prefix("CN = ")
-                .or_else(|| segment.trim().strip_prefix("CN="))
-                .map(ToOwned::to_owned)
-        })
-        .filter(|value| !value.is_empty())
-}
-
 pub(super) fn parse_codesigning_identity_line(line: &str) -> Option<(String, String)> {
     let quote_start = line.find('"')?;
     let quote_end = line[quote_start + 1..].find('"')?;
@@ -240,7 +200,6 @@ fn keychain_certificate_records(keychain_path: &str) -> Result<Vec<(String, Stri
 
 pub(super) fn recover_system_keychain_identity(
     serial_number: &str,
-    display_name: Option<&str>,
 ) -> Result<Option<SigningIdentity>> {
     for keychain_path in user_keychain_paths()? {
         let keychain_str = keychain_path
@@ -257,26 +216,15 @@ pub(super) fn recover_system_keychain_identity(
         }
 
         for (hash, pem) in keychain_certificate_records(keychain_str)? {
-            let Some(identity_name) = identities.get(&hash) else {
+            if !identities.contains_key(&hash) {
                 continue;
-            };
+            }
             let temp = NamedTempFile::new()?;
             fs::write(temp.path(), pem.as_bytes())
                 .with_context(|| format!("failed to write {}", temp.path().display()))?;
             let local_serial = read_certificate_serial_pem(temp.path())?;
             if !local_serial.eq_ignore_ascii_case(serial_number) {
                 continue;
-            }
-            if let Some(display_name) = display_name
-                && !identity_name.contains(display_name)
-            {
-                let local_common_name = read_certificate_common_name(temp.path())?;
-                if !local_common_name
-                    .as_deref()
-                    .is_some_and(|common_name| common_name.contains(display_name))
-                {
-                    continue;
-                }
             }
             return Ok(Some(SigningIdentity {
                 hash,

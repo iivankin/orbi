@@ -210,9 +210,9 @@ fn resolve_embedded_signing_identity(
         let certificate = state.certs.get(certificate_name).with_context(|| {
             format!("ASC profile references unknown certificate `{certificate_name}`")
         })?;
-        if let Some(identity) =
-            recover_system_keychain_identity(&certificate.serial_number, Some(&certificate.name))?
-        {
+        // ASC certificate display names are not guaranteed to appear in Keychain identity names.
+        // The serial number is the stable link between the profile state and the imported cert.
+        if let Some(identity) = recover_system_keychain_identity(&certificate.serial_number)? {
             return Ok(identity);
         }
     }

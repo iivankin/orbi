@@ -788,8 +788,35 @@ orbi asc validate
 orbi asc plan
 orbi asc apply
 orbi asc signing import
+orbi asc signing inspect
 orbi asc signing print-build-settings
 ```
+
+Inspect the local signing bundle, or a bundle from another project:
+
+```sh
+orbi asc signing inspect
+orbi asc signing inspect --from ../OtherProject/signing.ascbundle
+```
+
+The inspect output prints the stored team ID, App IDs, devices, certificates, profiles, artifact
+presence, expiration status when the scope can be unlocked, and warnings for dangling references.
+It also prints a reminder when the bundle's certificates can be reused from another project with
+`orbi asc signing adopt --from ...`.
+
+Reuse signing certificates from another project bundle without carrying over that project's App IDs,
+devices, or provisioning profiles:
+
+```sh
+orbi asc signing adopt --from ../OtherProject/signing.ascbundle
+orbi asc apply
+orbi asc signing import
+```
+
+`adopt` only copies matching certificates for the same `asc.team_id`. The next `apply` creates
+profiles for the current project using those certificates, which avoids consuming another limited
+Apple certificate slot. `import` installs the reused certificate identities into Keychain and the
+new profiles into the local provisioning profiles directory when this machine needs to sign builds.
 
 Register the current machine into the embedded ASC config:
 
