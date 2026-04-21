@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-repo="${ORBI_INSTALL_REPO:-iivankin/orbit}"
+repo="${ORBI_INSTALL_REPO:-iivankin/orbi}"
 install_dir="${ORBI_INSTALL_DIR:-$HOME/.local/bin}"
 
 uname_s="$(uname -s)"

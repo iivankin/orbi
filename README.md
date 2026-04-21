@@ -13,13 +13,13 @@ automation, trace capture, signing, and App Store Connect submission. Orbi reads
 macOS and Linux:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/iivankin/orbit/master/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/iivankin/orbi/master/install.sh | bash
 ```
 
 Windows:
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://raw.githubusercontent.com/iivankin/orbit/master/install.ps | iex"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://raw.githubusercontent.com/iivankin/orbi/master/install.ps | iex"
 ```
 
 The installer puts `orbi` under `~/.local/bin` on macOS/Linux and
