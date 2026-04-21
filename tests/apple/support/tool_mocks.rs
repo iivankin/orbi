@@ -739,6 +739,9 @@ if [ "$#" -ge 2 ] && [ "$1" = "xctrace" ] && [ "$2" = "record" ]; then
   attach=""
   launch=0
   time_limit=""
+  trace_launch_id=""
+  trace_registration_path=""
+  trace_bundle_id=""
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --output)
@@ -757,7 +760,21 @@ if [ "$#" -ge 2 ] && [ "$1" = "xctrace" ] && [ "$2" = "record" ]; then
         time_limit="$2"
         shift 2
         ;;
-      --device|--env)
+      --device)
+        shift 2
+        ;;
+      --env)
+        case "$2" in
+          ORBI_MACOS_UI_TRACE_LAUNCH_ID=*)
+            trace_launch_id="${{2#ORBI_MACOS_UI_TRACE_LAUNCH_ID=}}"
+            ;;
+          ORBI_MACOS_UI_TRACE_REGISTRATION_PATH=*)
+            trace_registration_path="${{2#ORBI_MACOS_UI_TRACE_REGISTRATION_PATH=}}"
+            ;;
+          ORBI_MACOS_UI_TRACE_EXPECTED_BUNDLE_ID=*)
+            trace_bundle_id="${{2#ORBI_MACOS_UI_TRACE_EXPECTED_BUNDLE_ID=}}"
+            ;;
+        esac
         shift 2
         ;;
       --no-prompt)
@@ -786,6 +803,14 @@ if [ "$#" -ge 2 ] && [ "$1" = "xctrace" ] && [ "$2" = "record" ]; then
   fi
   mkdir -p "$output"
   printf '%s\n' "$template" > "$output/template.txt"
+  if [ -n "$trace_registration_path" ] && [ -n "$trace_launch_id" ] && [ -n "$trace_bundle_id" ]; then
+    mkdir -p "$(dirname "$trace_registration_path")"
+    printf '{{"pid":%s,"launchId":"%s","bundleId":"%s"}}\n' "$$" "$trace_launch_id" "$trace_bundle_id" > "$trace_registration_path"
+    trap 'exit 0' INT TERM
+    while :; do
+      sleep 1
+    done
+  fi
   if [ -n "$time_limit" ]; then
     exit 0
   fi
@@ -1172,7 +1197,56 @@ if [ "$#" -ge 3 ] && [ "$1" = "--sdk" ] && [ "$3" = "swiftc" ]; then
     prev="$arg"
   done
   mkdir -p "$(dirname "$out")"
-  : > "$out"
+  if [ "$(basename "$out")" = "orbi-macos-ui-driver" ]; then
+    cat > "$out" <<'SCRIPT'
+#!/bin/sh
+set -eu
+echo "orbi-macos-ui-driver $@" >> "$MOCK_LOG"
+case "${{1:-}}" in
+  doctor)
+    printf '{{"accessibilityTrusted":true,"screenCaptureAccess":true}}\n'
+    ;;
+  frontmost-application)
+    printf '{{"pid":null}}\n'
+    ;;
+  launch-app)
+    printf '{{"pid":%s}}\n' "$$"
+    ;;
+  window-info)
+    printf '{{"windowNumber":1,"frame":{{"x":0,"y":0,"width":393,"height":852}}}}\n'
+    ;;
+  describe-all)
+    printf '[]\n'
+    ;;
+  describe-point)
+    printf '{{}}\n'
+    ;;
+  bridge-ping|reopen-app|focus|activate-element|tap|move|right-click|swipe|menu-item|type-text|press-key|press-button|set-clipboard|paste-text|erase-text|hide-keyboard|wait-for-animation)
+    ;;
+  screenshot-window)
+    out=""
+    prev=""
+    for arg in "$@"; do
+      if [ "$prev" = "--output" ]; then
+        out="$arg"
+      fi
+      prev="$arg"
+    done
+    if [ -n "$out" ]; then
+      mkdir -p "$(dirname "$out")"
+      printf 'png' > "$out"
+    fi
+    ;;
+  *)
+    echo "unexpected orbi-macos-ui-driver command: $@" >&2
+    exit 1
+    ;;
+esac
+SCRIPT
+    chmod +x "$out"
+  else
+    : > "$out"
+  fi
   if [ -n "$module" ]; then
     mkdir -p "$(dirname "$module")"
     : > "$module"

@@ -171,8 +171,10 @@ fn orbi_test_ui_trace_advances_past_macos_relaunch_planning() {
     let temp = tempdir().unwrap();
     let home = create_home(temp.path());
     let mock_bin = temp.path().join("mock-bin");
+    let sdk_root = temp.path().join("sdk-root");
     let log_path = temp.path().join("mock.log");
     fs::create_dir_all(&mock_bin).unwrap();
+    create_build_xcrun_mock(&mock_bin, &sdk_root);
     let workspace = create_ui_testing_workspace(temp.path());
     set_manifest_platforms(
         workspace.join("orbi.json").as_path(),
@@ -210,10 +212,19 @@ fn orbi_test_ui_trace_advances_past_macos_relaunch_planning() {
         format_failure_output(&stderr)
     );
 
-    let report_path = latest_ui_report_path(workspace.join(".orbi/tests/ui").as_path());
+    let report_root = workspace.join(".orbi/tests/ui");
+    assert!(
+        report_root.exists(),
+        "missing UI test report root: {}",
+        format_failure_output(&stderr)
+    );
+    let report_path = latest_ui_report_path(report_root.as_path());
     let report = fs::read_to_string(&report_path).unwrap();
     assert!(report.contains("\"command\": \"launchApp\""));
     assert!(report.contains("\"error\": \"could not find `Continue`"));
+
+    let log = read_log(&log_path);
+    assert!(log.contains("xcrun xctrace record --template Time Profiler"));
 
     let profiles_dir = workspace.join(".orbi/artifacts/profiles");
     let trace_count = fs::read_dir(&profiles_dir)
