@@ -25,8 +25,54 @@ struct ResolvedSwiftToolLibrary {
     cleanup_root: Option<PathBuf>,
 }
 
+struct MacosUiArtifactSpec {
+    description: &'static str,
+    source_path: &'static str,
+    output_file_name: &'static str,
+    compiler_arguments: &'static [&'static str],
+    rust_bytes_name: &'static str,
+    rust_file_name_name: &'static str,
+    rust_available_name: &'static str,
+    rust_unavailable_reason_name: &'static str,
+}
+
 const ORBI_SWIFT_TOOLS_PREBUILT_DIR_ENV: &str = "ORBI_SWIFT_TOOLS_PREBUILT_DIR";
 const SWIFT_BUILD_PROGRESS_INTERVAL: Duration = Duration::from_secs(30);
+
+const MACOS_UI_ARTIFACT_SPECS: &[MacosUiArtifactSpec] = &[
+    MacosUiArtifactSpec {
+        description: "macOS UI helper",
+        source_path: "src/apple/testing/ui/macos_driver.swift",
+        output_file_name: "orbi-macos-ui-driver",
+        compiler_arguments: &["--sdk", "macosx", "swiftc", "-O"],
+        rust_bytes_name: "ORBI_MACOS_UI_DRIVER_BYTES",
+        rust_file_name_name: "ORBI_MACOS_UI_DRIVER_FILE_NAME",
+        rust_available_name: "ORBI_MACOS_UI_DRIVER_AVAILABLE",
+        rust_unavailable_reason_name: "ORBI_MACOS_UI_DRIVER_UNAVAILABLE_REASON",
+    },
+    MacosUiArtifactSpec {
+        description: "macOS UI bridge",
+        source_path: "src/apple/testing/ui/macos_bridge.m",
+        output_file_name: "orbi-macos-ui-bridge.dylib",
+        compiler_arguments: &[
+            "--sdk",
+            "macosx",
+            "clang",
+            "-dynamiclib",
+            "-fobjc-arc",
+            "-framework",
+            "Foundation",
+            "-framework",
+            "AppKit",
+            "-framework",
+            "CoreGraphics",
+        ],
+        rust_bytes_name: "ORBI_MACOS_UI_BRIDGE_BYTES",
+        rust_file_name_name: "ORBI_MACOS_UI_BRIDGE_FILE_NAME",
+        rust_available_name: "ORBI_MACOS_UI_BRIDGE_AVAILABLE",
+        rust_unavailable_reason_name: "ORBI_MACOS_UI_BRIDGE_UNAVAILABLE_REASON",
+    },
+];
 
 const SWIFT_TOOL_SPECS: &[SwiftToolSpec] = &[
     SwiftToolSpec {
@@ -61,12 +107,18 @@ fn main() -> Result<(), Box<dyn Error>> {
     let out_dir = PathBuf::from(env::var("OUT_DIR")?);
     emit_prebuilt_rerun_hints();
     if target_os != "macos" {
+        write_unavailable_macos_ui_artifacts(
+            &out_dir,
+            "Orbi macOS UI automation artifacts are supported only on macOS hosts",
+        )?;
         write_unavailable_swift_tools(
             &out_dir,
             "Orbi Swift quality tooling is supported only on macOS hosts",
         )?;
         return Ok(());
     }
+
+    write_macos_ui_artifacts(&manifest_dir, &out_dir)?;
 
     let profile = env::var("PROFILE")?;
     if profile == "debug" {
@@ -109,6 +161,90 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     fs::write(out_dir.join("embedded_swift_tools.rs"), generated)?;
     Ok(())
+}
+
+fn write_macos_ui_artifacts(manifest_dir: &Path, out_dir: &Path) -> Result<(), Box<dyn Error>> {
+    let artifact_dir = out_dir.join("macos-ui-artifacts");
+    fs::create_dir_all(&artifact_dir)?;
+
+    let mut generated = String::new();
+    for spec in MACOS_UI_ARTIFACT_SPECS {
+        let source_path = manifest_dir.join(spec.source_path);
+        println!("cargo:rerun-if-changed={}", source_path.display());
+        let output_path = artifact_dir.join(spec.output_file_name);
+        compile_macos_ui_artifact(&source_path, &output_path, spec)?;
+        generated.push_str(&generated_macos_ui_artifact_definition(
+            spec,
+            Some(&output_path),
+            None,
+        ));
+    }
+
+    fs::write(out_dir.join("embedded_macos_ui_artifacts.rs"), generated)?;
+    Ok(())
+}
+
+fn write_unavailable_macos_ui_artifacts(
+    out_dir: &Path,
+    reason: &str,
+) -> Result<(), Box<dyn Error>> {
+    let generated = MACOS_UI_ARTIFACT_SPECS
+        .iter()
+        .map(|spec| generated_macos_ui_artifact_definition(spec, None, Some(reason)))
+        .collect::<String>();
+    fs::write(out_dir.join("embedded_macos_ui_artifacts.rs"), generated)?;
+    Ok(())
+}
+
+fn compile_macos_ui_artifact(
+    source_path: &Path,
+    output_path: &Path,
+    spec: &MacosUiArtifactSpec,
+) -> Result<(), Box<dyn Error>> {
+    let mut command = Command::new("xcrun");
+    command.args(spec.compiler_arguments);
+    command.arg(source_path);
+    command.arg("-o");
+    command.arg(output_path);
+    let debug = debug_command(&command);
+    let output = command.output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "failed to compile {} with `{debug}`: {}\nstdout:\n{}\nstderr:\n{}",
+            spec.description,
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn generated_macos_ui_artifact_definition(
+    spec: &MacosUiArtifactSpec,
+    embedded_path: Option<&Path>,
+    unavailable_reason: Option<&str>,
+) -> String {
+    let available = embedded_path.is_some();
+    let bytes = embedded_path.map_or_else(
+        || "&[]".to_owned(),
+        |path| format!("include_bytes!(r#\"{}\"#)", path.display()),
+    );
+    let unavailable_reason = unavailable_reason.unwrap_or("");
+    format!(
+        "pub(crate) const {}: &[u8] = {bytes};\n\
+         pub(crate) const {}: &str = {:?};\n\
+         pub(crate) const {}: bool = {};\n\
+         pub(crate) const {}: &str = {:?};\n",
+        spec.rust_bytes_name,
+        spec.rust_file_name_name,
+        spec.output_file_name,
+        spec.rust_available_name,
+        available,
+        spec.rust_unavailable_reason_name,
+        unavailable_reason,
+    )
 }
 
 fn emit_prebuilt_rerun_hints() {

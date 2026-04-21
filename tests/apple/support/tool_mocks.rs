@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::{fs, path::Path};
 
 use super::write_executable;
 
@@ -101,6 +101,51 @@ esac
 const IDB_COMPANION_MOCK_SCRIPT: &str = r#"#!/bin/sh
 set -eu
 echo "idb_companion $@" >> "$MOCK_LOG"
+"#;
+
+const MACOS_UI_DRIVER_MOCK_SCRIPT: &str = r#"#!/bin/sh
+set -eu
+echo "orbi-macos-ui-driver $@" >> "$MOCK_LOG"
+case "${1:-}" in
+  doctor)
+    printf '{"accessibilityTrusted":true,"screenCaptureAccess":true}\n'
+    ;;
+  frontmost-application)
+    printf '{"pid":null}\n'
+    ;;
+  launch-app)
+    printf '{"pid":%s}\n' "$$"
+    ;;
+  window-info)
+    printf '{"windowNumber":1,"frame":{"x":0,"y":0,"width":393,"height":852}}\n'
+    ;;
+  describe-all)
+    printf '[]\n'
+    ;;
+  describe-point)
+    printf '{}\n'
+    ;;
+  bridge-ping|reopen-app|focus|activate-element|tap|move|right-click|swipe|menu-item|type-text|press-key|press-button|set-clipboard|paste-text|erase-text|hide-keyboard|wait-for-animation)
+    ;;
+  screenshot-window)
+    out=""
+    prev=""
+    for arg in "$@"; do
+      if [ "$prev" = "--output" ]; then
+        out="$arg"
+      fi
+      prev="$arg"
+    done
+    if [ -n "$out" ]; then
+      mkdir -p "$(dirname "$out")"
+      printf 'png' > "$out"
+    fi
+    ;;
+  *)
+    echo "unexpected orbi-macos-ui-driver command: $@" >&2
+    exit 1
+    ;;
+esac
 "#;
 
 pub fn create_security_mock(mock_bin: &Path, db_path: &Path) {
@@ -629,6 +674,12 @@ enum XcrunMockKind {
 }
 
 fn create_xcrun_mock(mock_bin: &Path, sdk_root: &Path, kind: XcrunMockKind) {
+    write_executable(
+        &mock_bin.join("orbi-macos-ui-driver"),
+        MACOS_UI_DRIVER_MOCK_SCRIPT,
+    );
+    fs::write(mock_bin.join("orbi-macos-ui-bridge.dylib"), b"").unwrap();
+
     let sdk_version_block = match kind {
         XcrunMockKind::Build => "  printf '%s\\n' \"18.0\"\n  exit 0",
         XcrunMockKind::Watch => {

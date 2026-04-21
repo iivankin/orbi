@@ -82,4 +82,12 @@ fn apply_test_environment(command: &mut Command, home: &Path, mock_bin: &Path, l
         ),
     );
     command.env("MOCK_LOG", log_path);
+    let macos_ui_driver = mock_bin.join("orbi-macos-ui-driver");
+    if macos_ui_driver.is_file() {
+        command.env("ORBI_INTERNAL_MACOS_UI_DRIVER_PATH", macos_ui_driver);
+    }
+    let macos_ui_bridge = mock_bin.join("orbi-macos-ui-bridge.dylib");
+    if macos_ui_bridge.is_file() {
+        command.env("ORBI_INTERNAL_MACOS_UI_BRIDGE_PATH", macos_ui_bridge);
+    }
 }

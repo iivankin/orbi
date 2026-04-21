@@ -57,6 +57,8 @@ fn lint_runs_swiftlint_and_semantic_analysis_by_default() {
     let log = read_log(&log_path);
     assert!(!log.contains("swift build --disable-keychain --package-path"));
     assert!(log.contains("orbi-swiftlint "));
+    assert!(log.contains("\"configuration_json\""));
+    assert!(log.contains("\\\"trailing_comma\\\":\\\"off\\\""));
     assert!(log.contains("xcrun --sdk iphonesimulator --show-sdk-path"));
     assert!(log.contains("\"compiler_invocations\""));
     assert!(log.contains("\"arguments\""));
@@ -575,6 +577,7 @@ fn lint_reads_orbi_json_rules_and_ignore_globs() {
         "lint": {
             "ignore": ["**/Generated/**"],
             "rules": {
+                "trailing_comma": "warn",
                 "unused_import": "error",
                 "trailing_whitespace": ["warn", { "ignores_empty_lines": true }]
             }
@@ -605,6 +608,7 @@ fn lint_reads_orbi_json_rules_and_ignore_globs() {
 
     let log = read_log(&log_path);
     assert!(log.contains("\"configuration_json\""));
+    assert!(log.contains("\\\"trailing_comma\\\":\\\"warn\\\""));
     assert!(log.contains("\\\"unused_import\\\":\\\"error\\\""));
     assert!(
         log.contains(

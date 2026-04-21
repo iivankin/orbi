@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
+use sha2::{Digest, Sha256};
 use tempfile::{TempDir, tempdir};
 
 use super::super::matching::{find_visible_element_by_selector, find_visible_scroll_container};
@@ -19,12 +20,42 @@ use super::{ActiveVideoRecording, MacosDoctorStatus, MacosWindowInfo, UiBackend}
 use crate::apple::build::pipeline::macos_executable_path;
 use crate::apple::logs::MacosInferiorLogRelay;
 use crate::apple::xcode::{
-    SelectedXcode, log_redirect_dylib_path as selected_xcode_log_redirect_dylib_path, xcrun_command,
+    SelectedXcode, log_redirect_dylib_path as selected_xcode_log_redirect_dylib_path,
 };
 use crate::context::ProjectContext;
 use crate::util::{
-    command_output, command_output_allow_failure, ensure_dir, run_command, run_command_capture,
-    timestamp_slug,
+    command_output, command_output_allow_failure, ensure_dir, run_command, timestamp_slug,
+};
+
+mod embedded_macos_ui_artifacts {
+    include!(concat!(env!("OUT_DIR"), "/embedded_macos_ui_artifacts.rs"));
+}
+
+struct EmbeddedMacosUiArtifactSpec {
+    name: &'static str,
+    file_name: &'static str,
+    bytes: &'static [u8],
+    override_env_var: &'static str,
+    available: bool,
+    unavailable_reason: &'static str,
+}
+
+const ORBI_MACOS_UI_DRIVER: EmbeddedMacosUiArtifactSpec = EmbeddedMacosUiArtifactSpec {
+    name: "orbi-macos-ui-driver",
+    file_name: embedded_macos_ui_artifacts::ORBI_MACOS_UI_DRIVER_FILE_NAME,
+    bytes: embedded_macos_ui_artifacts::ORBI_MACOS_UI_DRIVER_BYTES,
+    override_env_var: "ORBI_INTERNAL_MACOS_UI_DRIVER_PATH",
+    available: embedded_macos_ui_artifacts::ORBI_MACOS_UI_DRIVER_AVAILABLE,
+    unavailable_reason: embedded_macos_ui_artifacts::ORBI_MACOS_UI_DRIVER_UNAVAILABLE_REASON,
+};
+
+const ORBI_MACOS_UI_BRIDGE: EmbeddedMacosUiArtifactSpec = EmbeddedMacosUiArtifactSpec {
+    name: "orbi-macos-ui-bridge",
+    file_name: embedded_macos_ui_artifacts::ORBI_MACOS_UI_BRIDGE_FILE_NAME,
+    bytes: embedded_macos_ui_artifacts::ORBI_MACOS_UI_BRIDGE_BYTES,
+    override_env_var: "ORBI_INTERNAL_MACOS_UI_BRIDGE_PATH",
+    available: embedded_macos_ui_artifacts::ORBI_MACOS_UI_BRIDGE_AVAILABLE,
+    unavailable_reason: embedded_macos_ui_artifacts::ORBI_MACOS_UI_BRIDGE_UNAVAILABLE_REASON,
 };
 
 pub struct MacosBackend {
@@ -1410,42 +1441,7 @@ fn macos_modifier_flag_name(modifier: UiKeyModifier) -> &'static str {
 }
 
 fn macos_requirement_message() -> &'static str {
-    "Orbi macOS UI automation requires Accessibility access and the built-in Swift toolchain on this Mac"
-}
-
-fn should_rebuild_macos_ui_artifact(source_path: &Path, binary_path: &Path) -> Result<bool> {
-    if !binary_path.exists() {
-        return Ok(true);
-    }
-
-    let source_modified = fs::metadata(source_path)
-        .and_then(|metadata| metadata.modified())
-        .with_context(|| format!("failed to read {}", source_path.display()))?;
-    let binary_modified = fs::metadata(binary_path)
-        .and_then(|metadata| metadata.modified())
-        .with_context(|| format!("failed to read {}", binary_path.display()))?;
-    Ok(source_modified > binary_modified)
-}
-
-fn compile_macos_ui_artifact(
-    project: &ProjectContext,
-    source_path: &Path,
-    binary_path: &Path,
-    compiler_arguments: &[&str],
-    description: &str,
-) -> Result<()> {
-    let mut command = xcrun_command(project.selected_xcode.as_ref());
-    command.args(compiler_arguments);
-    command.arg(source_path);
-    command.arg("-o");
-    command.arg(binary_path);
-    let _ = run_command_capture(&mut command).with_context(|| {
-        format!(
-            "failed to compile {description} from {}",
-            source_path.display()
-        )
-    })?;
-    Ok(())
+    "Orbi macOS UI automation requires Accessibility access on this Mac"
 }
 
 fn macos_ui_bridge_launch_environment(
@@ -1503,72 +1499,108 @@ pub(crate) fn macos_doctor(project: &ProjectContext) -> Result<MacosDoctorStatus
 }
 
 fn ensure_macos_driver_binary(project: &ProjectContext) -> Result<PathBuf> {
-    let tools_dir = project.project_paths.orbi_dir.join("tools");
-    ensure_dir(&tools_dir)?;
-    let binary_path = tools_dir.join("orbi-macos-ui-driver");
-    let source_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("src")
-        .join("apple")
-        .join("testing")
-        .join("ui")
-        .join("macos_driver.swift");
-
-    if !should_rebuild_macos_ui_artifact(&source_path, &binary_path)? {
-        return Ok(binary_path);
-    }
-
-    compile_macos_ui_artifact(
-        project,
-        &source_path,
-        &binary_path,
-        &["--sdk", "macosx", "swiftc", "-O"],
-        "macOS UI helper",
-    )?;
-    Ok(binary_path)
+    ensure_embedded_macos_ui_artifact(project, &ORBI_MACOS_UI_DRIVER)
 }
 
 fn ensure_macos_bridge_dylib(project: &ProjectContext) -> Result<PathBuf> {
-    let tools_dir = project.project_paths.orbi_dir.join("tools");
-    ensure_dir(&tools_dir)?;
-    let binary_path = tools_dir.join("orbi-macos-ui-bridge.dylib");
-    let source_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("src")
-        .join("apple")
-        .join("testing")
-        .join("ui")
-        .join("macos_bridge.m");
+    ensure_embedded_macos_ui_artifact(project, &ORBI_MACOS_UI_BRIDGE)
+}
 
-    if !should_rebuild_macos_ui_artifact(&source_path, &binary_path)? {
+fn ensure_embedded_macos_ui_artifact(
+    project: &ProjectContext,
+    spec: &EmbeddedMacosUiArtifactSpec,
+) -> Result<PathBuf> {
+    if let Some(path) = std::env::var_os(spec.override_env_var) {
+        let path = PathBuf::from(path);
+        if !path.is_file() {
+            bail!(
+                "{} points to a missing macOS UI artifact: {}",
+                spec.override_env_var,
+                path.display()
+            );
+        }
+        return Ok(path);
+    }
+
+    let tools_dir = embedded_macos_ui_artifact_dir(&project.app.global_paths.cache_dir, spec);
+    ensure_embedded_macos_ui_artifact_in_dir(&tools_dir, spec)
+}
+
+fn embedded_macos_ui_artifact_dir(cache_dir: &Path, spec: &EmbeddedMacosUiArtifactSpec) -> PathBuf {
+    cache_dir.join("macos-ui-artifacts").join(format!(
+        "{}-{}",
+        spec.name,
+        embedded_macos_ui_artifact_hash(spec.bytes)
+    ))
+}
+
+fn ensure_embedded_macos_ui_artifact_in_dir(
+    tools_dir: &Path,
+    spec: &EmbeddedMacosUiArtifactSpec,
+) -> Result<PathBuf> {
+    if !spec.available {
+        bail!("{}", spec.unavailable_reason);
+    }
+
+    ensure_dir(tools_dir)?;
+    let binary_path = tools_dir.join(spec.file_name);
+    if binary_path.exists() {
         return Ok(binary_path);
     }
 
-    compile_macos_ui_artifact(
-        project,
-        &source_path,
-        &binary_path,
-        &[
-            "--sdk",
-            "macosx",
-            "clang",
-            "-dynamiclib",
-            "-fobjc-arc",
-            "-framework",
-            "Foundation",
-            "-framework",
-            "AppKit",
-            "-framework",
-            "CoreGraphics",
-        ],
-        "macOS UI bridge",
-    )?;
+    let temporary_path = tools_dir.join(format!("{}.tmp", spec.file_name));
+    fs::write(&temporary_path, spec.bytes)
+        .with_context(|| format!("failed to write {}", temporary_path.display()))?;
+    set_embedded_macos_ui_artifact_permissions(&temporary_path)?;
+    if let Err(error) = fs::rename(&temporary_path, &binary_path) {
+        if binary_path.exists() {
+            let _ = fs::remove_file(&temporary_path);
+            return Ok(binary_path);
+        }
+        return Err(error).with_context(|| {
+            format!(
+                "failed to move {} into place at {}",
+                temporary_path.display(),
+                binary_path.display()
+            )
+        });
+    }
     Ok(binary_path)
+}
+
+fn set_embedded_macos_ui_artifact_permissions(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755))
+            .with_context(|| format!("failed to update {}", path.display()))?;
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+
+    Ok(())
+}
+
+fn embedded_macos_ui_artifact_hash(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    let digest = hasher.finalize();
+    digest[..8]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        MacosBackend, macos_launch_arguments, macos_ui_bridge_launch_environment,
-        read_trace_launch_registration,
+        EmbeddedMacosUiArtifactSpec, MacosBackend, embedded_macos_ui_artifact_hash,
+        ensure_embedded_macos_ui_artifact_in_dir, macos_launch_arguments,
+        macos_ui_bridge_launch_environment, read_trace_launch_registration,
     };
     use crate::apple::testing::ui::backend::UiBackend;
     use crate::apple::xcode::SelectedXcode;
@@ -1657,6 +1689,43 @@ mod tests {
         assert_eq!(registration.pid, 4242);
         assert_eq!(registration.launch_id, "launch-1");
         assert_eq!(registration.bundle_id, "sh.orbi.desktop");
+    }
+
+    #[test]
+    fn extracts_embedded_macos_ui_artifact_into_hashed_tool_directory() {
+        let temp = tempdir().unwrap();
+        let spec = EmbeddedMacosUiArtifactSpec {
+            name: "orbi-test-helper",
+            file_name: "helper",
+            bytes: b"embedded-helper",
+            override_env_var: "ORBI_INTERNAL_TEST_HELPER_PATH",
+            available: true,
+            unavailable_reason: "",
+        };
+        let cache_dir = temp.path().join("cache");
+        let tools_dir = super::embedded_macos_ui_artifact_dir(&cache_dir, &spec);
+
+        let artifact_path = ensure_embedded_macos_ui_artifact_in_dir(&tools_dir, &spec).unwrap();
+
+        assert_eq!(
+            artifact_path,
+            cache_dir
+                .join("macos-ui-artifacts")
+                .join(format!(
+                    "{}-{}",
+                    spec.name,
+                    embedded_macos_ui_artifact_hash(spec.bytes)
+                ))
+                .join("helper")
+        );
+        assert_eq!(fs::read(&artifact_path).unwrap(), spec.bytes);
+        assert!(artifact_path.exists());
+
+        #[cfg(unix)]
+        assert_ne!(
+            fs::metadata(&artifact_path).unwrap().permissions().mode() & 0o111,
+            0
+        );
     }
 
     #[test]

@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -9,6 +10,7 @@ use crate::apple::manifest::{FormatQualityManifest, LintQualityManifest};
 use crate::context::ProjectContext;
 
 const ORBI_DEFAULT_SWIFT_FORMAT_INDENT_WIDTH: u64 = 4;
+const ORBI_DEFAULT_DISABLED_SWIFTLINT_RULES: &[&str] = &["trailing_comma"];
 
 pub(super) struct IgnoreMatcher {
     root: PathBuf,
@@ -34,15 +36,27 @@ impl LintQualityConfig {
 
 pub(super) fn lint_quality_config(project: &ProjectContext) -> Result<LintQualityConfig> {
     let quality = &project.resolved_manifest.quality.lint;
-    let configuration_json = if quality.rules.is_empty() {
+    let rules = lint_rule_configuration(&quality.rules);
+    let configuration_json = if rules.is_empty() {
         None
     } else {
-        Some(serde_json::to_string(&quality.rules).context("failed to serialize Orbi lint rules")?)
+        Some(serde_json::to_string(&rules).context("failed to serialize Orbi lint rules")?)
     };
     Ok(LintQualityConfig {
         ignore_matcher: build_ignore_matcher(&project.root, quality)?,
         configuration_json,
     })
+}
+
+fn lint_rule_configuration(
+    manifest_rules: &BTreeMap<String, JsonValue>,
+) -> BTreeMap<String, JsonValue> {
+    let mut rules = ORBI_DEFAULT_DISABLED_SWIFTLINT_RULES
+        .iter()
+        .map(|rule| ((*rule).to_owned(), JsonValue::String("off".to_owned())))
+        .collect::<BTreeMap<_, _>>();
+    rules.extend(manifest_rules.clone());
+    rules
 }
 
 pub(super) fn format_ignore_matcher(project: &ProjectContext) -> Result<Option<IgnoreMatcher>> {
