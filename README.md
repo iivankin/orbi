@@ -1,12 +1,12 @@
 # Orbi
 
-Orbi turns an Apple app into one readable manifest and one batteries-included
-local CLI.
+Orbi lets you build Apple apps from a single declarative manifest.
 
-No hand-maintained Xcode project graph. No signing maze. The everyday app
-toolchain is built in: lint, format, tests, Swift `#Preview` screenshots, UI
-automation, trace capture, signing, and App Store Connect submission. Orbi reads
-`orbi.json` and drives the whole loop from one CLI.
+Instead of wiring together Xcode projects, signing, and dozens of developer
+tools, Orbi provides one batteries-included local CLI. Lint, format, tests,
+Swift `#Preview` screenshots, UI automation, trace capture, signing, and App
+Store Connect submission all run from the same workflow. Define your app in
+`orbi.json`, and Orbi drives the rest.
 
 ## Install
 
