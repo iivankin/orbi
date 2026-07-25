@@ -1235,7 +1235,7 @@ impl PreviewRuntimeBackend {
     fn launch_app(&self, bundle_id: &str) -> Result<()> {
         match self {
             Self::Simulator(backend) => backend.launch_app(bundle_id),
-            Self::Macos(backend) => backend.launch_app(bundle_id, true, &[]),
+            Self::Macos(backend) => backend.launch_app(bundle_id, true, &[], &[]),
         }
     }
 

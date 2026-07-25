@@ -1,4 +1,4 @@
-use std::{fs, path::Path};
+use std::path::Path;
 
 use super::write_executable;
 
@@ -101,51 +101,6 @@ esac
 const IDB_COMPANION_MOCK_SCRIPT: &str = r#"#!/bin/sh
 set -eu
 echo "idb_companion $@" >> "$MOCK_LOG"
-"#;
-
-const MACOS_UI_DRIVER_MOCK_SCRIPT: &str = r#"#!/bin/sh
-set -eu
-echo "orbi-macos-ui-driver $@" >> "$MOCK_LOG"
-case "${1:-}" in
-  doctor)
-    printf '{"accessibilityTrusted":true,"screenCaptureAccess":true}\n'
-    ;;
-  frontmost-application)
-    printf '{"pid":null}\n'
-    ;;
-  launch-app)
-    printf '{"pid":%s}\n' "$$"
-    ;;
-  window-info)
-    printf '{"windowNumber":1,"frame":{"x":0,"y":0,"width":393,"height":852}}\n'
-    ;;
-  describe-all)
-    printf '[]\n'
-    ;;
-  describe-point)
-    printf '{}\n'
-    ;;
-  bridge-ping|reopen-app|focus|activate-element|tap|move|right-click|swipe|menu-item|type-text|press-key|press-button|set-clipboard|paste-text|erase-text|hide-keyboard|wait-for-animation)
-    ;;
-  screenshot-window)
-    out=""
-    prev=""
-    for arg in "$@"; do
-      if [ "$prev" = "--output" ]; then
-        out="$arg"
-      fi
-      prev="$arg"
-    done
-    if [ -n "$out" ]; then
-      mkdir -p "$(dirname "$out")"
-      printf 'png' > "$out"
-    fi
-    ;;
-  *)
-    echo "unexpected orbi-macos-ui-driver command: $@" >&2
-    exit 1
-    ;;
-esac
 "#;
 
 pub fn create_security_mock(mock_bin: &Path, db_path: &Path) {
@@ -487,6 +442,21 @@ if [ -z "$package_path" ] || [ ! -f "$package_path/Package.swift" ]; then
   echo "missing generated Package.swift" >&2
   exit 1
 fi
+if [ -n "${ORBI_TRACE_OUTPUT:-}" ] && [ "${MOCK_ORBI_TRACE_SKIP_OUTPUT:-0}" != "1" ]; then
+  mkdir -p "$(dirname "$ORBI_TRACE_OUTPUT")"
+  case "${ORBI_TRACE_MODE:-cpu}" in
+    memory|allocations)
+      cat > "$ORBI_TRACE_OUTPUT" <<'JSON'
+{"format":"orbi.trace.v1","formatVersion":1,"mode":"memory","startedAtUnixNanos":1,"host":"mock","memory":{"summary":{"totalAllocatedBytes":128,"allocationEvents":2,"liveBytes":64,"liveAllocations":1,"peakLiveBytes":128},"dropped":{"allocationRecords":0,"allocationStacks":0,"processSamples":0,"unknownFrees":0},"processMemorySamples":[],"stacks":[{"stack":["0x1000"],"totalAllocatedBytes":128,"allocationCount":2,"liveBytes":64,"liveAllocations":1,"peakLiveBytes":128}]}}
+JSON
+      ;;
+    *)
+      cat > "$ORBI_TRACE_OUTPUT" <<'JSON'
+{"format":"orbi.trace.v1","formatVersion":1,"mode":"cpu","startedAtUnixNanos":1,"host":"mock","cpu":{"sampleIntervalMicros":4500,"droppedSamples":0,"failedUnwinds":0,"processMemorySamples":[],"threads":[{"id":1,"name":"main","samples":[{"timeNanos":1,"stack":["0x1000"]}]}]}}
+JSON
+      ;;
+  esac
+fi
 "#,
     );
 }
@@ -494,6 +464,183 @@ fi
 pub fn create_idb_mock(mock_bin: &Path) {
     write_executable(&mock_bin.join("idb"), IDB_MOCK_SCRIPT);
     write_executable(&mock_bin.join("idb_companion"), IDB_COMPANION_MOCK_SCRIPT);
+}
+
+pub fn create_macos_ui_helper_mock(mock_bin: &Path) -> std::path::PathBuf {
+    let path = mock_bin.join("orbi-macos-ui-helper");
+    write_executable(
+        &path,
+        r#"#!/usr/bin/env python3
+import json
+import os
+import pathlib
+import sys
+
+LOG = pathlib.Path(os.environ["MOCK_LOG"])
+
+TREE = {
+    "AXRole": "AXApplication",
+    "AXLabel": "ExampleApp",
+    "frame": {"x": 0, "y": 0, "width": 800, "height": 600},
+    "children": [
+        {
+            "AXRole": "AXWindow",
+            "AXLabel": "Example Window",
+            "frame": {"x": 20, "y": 40, "width": 500, "height": 360},
+            "children": [
+                {
+                    "AXRole": "AXButton",
+                    "AXLabel": "Continue",
+                    "AXIdentifier": "continue-button",
+                    "frame": {"x": 40, "y": 120, "width": 200, "height": 44},
+                    "actions": ["AXPress"]
+                },
+                {
+                    "AXRole": "AXStaticText",
+                    "AXLabel": "qa@example.com",
+                    "AXIdentifier": "email-value",
+                    "AXValue": "qa@example.com",
+                    "frame": {"x": 40, "y": 180, "width": 200, "height": 44}
+                }
+            ]
+        }
+    ]
+}
+ACTIVE_RECORDING_PATH = None
+
+def log(command, params):
+    with LOG.open("a", encoding="utf-8") as handle:
+        handle.write("macos-helper " + command + " " + json.dumps(params, sort_keys=True) + "\n")
+
+def ok(request, result=None):
+    return {"id": request["id"], "ok": True, "result": result if result is not None else {}, "error": None}
+
+def fail(request, message):
+    return {"id": request.get("id", -1), "ok": False, "result": None, "error": message}
+
+def write_trace_if_requested(params):
+    if os.environ.get("MOCK_ORBI_TRACE_SKIP_OUTPUT") == "1":
+        return
+    env = {}
+    for item in params.get("environment") or []:
+        key = item.get("key")
+        value = item.get("value")
+        if isinstance(key, str) and isinstance(value, str):
+            env[key] = value
+    output = env.get("ORBI_TRACE_OUTPUT")
+    if not output:
+        return
+    path = pathlib.Path(output)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if env.get("ORBI_TRACE_MODE") in {"memory", "allocations"}:
+        path.write_text('{"format":"orbi.trace.v1","formatVersion":1,"mode":"memory","startedAtUnixNanos":1,"host":"mock","memory":{"summary":{"totalAllocatedBytes":128,"allocationEvents":2,"liveBytes":64,"liveAllocations":1,"peakLiveBytes":128},"dropped":{"allocationRecords":0,"allocationStacks":0,"processSamples":0,"unknownFrees":0},"processMemorySamples":[],"stacks":[{"stack":["0x1000"],"totalAllocatedBytes":128,"allocationCount":2,"liveBytes":64,"liveAllocationCount":1,"peakLiveBytes":128}]}}')
+    else:
+        path.write_text('{"format":"orbi.trace.v1","formatVersion":1,"mode":"cpu","startedAtUnixNanos":1,"host":"mock","cpu":{"sampleIntervalMicros":4500,"droppedSamples":0,"failedUnwinds":0,"processMemorySamples":[],"threads":[{"id":1,"name":"main","samples":[{"timeNanos":1,"stack":["0x1000"]}]}]}}')
+
+for line in sys.stdin:
+    try:
+        request = json.loads(line)
+        command = request["command"]
+        params = request.get("params") or {}
+        log(command, params)
+        if command == "checkPermissions":
+            response = ok(request, {
+                "backendAvailable": True,
+                "accessibilityTrusted": True,
+                "screenCaptureAccess": True,
+            })
+        elif command == "launchApp":
+            write_trace_if_requested(params)
+            response = ok(request)
+        elif command == "waitForApp":
+            response = ok(request)
+        elif command in {"stopApp", "clearAppState", "focus", "inputText", "pressKey", "pressKeyCode", "pressKeySequence", "selectMenuItem", "scroll", "swipe", "drag", "hoverPoint", "rightClickPoint", "tapPoint"}:
+            response = ok(request)
+        elif command == "describeAll":
+            response = ok(request, TREE)
+        elif command == "describePoint":
+            response = ok(request, TREE["children"][0]["children"][0])
+        elif command == "activateSelector":
+            response = ok(request, True)
+        elif command == "takeScreenshot":
+            path = pathlib.Path(params["path"])
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"png")
+            response = ok(request)
+        elif command == "startVideoRecording":
+            path = pathlib.Path(params["path"])
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"mp4")
+            ACTIVE_RECORDING_PATH = path
+            response = ok(request)
+        elif command == "stopVideoRecording":
+            ACTIVE_RECORDING_PATH = None
+            response = ok(request)
+        else:
+            response = fail(request, "unexpected macOS helper command: " + command)
+    except Exception as error:
+        response = fail({"id": -1}, str(error))
+    print(json.dumps(response), flush=True)
+"#,
+    );
+    write_executable(
+        &mock_bin.join("open"),
+        r#"#!/usr/bin/env python3
+import json
+import os
+import pathlib
+import sys
+
+LOG = pathlib.Path(os.environ["MOCK_LOG"])
+
+def log(message):
+    with LOG.open("a", encoding="utf-8") as handle:
+        handle.write(message + "\n")
+
+def write_trace(env):
+    output = env.get("ORBI_TRACE_OUTPUT")
+    if not output or os.environ.get("MOCK_ORBI_TRACE_SKIP_OUTPUT") == "1":
+        return
+    path = pathlib.Path(output)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if env.get("ORBI_TRACE_MODE") in {"memory", "allocations"}:
+        path.write_text('{"format":"orbi.trace.v1","formatVersion":1,"mode":"memory","startedAtUnixNanos":1,"host":"mock","memory":{"summary":{"totalAllocatedBytes":128,"allocationEvents":2,"liveBytes":64,"liveAllocations":1,"peakLiveBytes":128},"dropped":{"allocationRecords":0,"allocationStacks":0,"processSamples":0,"unknownFrees":0},"processMemorySamples":[],"stacks":[{"stack":["0x1000"],"totalAllocatedBytes":128,"allocationCount":2,"liveBytes":64,"liveAllocationCount":1,"peakLiveBytes":128}]}}')
+    else:
+        path.write_text('{"format":"orbi.trace.v1","formatVersion":1,"mode":"cpu","startedAtUnixNanos":1,"host":"mock","cpu":{"sampleIntervalMicros":4500,"droppedSamples":0,"failedUnwinds":0,"processMemorySamples":[],"threads":[{"id":1,"name":"main","samples":[{"timeNanos":1,"stack":["0x1000"]}]}]}}')
+
+args = sys.argv[1:]
+env = {}
+stdout_path = None
+stderr_path = None
+index = 0
+while index < len(args):
+    arg = args[index]
+    if arg == "--env" and index + 1 < len(args):
+        raw = args[index + 1]
+        if "=" in raw:
+            key, value = raw.split("=", 1)
+            env[key] = value
+        index += 2
+        continue
+    if arg == "--stdout" and index + 1 < len(args):
+        stdout_path = args[index + 1]
+        index += 2
+        continue
+    if arg == "--stderr" and index + 1 < len(args):
+        stderr_path = args[index + 1]
+        index += 2
+        continue
+    index += 1
+
+log("open " + json.dumps({"args": args, "env": env}, sort_keys=True))
+write_trace(env)
+for path, line in [(stdout_path, "ExampleMacApp print launched\n"), (stderr_path, "ExampleMacApp launched\n")]:
+    if path:
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(line)
+"#,
+    );
+    path
 }
 
 pub fn create_python3_fb_idb_install_mock(mock_bin: &Path) {
@@ -674,12 +821,6 @@ enum XcrunMockKind {
 }
 
 fn create_xcrun_mock(mock_bin: &Path, sdk_root: &Path, kind: XcrunMockKind) {
-    write_executable(
-        &mock_bin.join("orbi-macos-ui-driver"),
-        MACOS_UI_DRIVER_MOCK_SCRIPT,
-    );
-    fs::write(mock_bin.join("orbi-macos-ui-bridge.dylib"), b"").unwrap();
-
     let sdk_version_block = match kind {
         XcrunMockKind::Build => "  printf '%s\\n' \"18.0\"\n  exit 0",
         XcrunMockKind::Watch => {
@@ -706,7 +847,38 @@ fi
 if [ "$1" = "simctl" ] && [ "$2" = "install" ]; then
   exit 0
 fi
+if [ "$1" = "simctl" ] && [ "$2" = "get_app_container" ]; then
+  container="$(dirname "$MOCK_LOG")/simulator-containers/$3/$4/data"
+  mkdir -p "$container/Documents"
+  printf '%s\n' "$container"
+  exit 0
+fi
 if [ "$1" = "simctl" ] && [ "$2" = "launch" ]; then
+  udid=""
+  bundle=""
+  for arg in "$@"; do
+    case "$arg" in
+      simctl|launch|--console-pty|--terminate-running-process|--wait-for-debugger)
+        ;;
+      -*)
+        ;;
+      *)
+        if [ -z "$udid" ]; then
+          udid="$arg"
+        elif [ -z "$bundle" ]; then
+          bundle="$arg"
+          break
+        fi
+        ;;
+    esac
+  done
+  if [ -n "$udid" ] && [ -n "$bundle" ] && [ "${MOCK_ORBI_TRACE_SKIP_OUTPUT:-0}" != "1" ]; then
+    trace_root="$(dirname "$MOCK_LOG")/simulator-containers/$udid/$bundle/data/Documents"
+    mkdir -p "$trace_root"
+    cat > "$trace_root/orbi-trace.json" <<'JSON'
+{"format":"orbi.trace.v1","formatVersion":1,"mode":"memory","startedAtUnixNanos":1,"host":"mock","memory":{"summary":{"totalAllocatedBytes":128,"allocationEvents":2,"liveBytes":64,"liveAllocations":1,"peakLiveBytes":128},"dropped":{"allocationRecords":0,"allocationStacks":0,"processSamples":0,"unknownFrees":0},"processMemorySamples":[],"stacks":[{"stack":["0x1000"],"totalAllocatedBytes":128,"allocationCount":2,"liveBytes":64,"liveAllocations":1,"peakLiveBytes":128}]}}
+JSON
+  fi
   exit 0
 fi
 if [ "$1" = "simctl" ] && [ "$2" = "spawn" ] && [ "$4" = "log" ] && [ "$5" = "stream" ]; then
@@ -756,7 +928,41 @@ fi
 if [ "$1" = "simctl" ] && [ "$2" = "install" ]; then
   exit 0
 fi
+if [ "$1" = "simctl" ] && [ "$2" = "get_app_container" ]; then
+  container="$(dirname "$MOCK_LOG")/simulator-containers/$3/$4/data"
+  mkdir -p "$container/Documents"
+  printf '%s\n' "$container"
+  exit 0
+fi
 if [ "$1" = "simctl" ] && [ "$2" = "launch" ]; then
+  udid=""
+  bundle=""
+  for arg in "$@"; do
+    case "$arg" in
+      simctl|launch|--console-pty|--terminate-running-process|--wait-for-debugger)
+        ;;
+      -*)
+        ;;
+      *)
+        if [ -z "$udid" ]; then
+          udid="$arg"
+        elif [ -z "$bundle" ]; then
+          bundle="$arg"
+          break
+        fi
+        ;;
+    esac
+  done
+  if [ -n "$udid" ] && [ -n "$bundle" ] && [ "${MOCK_ORBI_TRACE_SKIP_OUTPUT:-0}" != "1" ]; then
+    trace_root="$(dirname "$MOCK_LOG")/simulator-containers/$udid/$bundle/data/Documents"
+    mkdir -p "$trace_root"
+    cat > "$trace_root/orbi-trace.json" <<'JSON'
+{"format":"orbi.trace.v1","formatVersion":1,"mode":"cpu","startedAtUnixNanos":1,"host":"mock","cpu":{"sampleIntervalMicros":4500,"droppedSamples":0,"failedUnwinds":0,"processMemorySamples":[],"threads":[{"id":1,"name":"main","samples":[{"timeNanos":1,"stack":["0x1000"]}]}]}}
+JSON
+  fi
+  exit 0
+fi
+if [ "$1" = "simctl" ] && [ "$2" = "terminate" ]; then
   exit 0
 fi"#
         }
@@ -783,457 +989,6 @@ if [ "$#" -ge 3 ] && [ "$1" = "--sdk" ] && [ "$3" = "--show-sdk-build-version" ]
   printf '%s\n' "TESTSDK1"
   exit 0
 fi
-if [ "$#" -ge 2 ] && [ "$1" = "xctrace" ] && [ "$2" = "record" ]; then
-  shift 2
-  output=""
-  template=""
-  attach=""
-  launch=0
-  time_limit=""
-  trace_launch_id=""
-  trace_registration_path=""
-  trace_bundle_id=""
-  while [ "$#" -gt 0 ]; do
-    case "$1" in
-      --output)
-        output="$2"
-        shift 2
-        ;;
-      --template)
-        template="$2"
-        shift 2
-        ;;
-      --attach)
-        attach="$2"
-        shift 2
-        ;;
-      --time-limit)
-        time_limit="$2"
-        shift 2
-        ;;
-      --device)
-        shift 2
-        ;;
-      --env)
-        case "$2" in
-          ORBI_MACOS_UI_TRACE_LAUNCH_ID=*)
-            trace_launch_id="${{2#ORBI_MACOS_UI_TRACE_LAUNCH_ID=}}"
-            ;;
-          ORBI_MACOS_UI_TRACE_REGISTRATION_PATH=*)
-            trace_registration_path="${{2#ORBI_MACOS_UI_TRACE_REGISTRATION_PATH=}}"
-            ;;
-          ORBI_MACOS_UI_TRACE_EXPECTED_BUNDLE_ID=*)
-            trace_bundle_id="${{2#ORBI_MACOS_UI_TRACE_EXPECTED_BUNDLE_ID=}}"
-            ;;
-        esac
-        shift 2
-        ;;
-      --no-prompt)
-        shift
-        ;;
-      --launch)
-        launch=1
-        shift
-        if [ "$#" -gt 0 ] && [ "$1" = "--" ]; then
-          shift
-        fi
-        break
-        ;;
-      *)
-        shift
-        ;;
-    esac
-  done
-  if [ -z "$output" ] || [ -z "$template" ]; then
-    echo "xctrace record mock requires --output and --template" >&2
-    exit 1
-  fi
-  if [ -z "$attach" ] && [ "$launch" -eq 0 ]; then
-    echo "xctrace record mock requires a target mode" >&2
-    exit 1
-  fi
-  mkdir -p "$output"
-  printf '%s\n' "$template" > "$output/template.txt"
-  if [ -n "$trace_registration_path" ] && [ -n "$trace_launch_id" ] && [ -n "$trace_bundle_id" ]; then
-    mkdir -p "$(dirname "$trace_registration_path")"
-    printf '{{"pid":%s,"launchId":"%s","bundleId":"%s"}}\n' "$$" "$trace_launch_id" "$trace_bundle_id" > "$trace_registration_path"
-    trap 'exit 0' INT TERM
-    while :; do
-      sleep 1
-    done
-  fi
-  if [ -n "$time_limit" ]; then
-    exit 0
-  fi
-  if [ "$launch" -eq 1 ] && [ "$#" -gt 0 ]; then
-    if command -v "$1" >/dev/null 2>&1; then
-      "$@"
-      exit $?
-    fi
-    if [ -x "$1" ]; then
-      "$@"
-      exit $?
-    fi
-  fi
-  trap 'exit 0' INT TERM
-  while :; do
-    sleep 1
-  done
-  exit 0
-fi
-if [ "$#" -ge 2 ] && [ "$1" = "xctrace" ] && [ "$2" = "export" ]; then
-  if [ -n "${{MOCK_XCTRACE_EXPORT_FAIL_COUNT_FILE:-}}" ] && [ -f "$MOCK_XCTRACE_EXPORT_FAIL_COUNT_FILE" ]; then
-    remaining="$(cat "$MOCK_XCTRACE_EXPORT_FAIL_COUNT_FILE" 2>/dev/null || printf '0')"
-    case "$remaining" in
-      ''|*[!0-9]*)
-        remaining=0
-        ;;
-    esac
-    if [ "$remaining" -gt 0 ]; then
-      printf '%s\n' "$((remaining - 1))" > "$MOCK_XCTRACE_EXPORT_FAIL_COUNT_FILE"
-      echo "Export failed: Document Missing Template Error" >&2
-      exit 10
-    fi
-  fi
-  if [ "${{MOCK_XCTRACE_EXPORT_FAIL:-0}}" = "1" ]; then
-    echo "Export failed: Document Missing Template Error" >&2
-    exit 10
-  fi
-  mode=""
-  output=""
-  input=""
-  xpath=""
-  prev=""
-  for arg in "$@"; do
-    if [ "$prev" = "--output" ]; then
-      output="$arg"
-    fi
-    if [ "$prev" = "--input" ]; then
-      input="$arg"
-    fi
-    if [ "$arg" = "--toc" ]; then
-      mode="toc"
-    fi
-    if [ "$prev" = "--xpath" ]; then
-      mode="xpath"
-      xpath="$arg"
-    fi
-    if [ "$arg" = "--har" ]; then
-      mode="har"
-    fi
-    prev="$arg"
-  done
-  if [ "$mode" = "toc" ]; then
-    case "$input" in
-      *allocations.trace*)
-      if [ -n "$output" ]; then
-        mkdir -p "$(dirname "$output")"
-        cat > "$output" <<'XML'
-<?xml version="1.0"?>
-<trace-toc>
-  <run number="1">
-    <info>
-      <target>
-        <device platform="macOS" model="MacBook Pro" name="Example Mac" os-version="26.4 (25E246)" uuid="DEVICE-UUID"/>
-        <process type="attached" return-exit-status="0" name="Orbi" pid="123" termination-reason="exit(0)"/>
-      </target>
-      <summary>
-        <duration>5.0</duration>
-        <template-name>Allocations</template-name>
-      </summary>
-    </info>
-    <processes>
-      <process name="Orbi" pid="123" path="/Applications/Orbi.app/Contents/MacOS/Orbi"/>
-    </processes>
-    <tracks>
-      <track name="Allocations">
-        <details>
-          <detail name="Statistics" kind="table"/>
-          <detail name="Allocations List" kind="table"/>
-        </details>
-      </track>
-      <track name="VM Tracker">
-        <details>
-          <detail name="Regions Map" kind="table"/>
-        </details>
-      </track>
-    </tracks>
-  </run>
-</trace-toc>
-XML
-      else
-        cat <<'XML'
-<?xml version="1.0"?>
-<trace-toc>
-  <run number="1">
-    <info>
-      <target>
-        <device platform="macOS" model="MacBook Pro" name="Example Mac" os-version="26.4 (25E246)" uuid="DEVICE-UUID"/>
-        <process type="attached" return-exit-status="0" name="Orbi" pid="123" termination-reason="exit(0)"/>
-      </target>
-      <summary>
-        <duration>5.0</duration>
-        <template-name>Allocations</template-name>
-      </summary>
-    </info>
-    <processes>
-      <process name="Orbi" pid="123" path="/Applications/Orbi.app/Contents/MacOS/Orbi"/>
-    </processes>
-    <tracks>
-      <track name="Allocations">
-        <details>
-          <detail name="Statistics" kind="table"/>
-          <detail name="Allocations List" kind="table"/>
-        </details>
-      </track>
-      <track name="VM Tracker">
-        <details>
-          <detail name="Regions Map" kind="table"/>
-        </details>
-      </track>
-    </tracks>
-  </run>
-</trace-toc>
-XML
-      fi
-      exit 0
-      ;;
-    esac
-    if [ -n "$output" ]; then
-      mkdir -p "$(dirname "$output")"
-      cat > "$output" <<'XML'
-<?xml version="1.0"?>
-<trace-toc>
-  <run number="1">
-    <info>
-      <target>
-        <device platform="macOS" model="MacBook Pro" name="Example Mac" os-version="26.4 (25E246)" uuid="DEVICE-UUID"/>
-        <process type="launched" return-exit-status="0" name="Orbi" pid="123" termination-reason="exit(0)"/>
-      </target>
-      <summary>
-        <start-date>2026-04-03T04:18:08.145+03:00</start-date>
-        <end-date>2026-04-03T04:18:10.083+03:00</end-date>
-        <duration>1.938214</duration>
-        <end-reason>Time limit reached</end-reason>
-        <instruments-version>16.0 (17E192)</instruments-version>
-        <template-name>Time Profiler</template-name>
-        <recording-mode>Deferred</recording-mode>
-        <time-limit>1 second</time-limit>
-      </summary>
-    </info>
-    <processes>
-      <process name="Orbi" pid="123" path="/Applications/Orbi.app/Contents/MacOS/Orbi"/>
-      <process name="xctrace" pid="456" path="/Applications/Xcode.app/Contents/Developer/usr/bin/xctrace"/>
-    </processes>
-    <data>
-      <table schema="tick" frequency="10"/>
-      <table schema="time-profile" target-pid="ALL"/>
-      <table schema="time-profile" target-pid="123"/>
-    </data>
-    <tracks/>
-  </run>
-</trace-toc>
-XML
-    else
-      cat <<'XML'
-<?xml version="1.0"?>
-<trace-toc>
-  <run number="1">
-    <info>
-      <target>
-        <device platform="macOS" model="MacBook Pro" name="Example Mac" os-version="26.4 (25E246)" uuid="DEVICE-UUID"/>
-        <process type="launched" return-exit-status="0" name="Orbi" pid="123" termination-reason="exit(0)"/>
-      </target>
-      <summary>
-        <start-date>2026-04-03T04:18:08.145+03:00</start-date>
-        <end-date>2026-04-03T04:18:10.083+03:00</end-date>
-        <duration>1.938214</duration>
-        <end-reason>Time limit reached</end-reason>
-        <instruments-version>16.0 (17E192)</instruments-version>
-        <template-name>Time Profiler</template-name>
-        <recording-mode>Deferred</recording-mode>
-        <time-limit>1 second</time-limit>
-      </summary>
-    </info>
-    <processes>
-      <process name="Orbi" pid="123" path="/Applications/Orbi.app/Contents/MacOS/Orbi"/>
-      <process name="xctrace" pid="456" path="/Applications/Xcode.app/Contents/Developer/usr/bin/xctrace"/>
-    </processes>
-    <data>
-      <table schema="tick" frequency="10"/>
-      <table schema="time-profile" target-pid="ALL"/>
-      <table schema="time-profile" target-pid="123"/>
-    </data>
-    <tracks/>
-  </run>
-</trace-toc>
-XML
-    fi
-    exit 0
-  fi
-  if [ "$mode" = "xpath" ]; then
-    case "$input" in
-      *allocations.trace*)
-      if [ "$xpath" = '/trace-toc/run/tracks/track[@name="Allocations"]/details/detail[@name="Statistics"]' ]; then
-        cat <<'XML'
-<?xml version="1.0"?>
-<trace-query-result>
-  <node xpath='//trace-toc[1]/run[1]/tracks[1]/track[1]/details[1]/detail[1]'>
-    <row category="All Heap &amp; Anonymous VM" persistent-bytes="33782272" count-persistent="1161" total-bytes="34183680" transient-bytes="401408" count-events="1183" count-transient="6" count-total="1167"/>
-    <row category="All Heap Allocations" persistent-bytes="33782272" count-persistent="1161" total-bytes="33790464" transient-bytes="8192" count-events="1175" count-transient="2" count-total="1163"/>
-    <row category="All Anonymous VM" persistent-bytes="0" count-persistent="0" total-bytes="393216" transient-bytes="393216" count-events="8" count-transient="4" count-total="4"/>
-    <row category="Malloc 256.0 KiB" persistent-bytes="33554432" count-persistent="128" total-bytes="33554432" transient-bytes="0" count-events="128" count-transient="0" count-total="128"/>
-    <row category="Malloc 48 Bytes" persistent-bytes="8208" count-persistent="171" total-bytes="8208" transient-bytes="0" count-events="171" count-transient="0" count-total="171"/>
-    <row category="VM: Anonymous VM" persistent-bytes="0" count-persistent="0" total-bytes="393216" transient-bytes="393216" count-events="8" count-transient="4" count-total="4"/>
-  </node>
-</trace-query-result>
-XML
-        exit 0
-      fi
-      if [ "$xpath" = '/trace-toc/run/tracks/track[@name="Allocations"]/details/detail[@name="Allocations List"]' ]; then
-        cat <<'XML'
-<?xml version="1.0"?>
-<trace-query-result>
-  <node xpath='//trace-toc[1]/run[1]/tracks[1]/track[1]/details[1]/detail[2]'>
-    <row address="0x10133c000" category="Malloc 256.0 KiB" live="true" responsible-caller="allocateChunk()" responsible-library="Orbi" size="262144"/>
-    <row address="0x10137c000" category="Malloc 256.0 KiB" live="true" responsible-caller="allocateChunk()" responsible-library="Orbi" size="262144"/>
-    <row address="0x10139c000" category="Malloc 48 Bytes" live="true" responsible-caller="bootstrap()" responsible-library="Orbi" size="48"/>
-    <row address="0x10139c100" category="VM: Anonymous VM" live="false" responsible-caller="&lt;Call stack limit reached&gt;" responsible-library="" size="393216"/>
-  </node>
-</trace-query-result>
-XML
-        exit 0
-      fi
-      ;;
-    esac
-    if [ -n "$output" ]; then
-      mkdir -p "$(dirname "$output")"
-      cat > "$output" <<'XML'
-<?xml version="1.0"?>
-<trace-query-result>
-  <node xpath='//trace-toc[1]/run[1]/data[1]/table[2]'>
-    <schema name="time-profile">
-      <col><mnemonic>time</mnemonic></col>
-      <col><mnemonic>thread</mnemonic></col>
-      <col><mnemonic>process</mnemonic></col>
-      <col><mnemonic>core</mnemonic></col>
-      <col><mnemonic>thread-state</mnemonic></col>
-      <col><mnemonic>weight</mnemonic></col>
-      <col><mnemonic>stack</mnemonic></col>
-    </schema>
-    <row>
-      <sample-time id="1" fmt="00:00.001.000">1000000</sample-time>
-      <weight id="2" fmt="3.00 ms">3000000</weight>
-      <tagged-backtrace id="3" fmt="heavyWork() ← main">
-        <backtrace id="4">
-          <frame id="5" name="heavyWork()" addr="0x102000100">
-            <binary id="6" name="Orbi" path="/Applications/Orbi.app/Contents/MacOS/Orbi"/>
-          </frame>
-          <frame id="7" name="main" addr="0x102000050">
-            <binary ref="6"/>
-          </frame>
-        </backtrace>
-      </tagged-backtrace>
-    </row>
-    <row>
-      <sample-time id="8" fmt="00:00.002.000">2000000</sample-time>
-      <weight ref="2"/>
-      <tagged-backtrace id="9" fmt="sin ← heavyWork() ← main">
-        <backtrace id="10">
-          <frame id="11" name="sin" addr="0x180000100">
-            <binary id="12" name="libsystem_m.dylib" path="/usr/lib/system/libsystem_m.dylib"/>
-          </frame>
-          <frame ref="5"/>
-          <frame ref="7"/>
-        </backtrace>
-      </tagged-backtrace>
-    </row>
-    <row>
-      <sample-time id="13" fmt="00:00.003.000">3000000</sample-time>
-      <weight id="14" fmt="1.00 ms">1000000</weight>
-      <tagged-backtrace id="15" fmt="0x102000200 ← main">
-        <backtrace id="16">
-          <frame id="17" name="0x102000200" addr="0x102000200"/>
-          <frame ref="7"/>
-        </backtrace>
-      </tagged-backtrace>
-    </row>
-  </node>
-</trace-query-result>
-XML
-    else
-      cat <<'XML'
-<?xml version="1.0"?>
-<trace-query-result>
-  <node xpath='//trace-toc[1]/run[1]/data[1]/table[2]'>
-    <schema name="time-profile">
-      <col><mnemonic>time</mnemonic></col>
-      <col><mnemonic>thread</mnemonic></col>
-      <col><mnemonic>process</mnemonic></col>
-      <col><mnemonic>core</mnemonic></col>
-      <col><mnemonic>thread-state</mnemonic></col>
-      <col><mnemonic>weight</mnemonic></col>
-      <col><mnemonic>stack</mnemonic></col>
-    </schema>
-    <row>
-      <sample-time id="1" fmt="00:00.001.000">1000000</sample-time>
-      <weight id="2" fmt="3.00 ms">3000000</weight>
-      <tagged-backtrace id="3" fmt="heavyWork() ← main">
-        <backtrace id="4">
-          <frame id="5" name="heavyWork()" addr="0x102000100">
-            <binary id="6" name="Orbi" path="/Applications/Orbi.app/Contents/MacOS/Orbi"/>
-          </frame>
-          <frame id="7" name="main" addr="0x102000050">
-            <binary ref="6"/>
-          </frame>
-        </backtrace>
-      </tagged-backtrace>
-    </row>
-    <row>
-      <sample-time id="8" fmt="00:00.002.000">2000000</sample-time>
-      <weight ref="2"/>
-      <tagged-backtrace id="9" fmt="sin ← heavyWork() ← main">
-        <backtrace id="10">
-          <frame id="11" name="sin" addr="0x180000100">
-            <binary id="12" name="libsystem_m.dylib" path="/usr/lib/system/libsystem_m.dylib"/>
-          </frame>
-          <frame ref="5"/>
-          <frame ref="7"/>
-        </backtrace>
-      </tagged-backtrace>
-    </row>
-    <row>
-      <sample-time id="13" fmt="00:00.003.000">3000000</sample-time>
-      <weight id="14" fmt="1.00 ms">1000000</weight>
-      <tagged-backtrace id="15" fmt="0x102000200 ← main">
-        <backtrace id="16">
-          <frame id="17" name="0x102000200" addr="0x102000200"/>
-          <frame ref="7"/>
-        </backtrace>
-      </tagged-backtrace>
-    </row>
-  </node>
-</trace-query-result>
-XML
-    fi
-    exit 0
-  fi
-  if [ "$mode" = "har" ]; then
-    if [ -n "$output" ]; then
-      mkdir -p "$(dirname "$output")"
-      cat > "$output" <<'JSON'
-{{"log":{{"version":"1.2"}}}}
-JSON
-    else
-      cat <<'JSON'
-{{"log":{{"version":"1.2"}}}}
-JSON
-    fi
-    exit 0
-  fi
-  echo "unexpected xctrace export command: $@" >&2
-  exit 1
-fi
 if [ "$#" -ge 3 ] && [ "$1" = "--sdk" ] && [ "$3" = "swiftc" ]; then
   out=""
   module=""
@@ -1248,56 +1003,32 @@ if [ "$#" -ge 3 ] && [ "$1" = "--sdk" ] && [ "$3" = "swiftc" ]; then
     prev="$arg"
   done
   mkdir -p "$(dirname "$out")"
-  if [ "$(basename "$out")" = "orbi-macos-ui-driver" ]; then
-    cat > "$out" <<'SCRIPT'
+  cat > "$out" <<'SCRIPT'
 #!/bin/sh
 set -eu
-echo "orbi-macos-ui-driver $@" >> "$MOCK_LOG"
-case "${{1:-}}" in
-  doctor)
-    printf '{{"accessibilityTrusted":true,"screenCaptureAccess":true}}\n'
-    ;;
-  frontmost-application)
-    printf '{{"pid":null}}\n'
-    ;;
-  launch-app)
-    printf '{{"pid":%s}}\n' "$$"
-    ;;
-  window-info)
-    printf '{{"windowNumber":1,"frame":{{"x":0,"y":0,"width":393,"height":852}}}}\n'
-    ;;
-  describe-all)
-    printf '[]\n'
-    ;;
-  describe-point)
-    printf '{{}}\n'
-    ;;
-  bridge-ping|reopen-app|focus|activate-element|tap|move|right-click|swipe|menu-item|type-text|press-key|press-button|set-clipboard|paste-text|erase-text|hide-keyboard|wait-for-animation)
-    ;;
-  screenshot-window)
-    out=""
-    prev=""
-    for arg in "$@"; do
-      if [ "$prev" = "--output" ]; then
-        out="$arg"
-      fi
-      prev="$arg"
-    done
-    if [ -n "$out" ]; then
-      mkdir -p "$(dirname "$out")"
-      printf 'png' > "$out"
-    fi
-    ;;
-  *)
-    echo "unexpected orbi-macos-ui-driver command: $@" >&2
-    exit 1
-    ;;
-esac
+echo "$(basename "$0") $@" >> "$MOCK_LOG"
+printf '%s\n' "$$" > "$(dirname "$MOCK_LOG")/macos-ui-application.pid"
+if [ -n "${{ORBI_TRACE_OUTPUT:-}}" ] && [ "${{MOCK_ORBI_TRACE_SKIP_OUTPUT:-0}}" != "1" ]; then
+  mkdir -p "$(dirname "$ORBI_TRACE_OUTPUT")"
+  case "${{ORBI_TRACE_MODE:-cpu}}" in
+    memory|allocations)
+      cat > "$ORBI_TRACE_OUTPUT" <<'JSON'
+{{"format":"orbi.trace.v1","formatVersion":1,"mode":"memory","startedAtUnixNanos":1,"host":"mock","memory":{{"summary":{{"totalAllocatedBytes":128,"allocationEvents":2,"liveBytes":64,"liveAllocations":1,"peakLiveBytes":128}},"dropped":{{"allocationRecords":0,"allocationStacks":0,"processSamples":0,"unknownFrees":0}},"processMemorySamples":[],"stacks":[{{"stack":["0x1000"],"totalAllocatedBytes":128,"allocationCount":2,"liveBytes":64,"liveAllocations":1,"peakLiveBytes":128}}]}}}}
+JSON
+      ;;
+    *)
+      cat > "$ORBI_TRACE_OUTPUT" <<'JSON'
+{{"format":"orbi.trace.v1","formatVersion":1,"mode":"cpu","startedAtUnixNanos":1,"host":"mock","cpu":{{"sampleIntervalMicros":4500,"droppedSamples":0,"failedUnwinds":0,"processMemorySamples":[],"threads":[{{"id":1,"name":"main","samples":[{{"timeNanos":1,"stack":["0x1000"]}}]}}]}}}}
+JSON
+      ;;
+  esac
+fi
+trap 'exit 0' INT TERM
+while :; do
+  sleep 1
+done
 SCRIPT
-    chmod +x "$out"
-  else
-    : > "$out"
-  fi
+  chmod +x "$out"
   if [ -n "$module" ]; then
     mkdir -p "$(dirname "$module")"
     : > "$module"

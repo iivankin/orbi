@@ -1,27 +1,27 @@
 use std::fs;
 
-use crate::support::{
-    base_command, create_build_xcrun_mock, create_home, read_log, run_and_capture,
-};
+use crate::support::{base_command, create_home, read_log, run_and_capture};
 use tempfile::tempdir;
 
 #[test]
-fn orbi_inspect_trace_prints_time_profile_diagnosis() {
+fn orbi_inspect_trace_prints_orbi_cpu_diagnosis() {
     let temp = tempdir().unwrap();
     let home = create_home(temp.path());
     let workspace = temp.path().join("workspace");
     let mock_bin = temp.path().join("mock-bin");
-    let sdk_root = temp.path().join("sdk-root");
     let log_path = temp.path().join("mock.log");
-    let trace_path = workspace.join("sample.trace");
+    let trace_path = workspace.join("sample-cpu.orbitrace.json");
 
     fs::create_dir_all(&workspace).unwrap();
     fs::create_dir_all(&mock_bin).unwrap();
-    fs::create_dir_all(&trace_path).unwrap();
-    create_build_xcrun_mock(&mock_bin, &sdk_root);
+    fs::write(
+        &trace_path,
+        r#"{"format":"orbi.trace.v1","formatVersion":1,"mode":"cpu","startedAtUnixNanos":1,"cpu":{"sampleIntervalMicros":4500,"droppedSamples":0,"failedUnwinds":1,"threads":[{"id":1,"name":"main","samples":[{"timeNanos":1,"stack":["0x1000","0x2000"]},{"timeNanos":2,"stack":["0x1000","0x2000"]}]},{"id":2,"name":"worker","samples":[{"timeNanos":3,"stack":["0x3000"]}]}]}}"#,
+    )
+    .unwrap();
 
     let mut command = base_command(&workspace, &home, &mock_bin, &log_path);
-    command.args(["inspect-trace", "sample.trace"]);
+    command.args(["inspect-trace", "sample-cpu.orbitrace.json"]);
     let output = run_and_capture(&mut command);
     assert!(
         output.status.success(),
@@ -30,38 +30,35 @@ fn orbi_inspect_trace_prints_time_profile_diagnosis() {
     );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("Process: Orbi"));
-    assert!(stdout.contains("Template: Time Profiler"));
-    assert!(stdout.contains("SELF TIME"));
-    assert!(stdout.contains("heavyWork()"));
-    assert!(stdout.contains("CALL STACKS"));
+    assert!(stdout.contains("Orbi Trace"));
+    assert!(stdout.contains("Mode: cpu"));
+    assert!(stdout.contains("Sample interval: 4500 us"));
+    assert!(stdout.contains("Samples: 3"));
+    assert!(stdout.contains("0x1000 <- 0x2000"));
 
     let log = read_log(&log_path);
-    assert!(log.contains("xcrun xctrace export --input"));
-    assert!(log.contains("--toc"));
-    assert!(log.contains("--xpath"));
+    assert!(!log.contains("xctrace"));
 }
 
 #[test]
-fn orbi_inspect_trace_retries_until_trace_is_exportable() {
+fn orbi_inspect_trace_prints_orbi_memory_diagnosis() {
     let temp = tempdir().unwrap();
     let home = create_home(temp.path());
     let workspace = temp.path().join("workspace");
     let mock_bin = temp.path().join("mock-bin");
-    let sdk_root = temp.path().join("sdk-root");
     let log_path = temp.path().join("mock.log");
-    let trace_path = workspace.join("sample.trace");
-    let fail_count_path = temp.path().join("export-fail-count.txt");
+    let trace_path = workspace.join("sample-memory.orbitrace.json");
 
     fs::create_dir_all(&workspace).unwrap();
     fs::create_dir_all(&mock_bin).unwrap();
-    fs::create_dir_all(&trace_path).unwrap();
-    fs::write(&fail_count_path, "2\n").unwrap();
-    create_build_xcrun_mock(&mock_bin, &sdk_root);
+    fs::write(
+        &trace_path,
+        r#"{"format":"orbi.trace.v1","formatVersion":1,"mode":"memory","startedAtUnixNanos":1,"memory":{"summary":{"totalAllocatedBytes":4096,"allocationEvents":4,"liveBytes":1024,"liveAllocations":1,"peakLiveBytes":2048},"dropped":{"allocationRecords":1,"allocationStacks":2,"processSamples":3,"unknownFrees":4},"processMemorySamples":[],"stacks":[{"stack":["0x1000","0x2000"],"totalAllocatedBytes":4096,"allocationCount":4,"liveBytes":1024,"liveAllocationCount":1,"peakLiveBytes":2048}]}}"#,
+    )
+    .unwrap();
 
     let mut command = base_command(&workspace, &home, &mock_bin, &log_path);
-    command.env("MOCK_XCTRACE_EXPORT_FAIL_COUNT_FILE", &fail_count_path);
-    command.args(["inspect-trace", "sample.trace"]);
+    command.args(["inspect-trace", "sample-memory.orbitrace.json"]);
     let output = run_and_capture(&mut command);
     assert!(
         output.status.success(),
@@ -70,47 +67,12 @@ fn orbi_inspect_trace_retries_until_trace_is_exportable() {
     );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("Process: Orbi"));
-    assert_eq!(fs::read_to_string(&fail_count_path).unwrap(), "0\n");
+    assert!(stdout.contains("Mode: memory"));
+    assert!(stdout.contains("Total allocated: 4096 (4.0 KiB)"));
+    assert!(stdout.contains("Live bytes: 1024 (1.0 KiB)"));
+    assert!(stdout.contains("Dropped allocation records: 1"));
+    assert!(stdout.contains("0x1000 <- 0x2000"));
 
     let log = read_log(&log_path);
-    assert!(log.matches("xcrun xctrace export --input").count() >= 4);
-}
-
-#[test]
-fn orbi_inspect_trace_prints_allocations_diagnosis() {
-    let temp = tempdir().unwrap();
-    let home = create_home(temp.path());
-    let workspace = temp.path().join("workspace");
-    let mock_bin = temp.path().join("mock-bin");
-    let sdk_root = temp.path().join("sdk-root");
-    let log_path = temp.path().join("mock.log");
-    let trace_path = workspace.join("allocations.trace");
-
-    fs::create_dir_all(&workspace).unwrap();
-    fs::create_dir_all(&mock_bin).unwrap();
-    fs::create_dir_all(&trace_path).unwrap();
-    create_build_xcrun_mock(&mock_bin, &sdk_root);
-
-    let mut command = base_command(&workspace, &home, &mock_bin, &log_path);
-    command.args(["inspect-trace", "allocations.trace"]);
-    let output = run_and_capture(&mut command);
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("Template: Allocations"));
-    assert!(stdout.contains("Live bytes: 32.2 MiB"));
-    assert!(stdout.contains("LIVE BY CATEGORY"));
-    assert!(stdout.contains("Malloc 256.0 KiB"));
-    assert!(stdout.contains("LIVE BY RESPONSIBLE CALLER"));
-    assert!(stdout.contains("allocateChunk()"));
-
-    let log = read_log(&log_path);
-    assert!(log.contains("--toc"));
-    assert!(log.contains("Allocations"));
-    assert!(log.contains("Allocations List"));
+    assert!(!log.contains("xctrace"));
 }

@@ -2214,6 +2214,7 @@
           "$ref": "#/$defs/pathArray",
           "description": "Root directories for Orbi UI flow JSON files."
         }
+      }
     },
     "qualitySeverity": {
       "type": "string",
@@ -3288,5 +3289,4 @@
       }
     }
   }
-}
 }

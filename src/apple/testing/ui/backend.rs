@@ -7,7 +7,7 @@ use serde_json::Value as JsonValue;
 
 use super::{
     UiCrashDeleteRequest, UiCrashQuery, UiHardwareButton, UiKeyModifier, UiKeyPress,
-    UiPermissionConfig, UiSelector, UiSwipeDirection, UiTravel,
+    UiMenuSelection, UiPermissionConfig, UiSelector, UiSwipeDirection, UiTravel,
 };
 
 #[path = "backend/ios_simulator.rs"]
@@ -39,27 +39,19 @@ pub trait UiBackend {
         bundle_id: &str,
         stop_app: bool,
         arguments: &[(String, String)],
+        environment: &[(String, String)],
     ) -> Result<()>;
     fn stop_app(&self, bundle_id: &str) -> Result<()>;
     fn clear_app_state(&self, bundle_id: &str) -> Result<()>;
     fn focus(&self) -> Result<()>;
-    fn frontmost_application_pid(&self) -> Result<Option<u32>> {
-        Ok(None)
-    }
-    fn pin_pending_trace_launch(&self) -> Result<()> {
+    fn remove_trace_file(&self, _bundle_id: &str) -> Result<()> {
         Ok(())
     }
-    fn prepare_trace_launch_environment(
-        &self,
-        _previous_frontmost_pid: Option<u32>,
-    ) -> Result<Vec<(String, String)>> {
-        Ok(Vec::new())
-    }
-    fn abort_pending_trace_launch(&self) -> Result<()> {
-        Ok(())
-    }
-    fn prepare_external_running_target(&self) -> Result<()> {
-        Ok(())
+    fn collect_trace_file(&self, _bundle_id: &str, _destination: &Path) -> Result<()> {
+        bail!(
+            "trace file collection is not supported by the current {} backend",
+            self.backend_name()
+        )
     }
     fn tap_point(&self, x: f64, y: f64, duration_ms: Option<u32>) -> Result<()>;
     fn activate_selector(&self, _selector: &UiSelector) -> Result<bool> {
@@ -90,13 +82,15 @@ pub trait UiBackend {
         end: (f64, f64),
         duration_ms: Option<u32>,
         delta: Option<u32>,
+        payload_hint: Option<&str>,
     ) -> Result<()> {
+        let _ = payload_hint;
         self.swipe_points(start, end, duration_ms, delta)
     }
     fn input_text(&self, text: &str) -> Result<()>;
     fn press_button(&self, button: UiHardwareButton, duration_ms: Option<u32>) -> Result<()>;
     fn press_key(&self, key: &UiKeyPress) -> Result<()>;
-    fn select_menu_item(&self, _path: &[String]) -> Result<()> {
+    fn select_menu_item(&self, _selection: &UiMenuSelection) -> Result<()> {
         bail!(
             "`selectMenuItem` is not supported by the current {} backend",
             self.backend_name()
@@ -135,23 +129,10 @@ struct ActiveVideoRecording {
     child: Child,
 }
 
-#[derive(Debug, Deserialize)]
-struct MacosWindowInfo {
-    #[serde(rename = "windowNumber")]
-    _window_number: i64,
-    frame: MacosWindowFrame,
-}
-
-#[derive(Debug, Deserialize)]
-struct MacosWindowFrame {
-    x: f64,
-    y: f64,
-    width: f64,
-    height: f64,
-}
-
 #[derive(Debug, Deserialize, Serialize)]
 pub(crate) struct MacosDoctorStatus {
+    #[serde(rename = "backendAvailable")]
+    pub backend_available: bool,
     #[serde(rename = "accessibilityTrusted")]
     pub accessibility_trusted: bool,
     #[serde(rename = "screenCaptureAccess")]

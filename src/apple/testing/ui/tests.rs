@@ -54,6 +54,7 @@ impl UiBackend for TestUiBackend {
         _bundle_id: &str,
         _stop_app: bool,
         arguments: &[(String, String)],
+        _environment: &[(String, String)],
     ) -> Result<()> {
         self.launches.lock().unwrap().push(arguments.to_vec());
         Ok(())
@@ -69,10 +70,6 @@ impl UiBackend for TestUiBackend {
 
     fn focus(&self) -> Result<()> {
         *self.focus_calls.lock().unwrap() += 1;
-        Ok(())
-    }
-
-    fn abort_pending_trace_launch(&self) -> Result<()> {
         Ok(())
     }
 
@@ -345,7 +342,7 @@ fn ui_runner_prefers_backend_selector_activation_for_tap_on() {
         temp.path().join("artifacts"),
         "dev.orbi.fixture".to_owned(),
         false,
-        None,
+        Vec::new(),
     );
 
     runner
@@ -375,7 +372,7 @@ fn ui_runner_best_effort_focuses_after_launch_when_requested() {
         temp.path().join("artifacts"),
         "dev.orbi.fixture".to_owned(),
         true,
-        None,
+        Vec::new(),
     );
 
     runner

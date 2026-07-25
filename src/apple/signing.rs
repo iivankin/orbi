@@ -88,6 +88,12 @@ pub fn sign_bundle(
         })?;
     }
 
+    crate::apple::profile::runtime_support::sign_embedded_trace_runtime_if_present(
+        bundle_path,
+        &material.signing_identity,
+        material.keychain_path.as_deref(),
+    )?;
+
     let mut command = Command::new("codesign");
     command.args(["--force", "--sign"]);
     command.arg(&material.signing_identity);

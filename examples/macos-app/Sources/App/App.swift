@@ -40,8 +40,30 @@ private struct FixtureView: View {
     @State private var secondaryClickStatus = "Awaiting secondary click"
     @State private var dropStatus = "Drop target idle"
     @State private var hoverStatus = "Awaiting hover"
+    @State private var menuButtonStatus = "Awaiting menu button action"
+    @State private var appKitTableStatus = "Awaiting table action"
 
     var body: some View {
+        TabView {
+            existingFixtures
+                .tabItem {
+                    Text("Existing")
+                }
+
+            SwiftUICommandCoverageFixture()
+                .tabItem {
+                    Text("SwiftUI Coverage")
+                }
+
+            AppKitCommandCoverageFixture()
+                .tabItem {
+                    Text("AppKit Coverage")
+                }
+        }
+        .frame(minWidth: 700, minHeight: 1_060)
+    }
+
+    private var existingFixtures: some View {
         VStack(alignment: .leading, spacing: 16) {
             Text("Orbi macOS fixture")
                 .font(.title2.bold())
@@ -83,6 +105,13 @@ private struct FixtureView: View {
 
             Divider()
 
+            HStack(alignment: .top, spacing: 20) {
+                MenuButtonFixture(status: $menuButtonStatus)
+                AppKitTableFixture(status: $appKitTableStatus)
+            }
+
+            Divider()
+
             PersistenceFixture()
 
             Divider()
@@ -106,7 +135,7 @@ private struct FixtureView: View {
             .accessibilityIdentifier("fixture-scroll")
         }
         .padding(24)
-        .frame(minWidth: 620, minHeight: 760)
+        .frame(minWidth: 620, minHeight: 980)
         .onAppear {
             fixtureLogger.info("FixtureView appeared")
             print("FixtureView print appeared")

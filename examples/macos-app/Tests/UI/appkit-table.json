@@ -1,0 +1,17 @@
+{
+  "$schema": "../../../../schemas/orbi-ui-test.v1.json",
+  "appId": "dev.orbi.examples.macos",
+  "name": "macos-appkit-table",
+  "steps": [
+    "launchApp",
+    {
+      "tapOn": "Sent"
+    },
+    {
+      "assertVisible": "Activated Sent"
+    },
+    {
+      "takeScreenshot": "macos-appkit-table"
+    }
+  ]
+}

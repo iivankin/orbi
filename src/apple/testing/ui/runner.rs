@@ -9,14 +9,14 @@ use serde_json::Value as JsonValue;
 use super::backend::UiBackend;
 use super::flow::{canonical_or_absolute, flow_uses_manual_recording, resolve_path_from_flow};
 use super::matching::{
-    UiElementMatch, directional_points_in_frame, find_visible_element_by_selector,
-    find_visible_scroll_container, infer_screen_frame, resolve_point_expr,
+    UiElementMatch, directional_points_in_frame, find_scroll_container_near_selector,
+    find_visible_element_by_selector, find_visible_scroll_container, infer_screen_frame,
+    resolve_point_expr,
 };
 use super::report::{
     FlowRunReport, RunStatus, StepRunReport, append_report_error, flow_name_from_path,
     sanitize_artifact_name, sanitize_extension_component, unix_timestamp_secs,
 };
-use super::trace::{MacosUiTraceRuntime, resolve_trace_bundle_id};
 use super::{
     UiCommand, UiDragAndDrop, UiElementScroll, UiElementSwipe, UiExtendedWaitUntil, UiFlow,
     UiKeyPress, UiPressKey, UiScrollUntilVisible, UiSelector, UiSwipe, UiSwipeDirection,
@@ -42,7 +42,8 @@ pub(super) struct UiFlowRunner {
     stack: Vec<PathBuf>,
     clipboard: Option<String>,
     manual_recording: Option<PathBuf>,
-    trace_runtime: Option<MacosUiTraceRuntime>,
+    launch_environment: Vec<(String, String)>,
+    launched_app: bool,
 }
 
 impl UiFlowRunner {
@@ -51,7 +52,7 @@ impl UiFlowRunner {
         artifacts_dir: PathBuf,
         bundle_id: String,
         focus_after_launch: bool,
-        trace_runtime: Option<MacosUiTraceRuntime>,
+        launch_environment: Vec<(String, String)>,
     ) -> Self {
         Self {
             backend,
@@ -61,8 +62,13 @@ impl UiFlowRunner {
             stack: Vec::new(),
             clipboard: None,
             manual_recording: None,
-            trace_runtime,
+            launch_environment,
+            launched_app: false,
         }
+    }
+
+    pub(super) fn did_launch_app(&self) -> bool {
+        self.launched_app
     }
 
     pub(super) fn execute_flow(
@@ -151,15 +157,6 @@ impl UiFlowRunner {
             report.error = Some(error.to_string());
             self.capture_failure_artifacts(&flow_path, &mut report)?;
         }
-        if invoked_by.is_none()
-            && let Err(error) = self.finish_top_level_trace_run()
-        {
-            report.status = RunStatus::Failed;
-            append_report_error(&mut report, error.to_string());
-            if report.failure_screenshot.is_none() {
-                self.capture_failure_artifacts(&flow_path, &mut report)?;
-            }
-        }
         if let Some(path) = video_path.as_ref()
             && auto_video_started
         {
@@ -194,35 +191,17 @@ impl UiFlowRunner {
         Ok(passed)
     }
 
-    fn finish_top_level_trace_run(&mut self) -> Result<()> {
-        if self.trace_runtime.is_none() {
-            return Ok(());
-        }
-        self.finish_active_trace_segment("flow completion")?;
-        self.backend
-            .stop_app(self.bundle_id.as_str())
-            .with_context(|| format!("failed to stop `{}` after traced flow", self.bundle_id))
-    }
-
-    fn finish_active_trace_segment(&mut self, reason: &str) -> Result<()> {
-        let Some(trace_runtime) = self.trace_runtime.as_mut() else {
-            return Ok(());
-        };
-        if let Some(path) = trace_runtime
-            .finish_active()
-            .with_context(|| format!("failed to finalize active trace before `{reason}`"))?
-        {
-            println!("trace: {}", path.display());
-        }
-        Ok(())
-    }
-
-    fn resolve_command_bundle_id(&self, requested: Option<&str>, source: &str) -> Result<String> {
-        if self.trace_runtime.is_some() {
-            resolve_trace_bundle_id(&self.bundle_id, requested, source).map(str::to_owned)
-        } else {
-            Ok(self.resolve_bundle_id(requested).to_owned())
-        }
+    fn require_element_frame(
+        &self,
+        element: &UiElementMatch,
+        action: &str,
+    ) -> Result<super::matching::UiFrame> {
+        element.frame.with_context(|| {
+            format!(
+                "found `{}`, but it did not expose a frame for {}",
+                element.label, action
+            )
+        })
     }
 
     pub(super) fn run_leaf_command(&mut self, command: &UiCommand) -> Result<Option<PathBuf>> {
@@ -371,53 +350,37 @@ impl UiFlowRunner {
     fn run_leaf_command_inner(&mut self, command: &UiCommand) -> Result<Option<PathBuf>> {
         match command {
             UiCommand::LaunchApp(command) => {
-                if let Some(trace_runtime) = self.trace_runtime.as_mut() {
-                    trace_runtime.launch_app(self.backend.as_ref(), command)?;
-                } else {
-                    let app_id = self.resolve_bundle_id(command.app_id.as_deref());
-                    if command.clear_keychain {
-                        self.backend.clear_keychain()?;
-                    }
-                    if command.clear_state {
-                        self.backend.clear_app_state(app_id)?;
-                    }
-                    if let Some(permissions) = command.permissions.as_ref() {
-                        self.backend.set_permissions(app_id, permissions)?;
-                    }
-                    self.backend.launch_app(
-                        app_id,
-                        command.stop_app,
-                        command.arguments.as_slice(),
-                    )?;
+                let app_id = self.resolve_bundle_id(command.app_id.as_deref());
+                if command.clear_keychain {
+                    self.backend.clear_keychain()?;
                 }
+                if command.clear_state {
+                    self.backend.clear_app_state(app_id)?;
+                }
+                if let Some(permissions) = command.permissions.as_ref() {
+                    self.backend.set_permissions(app_id, permissions)?;
+                }
+                self.backend.launch_app(
+                    app_id,
+                    command.stop_app,
+                    command.arguments.as_slice(),
+                    self.launch_environment.as_slice(),
+                )?;
+                self.launched_app = true;
                 self.best_effort_focus_after_launch();
                 Ok(None)
             }
             UiCommand::StopApp(app_id) | UiCommand::KillApp(app_id) => {
-                let app_id = self.resolve_command_bundle_id(
-                    app_id.as_deref(),
-                    if matches!(command, UiCommand::StopApp(_)) {
-                        "stopApp"
-                    } else {
-                        "killApp"
-                    },
-                )?;
-                self.finish_active_trace_segment(if matches!(command, UiCommand::StopApp(_)) {
-                    "stopApp"
-                } else {
-                    "killApp"
-                })?;
+                let app_id = self.resolve_bundle_id(app_id.as_deref()).to_owned();
                 self.backend.stop_app(&app_id)?;
                 Ok(None)
             }
             UiCommand::ClearState(app_id) => {
-                let app_id = self.resolve_command_bundle_id(app_id.as_deref(), "clearState")?;
-                self.finish_active_trace_segment("clearState")?;
+                let app_id = self.resolve_bundle_id(app_id.as_deref()).to_owned();
                 self.backend.clear_app_state(&app_id)?;
                 Ok(None)
             }
             UiCommand::ClearKeychain => {
-                self.finish_active_trace_segment("clearKeychain")?;
                 self.backend.clear_keychain()?;
                 Ok(None)
             }
@@ -426,23 +389,21 @@ impl UiFlowRunner {
                     return Ok(None);
                 }
                 let element = self.find_tappable_element(target)?;
-                let frame = element.frame.expect("tappable element must expose a frame");
+                let frame = self.require_element_frame(&element, "tapOn")?;
                 let (x, y) = frame.center();
                 self.backend.tap_point(x, y, None)?;
                 Ok(None)
             }
             UiCommand::HoverOn(target) => {
                 let element = self.find_visible_element(target)?;
-                let frame = element.frame.expect("hover target must expose a frame");
+                let frame = self.require_element_frame(&element, "hoverOn")?;
                 let (x, y) = frame.center();
                 self.backend.hover_point(x, y)?;
                 Ok(None)
             }
             UiCommand::RightClickOn(target) => {
                 let element = self.find_tappable_element(target)?;
-                let frame = element
-                    .frame
-                    .expect("right-click target must expose a frame");
+                let frame = self.require_element_frame(&element, "rightClickOn")?;
                 let (x, y) = frame.center();
                 self.backend.right_click_point(x, y)?;
                 Ok(None)
@@ -456,8 +417,13 @@ impl UiFlowRunner {
                 Ok(None)
             }
             UiCommand::DoubleTapOn(target) => {
+                if self.backend.activate_selector(target)? {
+                    thread::sleep(Duration::from_millis(120));
+                    let _ = self.backend.activate_selector(target)?;
+                    return Ok(None);
+                }
                 let element = self.find_tappable_element(target)?;
-                let frame = element.frame.expect("tappable element must expose a frame");
+                let frame = self.require_element_frame(&element, "doubleTapOn")?;
                 let (x, y) = frame.center();
                 self.backend.tap_point(x, y, None)?;
                 thread::sleep(Duration::from_millis(120));
@@ -468,8 +434,11 @@ impl UiFlowRunner {
                 target,
                 duration_ms,
             } => {
+                if self.backend.activate_selector(target)? {
+                    return Ok(None);
+                }
                 let element = self.find_tappable_element(target)?;
-                let frame = element.frame.expect("tappable element must expose a frame");
+                let frame = self.require_element_frame(&element, "longPressOn")?;
                 let (x, y) = frame.center();
                 self.backend.tap_point(x, y, Some(*duration_ms))?;
                 Ok(None)
@@ -551,8 +520,8 @@ impl UiFlowRunner {
                 self.backend.press_button(*button, *duration_ms)?;
                 Ok(None)
             }
-            UiCommand::SelectMenuItem(path) => {
-                self.backend.select_menu_item(path)?;
+            UiCommand::SelectMenuItem(selection) => {
+                self.backend.select_menu_item(selection)?;
                 Ok(None)
             }
             UiCommand::HideKeyboard => {
@@ -613,9 +582,7 @@ impl UiFlowRunner {
                 Ok(None)
             }
             UiCommand::SetPermissions(command) => {
-                let app_id =
-                    self.resolve_command_bundle_id(command.app_id.as_deref(), "setPermissions")?;
-                self.finish_active_trace_segment("setPermissions")?;
+                let app_id = self.resolve_bundle_id(command.app_id.as_deref()).to_owned();
                 self.backend.set_permissions(&app_id, command)?;
                 Ok(None)
             }
@@ -762,7 +729,12 @@ impl UiFlowRunner {
             if find_visible_element_by_selector(&tree, &command.target).is_some() {
                 return Ok(());
             }
-            self.perform_scroll_with_tree(command.direction, &tree)?;
+            if let Some(container) = find_scroll_container_near_selector(&tree, &command.target) {
+                self.backend
+                    .scroll_at_point(command.direction, container.center())?;
+            } else {
+                self.perform_scroll_with_tree(command.direction, &tree)?;
+            }
             thread::sleep(Duration::from_millis(350));
         }
 
@@ -788,7 +760,7 @@ impl UiFlowRunner {
 
     fn perform_swipe_on(&self, command: &UiElementSwipe) -> Result<()> {
         let element = self.find_tappable_element(&command.target)?;
-        let frame = element.frame.expect("swipe target must expose a frame");
+        let frame = self.require_element_frame(&element, "swipeOn")?;
         let (start, end) = directional_points_in_frame(frame, command.direction, false);
         self.backend.swipe_points(
             start,
@@ -801,22 +773,25 @@ impl UiFlowRunner {
 
     fn perform_drag_and_drop(&self, command: &UiDragAndDrop) -> Result<()> {
         let source = self.find_tappable_element(&command.source)?;
-        let source_frame = source.frame.expect("drag source must expose a frame");
+        let source_frame = self.require_element_frame(&source, "dragAndDrop source")?;
         let destination = self.find_tappable_element(&command.destination)?;
-        let destination_frame = destination
-            .frame
-            .expect("drag destination must expose a frame");
+        let destination_frame =
+            self.require_element_frame(&destination, "dragAndDrop destination")?;
         self.backend.drag_points(
             source_frame.center(),
             destination_frame.center(),
             command.duration_ms.or(Some(DEFAULT_DRAG_DURATION_MS)),
             command.delta.or(Some(DEFAULT_SWIPE_DELTA)),
+            source
+                .copied_text
+                .as_deref()
+                .or(Some(source.label.as_str())),
         )
     }
 
     fn perform_scroll_on(&self, command: &UiElementScroll) -> Result<()> {
         let element = self.find_tappable_element(&command.target)?;
-        let frame = element.frame.expect("scroll target must expose a frame");
+        let frame = self.require_element_frame(&element, "scrollOn")?;
         self.backend
             .scroll_at_point(command.direction, frame.center())
     }

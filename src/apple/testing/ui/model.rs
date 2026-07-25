@@ -51,7 +51,7 @@ pub enum UiCommand {
         button: UiHardwareButton,
         duration_ms: Option<u32>,
     },
-    SelectMenuItem(Vec<String>),
+    SelectMenuItem(UiMenuSelection),
     HideKeyboard,
     AssertVisible(UiSelector),
     AssertNotVisible(UiSelector),
@@ -107,6 +107,22 @@ pub struct UiDragAndDrop {
     pub destination: UiSelector,
     pub duration_ms: Option<u32>,
     pub delta: Option<u32>,
+}
+
+#[derive(Debug, Clone)]
+pub struct UiMenuSelection {
+    pub source: Option<UiSelector>,
+    pub path: Vec<String>,
+}
+
+impl UiMenuSelection {
+    pub(crate) fn summary(&self) -> String {
+        let path = self.path.join(" > ");
+        match self.source.as_ref() {
+            Some(source) => format!("{} from {}", path, source.summary()),
+            None => path,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -351,8 +367,8 @@ impl UiCommand {
             UiCommand::PressButton { button, .. } => {
                 format!("pressButton {}", button.summary())
             }
-            UiCommand::SelectMenuItem(path) => {
-                format!("selectMenuItem {}", path.join(" > "))
+            UiCommand::SelectMenuItem(selection) => {
+                format!("selectMenuItem {}", selection.summary())
             }
             UiCommand::HideKeyboard => "hideKeyboard".to_owned(),
             UiCommand::AssertVisible(target) => {

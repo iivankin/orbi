@@ -1,0 +1,193 @@
+{
+  "$schema": "../../../../schemas/orbi-ui-test.v1.json",
+  "appId": "dev.orbi.examples.macos",
+  "name": "macos-appkit-command-coverage",
+  "steps": [
+    "launchApp",
+    {
+      "tapOn": "AppKit Coverage"
+    },
+    {
+      "assertVisible": {
+        "id": "appkit-coverage-title"
+      }
+    },
+    {
+      "startRecording": "macos-appkit-command-coverage"
+    },
+    {
+      "tapOn": {
+        "id": "appkit-command-field"
+      }
+    },
+    {
+      "inputText": "Zed"
+    },
+    {
+      "assertVisible": "Zed"
+    },
+    {
+      "pressKey": "!"
+    },
+    {
+      "assertVisible": "Zed!"
+    },
+    {
+      "pressKeyCode": {
+        "keyCode": 51
+      }
+    },
+    {
+      "assertVisible": "Zed"
+    },
+    {
+      "keySequence": [51]
+    },
+    {
+      "assertVisible": "Ze"
+    },
+    {
+      "eraseText": 1
+    },
+    {
+      "assertVisible": "Z"
+    },
+    {
+      "setClipboard": "ed"
+    },
+    "pasteText",
+    {
+      "assertVisible": "Zed"
+    },
+    {
+      "copyTextFrom": {
+        "id": "appkit-copy-source"
+      }
+    },
+    "pasteText",
+    {
+      "assertVisible": "ZedAppKit copied value"
+    },
+    {
+      "tapOn": {
+        "id": "appkit-tap-button"
+      }
+    },
+    {
+      "assertVisible": "AppKit tap recognized"
+    },
+    {
+      "doubleTapOn": {
+        "id": "appkit-double-button"
+      }
+    },
+    {
+      "assertVisible": "AppKit double count 2"
+    },
+    {
+      "longPressOn": {
+        "element": {
+          "id": "appkit-long-target"
+        },
+        "duration": "500ms"
+      }
+    },
+    {
+      "assertVisible": "AppKit long press recognized"
+    },
+    {
+      "hoverOn": {
+        "id": "appkit-hover-target"
+      }
+    },
+    {
+      "assertVisible": "AppKit hover recognized"
+    },
+    {
+      "rightClickOn": {
+        "id": "appkit-right-target"
+      }
+    },
+    {
+      "assertVisible": "AppKit right click recognized"
+    },
+    {
+      "dragAndDrop": {
+        "from": {
+          "id": "appkit-drag-source"
+        },
+        "to": {
+          "id": "appkit-drop-target"
+        },
+        "duration": "500ms",
+        "delta": 4
+      }
+    },
+    {
+      "assertVisible": "AppKit dropped appkit-token"
+    },
+    {
+      "selectMenuItem": {
+        "from": {
+          "id": "appkit-coverage-menu"
+        },
+        "item": "AppKit Menu Action"
+      }
+    },
+    {
+      "assertVisible": "AppKit menu selected"
+    },
+    {
+      "swipeOn": {
+        "element": {
+          "id": "appkit-command-scroll"
+        },
+        "direction": "UP",
+        "duration": "500ms",
+        "delta": 4
+      }
+    },
+    {
+      "scrollOn": {
+        "element": {
+          "id": "appkit-command-scroll"
+        },
+        "direction": "DOWN"
+      }
+    },
+    {
+      "scrollUntilVisible": {
+        "element": {
+          "id": "appkit-scroll-footer"
+        },
+        "direction": "DOWN",
+        "timeout": "8s"
+      }
+    },
+    {
+      "assertVisible": {
+        "id": "appkit-scroll-footer"
+      }
+    },
+    {
+      "assertNotVisible": "AppKit missing sentinel"
+    },
+    {
+      "extendedWaitUntil": {
+        "visible": {
+          "id": "appkit-scroll-footer"
+        },
+        "notVisible": {
+          "text": "AppKit missing sentinel"
+        },
+        "timeout": "2s"
+      }
+    },
+    "waitForAnimationToEnd",
+    "hideKeyboard",
+    "stopRecording",
+    {
+      "takeScreenshot": "macos-appkit-command-coverage"
+    }
+  ]
+}

@@ -3,9 +3,9 @@ use anyhow::{Context, Result, bail};
 use crate::apple::runtime;
 use crate::apple::testing::ui::{
     UiCommand, UiDragAndDrop, UiElementScroll, UiElementSwipe, UiExtendedWaitUntil,
-    UiHardwareButton, UiKeyModifier, UiKeyPress, UiLaunchApp, UiLocationPoint, UiPermissionConfig,
-    UiPermissionSetting, UiPermissionState, UiPointExpr, UiPressKey, UiScrollUntilVisible,
-    UiSelector, UiSwipe, UiSwipeDirection, UiTravel,
+    UiHardwareButton, UiKeyModifier, UiKeyPress, UiLaunchApp, UiLocationPoint, UiMenuSelection,
+    UiPermissionConfig, UiPermissionSetting, UiPermissionState, UiPointExpr, UiPressKey,
+    UiScrollUntilVisible, UiSelector, UiSwipe, UiSwipeDirection, UiTravel,
 };
 use crate::cli::{
     UiAppTargetArgs, UiDragArgs, UiEraseTextArgs, UiHardwareButtonArg, UiInputTextArgs,
@@ -276,7 +276,10 @@ pub(super) fn select_menu_item(args: &UiSelectMenuItemArgs) -> Result<DirectUiCo
     Ok(DirectUiCommand {
         platform: platform_from_cli(args.runtime.platform),
         focus_after_launch: false,
-        command: UiCommand::SelectMenuItem(parse_menu_path(&args.path)?),
+        command: UiCommand::SelectMenuItem(UiMenuSelection {
+            source: None,
+            path: parse_menu_path(&args.path)?,
+        }),
     })
 }
 

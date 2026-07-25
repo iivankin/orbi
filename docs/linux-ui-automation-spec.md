@@ -757,7 +757,7 @@ Anything narrower will either fail on modern Wayland desktops or create the wron
 - Orbi repo:
   - current desktop UI backend contract in `src/apple/testing/ui.rs`
   - macOS backend implementation in `src/apple/testing/ui/backend.rs`
-  - macOS helper in `src/apple/testing/ui/macos_driver.swift`
+  - macOS backend stub in `src/apple/testing/ui/backend/macos.rs`; the previous Swift helper has been removed
   - documented backend coverage in `README.md`
   - fixture flows in `examples/macos-app/Tests/UI/`
 - AT-SPI:

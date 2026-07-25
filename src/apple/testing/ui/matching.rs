@@ -80,7 +80,7 @@ pub(super) fn find_element_by_selector(
     selector: &UiSelector,
 ) -> Option<UiElementMatch> {
     let mut matches = Vec::new();
-    collect_element_matches(tree, selector, &mut matches);
+    collect_element_matches(tree, selector, false, &mut matches);
     select_best_match(matches)
 }
 
@@ -90,7 +90,7 @@ pub(super) fn find_visible_element_by_selector(
 ) -> Option<UiElementMatch> {
     let screen = infer_screen_frame(tree);
     let mut matches = Vec::new();
-    collect_element_matches(tree, selector, &mut matches);
+    collect_element_matches(tree, selector, false, &mut matches);
     matches.retain(|element| {
         screen.is_none_or(|screen| {
             element
@@ -104,14 +104,38 @@ pub(super) fn find_visible_element_by_selector(
 pub(super) fn find_visible_scroll_container(tree: &JsonValue) -> Option<UiFrame> {
     let screen = infer_screen_frame(tree);
     let mut frames = Vec::new();
-    collect_visible_scroll_frames(tree, screen, &mut frames);
-    frames.into_iter().max_by(|left, right| {
-        let left_area = left.width * left.height;
-        let right_area = right.width * right.height;
-        left_area
-            .partial_cmp(&right_area)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    })
+    collect_visible_scroll_frames(tree, screen, false, &mut frames);
+    largest_frame(frames)
+}
+
+pub(super) fn find_scroll_container_near_selector(
+    tree: &JsonValue,
+    selector: &UiSelector,
+) -> Option<UiFrame> {
+    let screen = infer_screen_frame(tree);
+    let mut matches = Vec::new();
+    collect_element_matches(tree, selector, false, &mut matches);
+    let target = select_best_match(matches)?.frame?;
+
+    let mut containers = Vec::new();
+    collect_visible_scroll_frames(tree, screen, false, &mut containers);
+    containers
+        .into_iter()
+        .filter(|container| {
+            ranges_overlap(
+                container.x,
+                container.x + container.width,
+                target.x,
+                target.x + target.width,
+            )
+        })
+        .min_by(|left, right| {
+            let left_distance = vertical_distance_to_frame(*left, target);
+            let right_distance = vertical_distance_to_frame(*right, target);
+            left_distance
+                .partial_cmp(&right_distance)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
 }
 
 fn select_best_match(mut matches: Vec<UiElementMatch>) -> Option<UiElementMatch> {
@@ -123,6 +147,31 @@ fn select_best_match(mut matches: Vec<UiElementMatch>) -> Option<UiElementMatch>
             .then_with(|| left.label.cmp(&right.label))
     });
     matches.into_iter().next()
+}
+
+fn largest_frame(frames: Vec<UiFrame>) -> Option<UiFrame> {
+    frames.into_iter().max_by(|left, right| {
+        let left_area = left.width * left.height;
+        let right_area = right.width * right.height;
+        left_area
+            .partial_cmp(&right_area)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    })
+}
+
+fn ranges_overlap(left_start: f64, left_end: f64, right_start: f64, right_end: f64) -> bool {
+    left_start < right_end && left_end > right_start
+}
+
+fn vertical_distance_to_frame(container: UiFrame, target: UiFrame) -> f64 {
+    let target_center_y = target.y + target.height / 2.0;
+    if target_center_y < container.y {
+        container.y - target_center_y
+    } else if target_center_y > container.y + container.height {
+        target_center_y - (container.y + container.height)
+    } else {
+        0.0
+    }
 }
 
 fn resolve_coordinate(origin: f64, span: f64, coordinate: UiCoordinate) -> f64 {
@@ -140,6 +189,9 @@ fn collect_frames(tree: &JsonValue, frames: &mut Vec<UiFrame>) {
             }
         }
         JsonValue::Object(map) => {
+            if node_hidden(map) {
+                return;
+            }
             if let Some(frame) = extract_frame(map) {
                 frames.push(frame);
             }
@@ -154,16 +206,19 @@ fn collect_frames(tree: &JsonValue, frames: &mut Vec<UiFrame>) {
 fn collect_visible_scroll_frames(
     tree: &JsonValue,
     screen: Option<UiFrame>,
+    hidden_ancestor: bool,
     frames: &mut Vec<UiFrame>,
 ) {
     match tree {
         JsonValue::Array(values) => {
             for value in values {
-                collect_visible_scroll_frames(value, screen, frames);
+                collect_visible_scroll_frames(value, screen, hidden_ancestor, frames);
             }
         }
         JsonValue::Object(map) => {
-            if let Some(frame) = extract_frame(map)
+            let hidden = hidden_ancestor || node_hidden(map);
+            if !hidden
+                && let Some(frame) = extract_frame(map)
                 && frame.width > 1.0
                 && frame.height > 1.0
                 && screen
@@ -177,7 +232,7 @@ fn collect_visible_scroll_frames(
                 frames.push(frame);
             }
             for value in map.values() {
-                collect_visible_scroll_frames(value, screen, frames);
+                collect_visible_scroll_frames(value, screen, hidden, frames);
             }
         }
         _ => {}
@@ -202,20 +257,22 @@ fn is_scrollable_role(role: &str) -> bool {
 fn collect_element_matches(
     tree: &JsonValue,
     selector: &UiSelector,
+    hidden_ancestor: bool,
     matches: &mut Vec<UiElementMatch>,
 ) {
     match tree {
         JsonValue::Array(values) => {
             for value in values {
-                collect_element_matches(value, selector, matches);
+                collect_element_matches(value, selector, hidden_ancestor, matches);
             }
         }
         JsonValue::Object(map) => {
-            if let Some(element) = match_element_object(map, selector) {
+            let hidden = hidden_ancestor || node_hidden(map);
+            if !hidden && let Some(element) = match_element_object(map, selector) {
                 matches.push(element);
             }
             for value in map.values() {
-                collect_element_matches(value, selector, matches);
+                collect_element_matches(value, selector, hidden, matches);
             }
         }
         _ => {}
@@ -264,6 +321,26 @@ fn match_element_object(
         score,
         copied_text,
     })
+}
+
+fn node_hidden(map: &serde_json::Map<String, JsonValue>) -> bool {
+    map.get("AXHidden")
+        .and_then(json_bool)
+        .or_else(|| map.get("hidden").and_then(json_bool))
+        .unwrap_or(false)
+}
+
+fn json_bool(value: &JsonValue) -> Option<bool> {
+    match value {
+        JsonValue::Bool(value) => Some(*value),
+        JsonValue::Number(number) => number.as_i64().map(|value| value != 0),
+        JsonValue::String(value) => match value.as_str() {
+            "true" | "1" => Some(true),
+            "false" | "0" => Some(false),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 fn match_score(value: &str, needle: &str) -> u8 {

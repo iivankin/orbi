@@ -1,5 +1,6 @@
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result, bail};
@@ -24,8 +25,6 @@ mod report;
 mod runner;
 #[path = "ui/schema.rs"]
 mod schema;
-#[path = "ui/trace.rs"]
-mod trace;
 
 use self::backend::{IosSimulatorBackend, MacosBackend, MacosDoctorStatus, UiBackend};
 use self::flow::collect_ui_flow_paths;
@@ -37,13 +36,12 @@ use self::matching::{
 pub(crate) use self::model::{
     UiCommand, UiCoordinate, UiCrashDeleteRequest, UiCrashQuery, UiDragAndDrop, UiElementScroll,
     UiElementSwipe, UiExtendedWaitUntil, UiFlow, UiFlowConfig, UiHardwareButton, UiKeyModifier,
-    UiKeyPress, UiLaunchApp, UiLocationPoint, UiPermissionConfig, UiPermissionSetting,
-    UiPermissionState, UiPointExpr, UiPressKey, UiScrollUntilVisible, UiSelector, UiSwipe,
-    UiSwipeDirection, UiTravel,
+    UiKeyPress, UiLaunchApp, UiLocationPoint, UiMenuSelection, UiPermissionConfig,
+    UiPermissionSetting, UiPermissionState, UiPointExpr, UiPressKey, UiScrollUntilVisible,
+    UiSelector, UiSwipe, UiSwipeDirection, UiTravel,
 };
 use self::report::{RunStatus, UiTestRunReport, unix_timestamp_secs};
 use self::runner::UiFlowRunner;
-use self::trace::MacosUiTraceRuntime;
 use crate::apple::build::toolchain::DestinationKind;
 use crate::apple::logs::SimulatorAppLogStream;
 use crate::apple::{build, runtime};
@@ -51,7 +49,8 @@ use crate::cli::{ProfileKind, TestArgs, UiCleanTraceTempArgs, UiInitArgs};
 use crate::context::ProjectContext;
 use crate::manifest::ApplePlatform;
 use crate::util::{
-    ensure_dir, format_elapsed, human_bytes, print_success, resolve_path, write_json_file,
+    ensure_dir, ensure_parent_dir, format_elapsed, human_bytes, print_success, resolve_path,
+    write_json_file,
 };
 
 struct PreparedUiSession {
@@ -167,7 +166,8 @@ pub fn run_ui_command(
         .bundle_id
         .clone();
     let backend = backend_for_ui_command(project, platform, &command, &bundle_id)?;
-    let mut runner = UiFlowRunner::new(backend, run_root, bundle_id, focus_after_launch, None);
+    let mut runner =
+        UiFlowRunner::new(backend, run_root, bundle_id, focus_after_launch, Vec::new());
     let command_summary = command.summary();
     if let Some(path) = runner.run_leaf_command(&command)? {
         println!("artifact: {}", path.display());
@@ -186,9 +186,6 @@ fn run_ui_flow_paths(
     trace: Option<ProfileKind>,
     focus_after_launch: bool,
 ) -> Result<()> {
-    if platform == ApplePlatform::Ios {
-        crate::apple::profile::ensure_simulator_profiling_supported(trace)?;
-    }
     if platform == ApplePlatform::Macos {
         let status = backend::macos_doctor(project)?;
         ensure_macos_ui_test_requirements(&status)?;
@@ -205,14 +202,18 @@ fn run_ui_flow_paths(
 
     let started_at_unix = unix_timestamp_secs();
     let started = Instant::now();
-    let prepared = prepare_ui_session(project, platform, false)?;
-    if platform == ApplePlatform::Macos && trace.is_some() {
-        let target = project.resolved_manifest.resolve_target(None)?;
-        crate::apple::signing::prepare_macos_bundle_for_debug_tracing(
-            project,
-            target,
-            &prepared.build_outcome.receipt.bundle_path,
-        )?;
+    let prepared = prepare_ui_session(project, platform, false, trace)?;
+    let macos_trace = if platform == ApplePlatform::Macos {
+        trace
+            .map(|kind| prepare_macos_ui_trace(project, kind))
+            .transpose()?
+    } else {
+        None
+    };
+    if trace.is_some() && platform == ApplePlatform::Ios {
+        prepared
+            .backend
+            .remove_trace_file(prepared.build_outcome.receipt.bundle_id.as_str())?;
     }
     (|| {
         let report_path = run_root.join("report.json");
@@ -223,20 +224,10 @@ fn run_ui_flow_paths(
             artifacts_dir.clone(),
             prepared.build_outcome.receipt.bundle_id.clone(),
             focus_after_launch,
-            if platform == ApplePlatform::Macos {
-                trace.map(|kind| {
-                    MacosUiTraceRuntime::new(
-                        project.root.clone(),
-                        &project.project_paths,
-                        project.selected_xcode.clone(),
-                        &prepared.build_outcome.receipt,
-                        kind,
-                        project.app.interactive,
-                    )
-                })
-            } else {
-                None
-            },
+            macos_trace
+                .as_ref()
+                .map(|trace| trace.environment.clone())
+                .unwrap_or_default(),
         );
         let mut has_failures = false;
         for flow_path in &flow_paths {
@@ -244,7 +235,29 @@ fn run_ui_flow_paths(
                 has_failures = true;
             }
         }
-        if trace.is_none()
+        if let Some(kind) = trace.filter(|_| platform == ApplePlatform::Ios) {
+            thread::sleep(Duration::from_millis(1200));
+            let trace_path = crate::apple::profile::default_trace_output(&project.root, kind)?;
+            runner
+                .backend
+                .collect_trace_file(
+                    prepared.build_outcome.receipt.bundle_id.as_str(),
+                    &trace_path,
+                )
+                .with_context(|| "failed to collect iOS simulator trace file")?;
+            println!("trace: {}", trace_path.display());
+            if let Err(error) = runner
+                .backend
+                .stop_app(prepared.build_outcome.receipt.bundle_id.as_str())
+            {
+                eprintln!(
+                    "warning: failed to stop `{}` after traced UI tests on {}: {error:#}",
+                    prepared.build_outcome.receipt.bundle_id,
+                    runner.backend.target_name()
+                );
+            }
+        }
+        if (trace.is_none() || platform == ApplePlatform::Macos)
             && let Err(error) = runner
                 .backend
                 .stop_app(prepared.build_outcome.receipt.bundle_id.as_str())
@@ -254,6 +267,22 @@ fn run_ui_flow_paths(
                 prepared.build_outcome.receipt.bundle_id,
                 runner.backend.target_name()
             );
+        }
+        if let Some(trace) = macos_trace.as_ref()
+            && runner.did_launch_app()
+        {
+            if has_failures {
+                match wait_for_macos_ui_trace(trace) {
+                    Ok(()) => println!("trace: {}", trace.output_path.display()),
+                    Err(error) => eprintln!(
+                        "warning: failed to finalize {} trace after failed UI flows: {error:#}",
+                        trace.kind.trace_label()
+                    ),
+                }
+            } else {
+                wait_for_macos_ui_trace(trace)?;
+                println!("trace: {}", trace.output_path.display());
+            }
         }
 
         let finished_at_unix = unix_timestamp_secs();
@@ -296,6 +325,45 @@ fn run_ui_flow_paths(
     })()
 }
 
+struct MacosUiTrace {
+    kind: ProfileKind,
+    output_path: PathBuf,
+    environment: Vec<(String, String)>,
+}
+
+fn prepare_macos_ui_trace(project: &ProjectContext, kind: ProfileKind) -> Result<MacosUiTrace> {
+    let output_path = crate::apple::profile::default_trace_output(&project.root, kind)?;
+    ensure_parent_dir(&output_path)?;
+    match fs::remove_file(&output_path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to remove {}", output_path.display()));
+        }
+    }
+    Ok(MacosUiTrace {
+        kind,
+        environment: crate::apple::profile::trace_launch_environment(kind, &output_path),
+        output_path,
+    })
+}
+
+fn wait_for_macos_ui_trace(trace: &MacosUiTrace) -> Result<()> {
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_secs(5) {
+        if trace.output_path.exists() {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    bail!(
+        "{} trace did not write {}",
+        trace.kind.trace_label(),
+        trace.output_path.display()
+    )
+}
+
 fn start_ui_app_logs(prepared: &PreparedUiSession) -> Option<SimulatorAppLogStream> {
     if prepared.build_outcome.receipt.platform != ApplePlatform::Ios {
         return None;
@@ -323,7 +391,7 @@ pub(crate) fn dump_tree_json(
     project: &ProjectContext,
     platform: ApplePlatform,
 ) -> Result<JsonValue> {
-    let prepared = prepare_ui_session(project, platform, true)?;
+    let prepared = prepare_ui_session(project, platform, true, None)?;
     prepared.backend.describe_all()
 }
 
@@ -333,7 +401,7 @@ pub(crate) fn describe_point_json(
     x: f64,
     y: f64,
 ) -> Result<JsonValue> {
-    let prepared = prepare_ui_session(project, platform, true)?;
+    let prepared = prepare_ui_session(project, platform, true, None)?;
     prepared.backend.describe_point(x, y)
 }
 
@@ -389,7 +457,7 @@ pub(crate) fn attach_backend(
             Ok(Box::new(IosSimulatorBackend::attach(project)?))
         }
         ApplePlatform::Macos => {
-            let prepared = prepare_ui_session(project, platform, true)?;
+            let prepared = prepare_ui_session(project, platform, true, None)?;
             Ok(prepared.backend)
         }
         _ => bail!(
@@ -415,14 +483,25 @@ fn backend_for_ui_command(
     );
 
     if needs_prepared_session {
-        return Ok(prepare_ui_session(project, platform, false)?.backend);
+        return Ok(prepare_ui_session(project, platform, false, None)?.backend);
     }
 
     attach_backend(project, platform)
 }
 
 fn print_macos_doctor_status(status: &MacosDoctorStatus) {
-    println!("ui backend: orbi-ax-macos");
+    println!(
+        "ui backend: {}",
+        if status.backend_available {
+            "orbi-ax-macos"
+        } else {
+            "unavailable"
+        }
+    );
+    if !status.backend_available {
+        println!("macos ui automation: unavailable");
+        return;
+    }
     println!(
         "accessibility: {}",
         if status.accessibility_trusted {
@@ -487,6 +566,10 @@ fn cleanup_macos_trace_temp_dir(
 }
 
 fn ensure_macos_ui_test_requirements(status: &MacosDoctorStatus) -> Result<()> {
+    if !status.backend_available {
+        bail!("macOS UI automation backend is unavailable on this host")
+    }
+
     if status.accessibility_trusted && status.screen_capture_access {
         return Ok(());
     }
@@ -513,16 +596,21 @@ fn prepare_ui_session(
     project: &ProjectContext,
     platform: ApplePlatform,
     launch_app: bool,
+    trace: Option<ProfileKind>,
 ) -> Result<PreparedUiSession> {
     let destination = ui_testing_destination(platform);
     match platform {
         ApplePlatform::Ios => {
             idb::ensure_tooling_available()?;
-            let build_outcome =
-                build::build_for_testing_destination(project, platform, destination)?;
+            let build_outcome = build::build_for_testing_destination_with_trace(
+                project,
+                platform,
+                destination,
+                trace,
+            )?;
             let backend = IosSimulatorBackend::prepare(project, &build_outcome.receipt)?;
             if launch_app {
-                backend.launch_app(&build_outcome.receipt.bundle_id, true, &[])?;
+                backend.launch_app(&build_outcome.receipt.bundle_id, true, &[], &[])?;
             }
             Ok(PreparedUiSession {
                 build_outcome,
@@ -532,11 +620,15 @@ fn prepare_ui_session(
             })
         }
         ApplePlatform::Macos => {
-            let build_outcome =
-                build::build_for_testing_destination(project, platform, destination)?;
+            let build_outcome = build::build_for_testing_destination_with_trace(
+                project,
+                platform,
+                destination,
+                trace,
+            )?;
             let backend = MacosBackend::prepare(project, &build_outcome.receipt)?;
             if launch_app {
-                backend.launch_app(&build_outcome.receipt.bundle_id, true, &[])?;
+                backend.launch_app(&build_outcome.receipt.bundle_id, true, &[], &[])?;
             }
             Ok(PreparedUiSession {
                 build_outcome,

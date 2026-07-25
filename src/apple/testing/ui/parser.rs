@@ -10,8 +10,8 @@ use super::schema::{FLOW_SCHEMA_FILENAME, supports_flow_schema};
 use super::{
     UiCommand, UiCoordinate, UiDragAndDrop, UiElementScroll, UiElementSwipe, UiExtendedWaitUntil,
     UiFlow, UiFlowConfig, UiHardwareButton, UiKeyModifier, UiKeyPress, UiLaunchApp,
-    UiLocationPoint, UiPermissionConfig, UiPermissionSetting, UiPermissionState, UiPointExpr,
-    UiPressKey, UiScrollUntilVisible, UiSelector, UiSwipe, UiSwipeDirection, UiTravel,
+    UiLocationPoint, UiMenuSelection, UiPermissionConfig, UiPermissionSetting, UiPermissionState,
+    UiPointExpr, UiPressKey, UiScrollUntilVisible, UiSelector, UiSwipe, UiSwipeDirection, UiTravel,
 };
 
 pub fn parse_ui_flow(path: &Path) -> Result<UiFlow> {
@@ -274,7 +274,18 @@ fn parse_long_press(value: &Yaml) -> Result<UiCommand> {
 }
 
 fn parse_select_menu_item(value: &Yaml) -> Result<UiCommand> {
-    fn validate_items(items: Vec<String>) -> Result<UiCommand> {
+    fn parse_menu_path(value: &Yaml) -> Result<Vec<String>> {
+        match value {
+            Yaml::String(path) => Ok(path.split('>').map(str::to_owned).collect()),
+            Yaml::Array(items) => items
+                .iter()
+                .map(|item| Ok(yaml_string(item)?.to_owned()))
+                .collect::<Result<Vec<_>>>(),
+            _ => bail!("menu item paths must be a string or sequence"),
+        }
+    }
+
+    fn validate_selection(source: Option<UiSelector>, items: Vec<String>) -> Result<UiCommand> {
         let items = items
             .into_iter()
             .map(|item| item.trim().to_owned())
@@ -283,21 +294,24 @@ fn parse_select_menu_item(value: &Yaml) -> Result<UiCommand> {
         if items.is_empty() {
             bail!("`selectMenuItem` requires at least one menu label");
         }
-        Ok(UiCommand::SelectMenuItem(items))
+        Ok(UiCommand::SelectMenuItem(UiMenuSelection {
+            source,
+            path: items,
+        }))
     }
 
     match value {
-        Yaml::String(path) => validate_items(path.split('>').map(str::to_owned).collect()),
-        Yaml::Array(items) => validate_items(
-            items
-                .iter()
-                .map(|item| Ok(yaml_string(item)?.to_owned()))
-                .collect::<Result<Vec<_>>>()?,
-        ),
-        Yaml::Hash(map) => match get_optional(map, "path") {
-            Some(path) => parse_select_menu_item(path),
-            None => bail!("`selectMenuItem` expects a string, sequence, or `{{ path: ... }}`"),
-        },
+        Yaml::String(_) | Yaml::Array(_) => validate_selection(None, parse_menu_path(value)?),
+        Yaml::Hash(map) => {
+            let source = get_optional(map, "from").map(parse_selector).transpose()?;
+            let path_value = get_optional(map, "path").or_else(|| get_optional(map, "item"));
+            match path_value {
+                Some(path) => validate_selection(source, parse_menu_path(path)?),
+                None => bail!(
+                    "`selectMenuItem` expects a string, sequence, or `{{ path: ..., from: ... }}`"
+                ),
+            }
+        }
         _ => bail!("`selectMenuItem` expects a string, sequence, or mapping"),
     }
 }
@@ -1157,10 +1171,31 @@ mod tests {
         ));
         assert!(matches!(
             &flow.commands[8],
-            UiCommand::SelectMenuItem(path)
-            if path == &vec!["Automation".to_owned(), "Trigger Shortcut".to_owned()]
+            UiCommand::SelectMenuItem(selection)
+            if selection.source.is_none()
+                && selection.path == vec!["Automation".to_owned(), "Trigger Shortcut".to_owned()]
         ));
         assert!(matches!(&flow.commands[9], UiCommand::KillApp(None)));
+    }
+
+    #[test]
+    fn parses_popup_menu_item_selection() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("flow.json");
+        fs::write(
+            &path,
+            "{\n  \"$schema\": \"/tmp/.orbi/schemas/orbi-ui-test.v1.json\",\n  \"steps\": [\n    {\n      \"selectMenuItem\": {\n        \"from\": {\n          \"id\": \"quick-actions-menu\"\n        },\n        \"item\": \"Confirm Default Action\"\n      }\n    }\n  ]\n}\n",
+        )
+        .unwrap();
+
+        let flow = parse_ui_flow(&path).unwrap();
+        assert!(matches!(
+            &flow.commands[0],
+            UiCommand::SelectMenuItem(selection)
+            if selection.source.as_ref().and_then(|source| source.id.as_deref())
+                == Some("quick-actions-menu")
+                && selection.path == vec!["Confirm Default Action".to_owned()]
+        ));
     }
 
     #[test]

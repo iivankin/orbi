@@ -55,6 +55,33 @@ struct AutomationMenuFixture: View {
     }
 }
 
+struct MenuButtonFixture: View {
+    @Binding var status: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Menu Button")
+                .font(.headline)
+
+            Menu("Quick Actions") {
+                Button("Confirm Default Action") {
+                    status = "Menu button action triggered"
+                }
+
+                Button("Secondary Action") {
+                    status = "Secondary menu action triggered"
+                }
+            }
+            .accessibilityIdentifier("quick-actions-menu")
+
+            Text(status)
+                .font(.subheadline.weight(.medium))
+                .accessibilityIdentifier("menu-button-status")
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
 struct PersistenceFixture: View {
     @AppStorage("orbi.fixture.persisted-message")
     private var message = "Clean slate"
@@ -139,5 +166,10 @@ private final class HoverTargetView: NSView {
 
     override func mouseMoved(with event: NSEvent) {
         onHover?()
+    }
+
+    override func accessibilityPerformShowDefaultUI() -> Bool {
+        onHover?()
+        return true
     }
 }

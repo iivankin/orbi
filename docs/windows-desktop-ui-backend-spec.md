@@ -2,7 +2,7 @@
 
 ## Scope
 
-This spec is for the Windows counterpart of Orbi's current macOS desktop UI automation backend and its fixture coverage.
+This spec is for the Windows counterpart of Orbi's desktop UI automation runner and fixture coverage.
 
 It is **not** a Windows port of Orbi's Apple build/sign/submit pipeline.
 
@@ -10,8 +10,9 @@ Concretely, the thing being ported is the desktop-testing surface that currently
 
 - `src/apple/testing/ui.rs`
 - `src/apple/testing/ui/backend.rs`
-- `src/apple/testing/ui/macos_driver.swift`
 - `examples/macos-app`
+
+The previous macOS Swift helper implementation has been removed; the current macOS backend is an unsupported stub pending a new implementation.
 
 The target outcome is: Orbi can drive a Windows desktop fixture app with the same YAML runner, the same report/artifact model, and equivalent tested flows.
 

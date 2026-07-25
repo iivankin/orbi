@@ -452,6 +452,7 @@ where
             package_outputs: &package_outputs,
             external_link_inputs: &external_link_inputs,
             object_files: &[],
+            trace_runtime: None,
             index_store_path: Some(index_store_path),
         },
     )?;

@@ -23,5 +23,43 @@
     "OrbiGreeting": {
       "path": "Packages/OrbiGreeting"
     }
+  },
+  "asc": {
+    "$schema": "https://orbitstorage.dev/schemas/asc-sync.schema-0.1.3.json",
+    "_description": "This embedded config is documented by its `$schema`. Start with `orbi asc --help` for the common workflow.",
+    "team_id": "JZPJ2RGU5F",
+    "bundle_ids": {
+      "app": {
+        "bundle_id": "dev.orbi.examples.exampleiosapp",
+        "name": "ExampleIOSApp",
+        "platform": "ios"
+      }
+    },
+    "devices": {
+      "local-ios-device": {
+        "family": "ios",
+        "udid": "00008150-001C25910241401C",
+        "name": "iPhone Ilya Ivankin"
+      }
+    },
+    "certs": {
+      "development": {
+        "type": "development",
+        "name": "ExampleIOSApp Development"
+      }
+    },
+    "profiles": {
+      "app-development": {
+        "name": "ExampleIOSApp Development",
+        "type": "ios_app_development",
+        "bundle_id": "app",
+        "certs": [
+          "development"
+        ],
+        "devices": [
+          "local-ios-device"
+        ]
+      }
+    }
   }
 }

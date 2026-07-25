@@ -10,6 +10,7 @@ struct ExampleIOSApp: App {
 
     init() {
         logger.notice("ExampleIOSApp launched")
+        print("ExampleIOSApp print launched")
     }
 
     var body: some Scene {

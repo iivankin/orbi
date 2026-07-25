@@ -1,134 +1,48 @@
+use std::collections::BTreeMap;
 use std::fs;
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::Mutex;
-use std::thread;
-use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
-use serde_json::Value as JsonValue;
+use serde_json::{Value as JsonValue, json};
 use sha2::{Digest, Sha256};
-use tempfile::{TempDir, tempdir};
 
-use super::super::matching::{find_visible_element_by_selector, find_visible_scroll_container};
 use super::super::{
     UiCrashDeleteRequest, UiCrashQuery, UiHardwareButton, UiKeyModifier, UiKeyPress,
-    UiPermissionConfig, UiPressKey, UiSelector, UiSwipeDirection, UiTravel,
+    UiMenuSelection, UiPermissionConfig, UiPressKey, UiSelector, UiSwipeDirection, UiTravel,
 };
-use super::{ActiveVideoRecording, MacosDoctorStatus, MacosWindowInfo, UiBackend};
-use crate::apple::build::pipeline::macos_executable_path;
+use super::{MacosDoctorStatus, UiBackend};
 use crate::apple::logs::MacosInferiorLogRelay;
-use crate::apple::xcode::{
-    SelectedXcode, log_redirect_dylib_path as selected_xcode_log_redirect_dylib_path,
-};
+use crate::apple::xcode::{SelectedXcode, xcrun_command};
 use crate::context::ProjectContext;
-use crate::util::{
-    command_output, command_output_allow_failure, ensure_dir, run_command, timestamp_slug,
-};
+use crate::util::{ensure_dir, run_command};
 
-mod embedded_macos_ui_artifacts {
-    include!(concat!(env!("OUT_DIR"), "/embedded_macos_ui_artifacts.rs"));
-}
-
-struct EmbeddedMacosUiArtifactSpec {
-    name: &'static str,
-    file_name: &'static str,
-    bytes: &'static [u8],
-    override_env_var: &'static str,
-    available: bool,
-    unavailable_reason: &'static str,
-}
-
-const ORBI_MACOS_UI_DRIVER: EmbeddedMacosUiArtifactSpec = EmbeddedMacosUiArtifactSpec {
-    name: "orbi-macos-ui-driver",
-    file_name: embedded_macos_ui_artifacts::ORBI_MACOS_UI_DRIVER_FILE_NAME,
-    bytes: embedded_macos_ui_artifacts::ORBI_MACOS_UI_DRIVER_BYTES,
-    override_env_var: "ORBI_INTERNAL_MACOS_UI_DRIVER_PATH",
-    available: embedded_macos_ui_artifacts::ORBI_MACOS_UI_DRIVER_AVAILABLE,
-    unavailable_reason: embedded_macos_ui_artifacts::ORBI_MACOS_UI_DRIVER_UNAVAILABLE_REASON,
-};
-
-const ORBI_MACOS_UI_BRIDGE: EmbeddedMacosUiArtifactSpec = EmbeddedMacosUiArtifactSpec {
-    name: "orbi-macos-ui-bridge",
-    file_name: embedded_macos_ui_artifacts::ORBI_MACOS_UI_BRIDGE_FILE_NAME,
-    bytes: embedded_macos_ui_artifacts::ORBI_MACOS_UI_BRIDGE_BYTES,
-    override_env_var: "ORBI_INTERNAL_MACOS_UI_BRIDGE_PATH",
-    available: embedded_macos_ui_artifacts::ORBI_MACOS_UI_BRIDGE_AVAILABLE,
-    unavailable_reason: embedded_macos_ui_artifacts::ORBI_MACOS_UI_BRIDGE_UNAVAILABLE_REASON,
-};
+const HELPER_OVERRIDE_ENV: &str = "ORBI_INTERNAL_MACOS_UI_HELPER_PATH";
+const HELPER_BINARY_NAME: &str = "orbi-macos-ui-helper";
+const HELPER_SOURCES: &[&str] = &[
+    "src/apple/testing/ui/macos_driver/Protocol.swift",
+    "src/apple/testing/ui/macos_driver/AXSupport.swift",
+    "src/apple/testing/ui/macos_driver/Input.swift",
+    "src/apple/testing/ui/macos_driver/Screenshot.swift",
+    "src/apple/testing/ui/macos_driver/Recording.swift",
+    "src/apple/testing/ui/macos_driver/BackgroundActivation.swift",
+    "src/apple/testing/ui/macos_driver/Automation.swift",
+    "src/apple/testing/ui/macos_driver/Main.swift",
+];
 
 pub struct MacosBackend {
+    helper: Mutex<MacosHelperProcess>,
     helper_path: PathBuf,
-    bridge_dylib_path: PathBuf,
     bundle_id: String,
     bundle_path: PathBuf,
-    executable_path: PathBuf,
-    selected_xcode: Option<SelectedXcode>,
+    log_pipe_path: PathBuf,
+    log_relay: Mutex<Option<MacosUiLogRelay>>,
+    _log_temp_dir: tempfile::TempDir,
     verbose: bool,
-    pinned_target_pid: Mutex<Option<u32>>,
-    launched_session: Mutex<Option<MacosLaunchedSession>>,
-    pending_trace_launch: Mutex<Option<PendingTraceLaunch>>,
-    last_tap_point: Mutex<Option<(f64, f64)>>,
-    active_video: Option<ActiveVideoRecording>,
-}
-
-struct MacosLaunchedSession {
-    launched_pid: u32,
-    _launch_dir: TempDir,
-    log_pipe_anchor: Option<fs::File>,
-    log_relay: Option<MacosInferiorLogRelay>,
-    bridge_directory: PathBuf,
-    bridge_notification_name: String,
-    previous_frontmost_pid: Option<u32>,
-}
-
-impl MacosLaunchedSession {
-    fn finish_logging(&mut self) {
-        self.log_pipe_anchor.take();
-        if let Some(mut relay) = self.log_relay.take() {
-            relay.stop();
-        }
-    }
-}
-
-struct PendingTraceLaunch {
-    launch_dir: TempDir,
-    log_pipe_anchor: fs::File,
-    log_relay: MacosInferiorLogRelay,
-    launch_id: String,
-    registration_path: PathBuf,
-    bridge_directory: PathBuf,
-    bridge_notification_name: String,
-    previous_frontmost_pid: Option<u32>,
-}
-
-struct PreparedMacosLaunchSupport {
-    launch_dir: TempDir,
-    log_pipe_anchor: fs::File,
-    log_relay: MacosInferiorLogRelay,
-    bridge_directory: PathBuf,
-    bridge_notification_name: String,
-    launch_environment: Vec<(String, String)>,
-}
-
-#[derive(Deserialize)]
-struct MacosFrontmostApplication {
-    pid: Option<u32>,
-}
-
-#[derive(Deserialize)]
-struct MacosLaunchedApplication {
-    pid: u32,
-}
-
-#[derive(Deserialize)]
-struct MacosTraceLaunchRegistration {
-    pid: u32,
-    #[serde(rename = "launchId")]
-    launch_id: String,
-    #[serde(rename = "bundleId")]
-    bundle_id: String,
+    active_video_path: Option<PathBuf>,
 }
 
 impl MacosBackend {
@@ -136,19 +50,20 @@ impl MacosBackend {
         project: &ProjectContext,
         receipt: &crate::apple::build::receipt::BuildReceipt,
     ) -> Result<Self> {
+        let helper_path = ensure_macos_helper(project)?;
+        let log_temp_dir = tempfile::TempDir::new()
+            .context("failed to create temporary directory for macOS UI app logs")?;
+        let log_pipe_path = log_temp_dir.path().join("inferior-stdio.pipe");
         Ok(Self {
-            helper_path: ensure_macos_driver_binary(project)?,
-            bridge_dylib_path: ensure_macos_bridge_dylib(project)?,
+            helper: Mutex::new(MacosHelperProcess::spawn(&helper_path)?),
+            helper_path,
             bundle_id: receipt.bundle_id.clone(),
             bundle_path: receipt.bundle_path.clone(),
-            executable_path: macos_executable_path(receipt)?,
-            selected_xcode: project.selected_xcode.clone(),
+            log_pipe_path,
+            log_relay: Mutex::new(None),
+            _log_temp_dir: log_temp_dir,
             verbose: project.app.verbose,
-            pinned_target_pid: Mutex::new(None),
-            launched_session: Mutex::new(None),
-            pending_trace_launch: Mutex::new(None),
-            last_tap_point: Mutex::new(None),
-            active_video: None,
+            active_video_path: None,
         })
     }
 
@@ -162,389 +77,86 @@ impl MacosBackend {
         )
     }
 
-    fn run_helper(&self, arguments: &[String]) -> Result<()> {
-        let mut command = Command::new(&self.helper_path);
-        command.args(arguments);
-        run_command(&mut command).with_context(macos_requirement_message)
-    }
-
-    fn helper_output(&self, arguments: &[String]) -> Result<String> {
-        let mut command = Command::new(&self.helper_path);
-        command.args(arguments);
-        command_output(&mut command).with_context(macos_requirement_message)
-    }
-
-    fn stop_launched_process(&self) -> Result<()> {
-        let mut session = self
-            .launched_session
+    fn request(&self, command: &str, params: JsonValue) -> Result<JsonValue> {
+        let mut helper = self
+            .helper
             .lock()
-            .map_err(|_| anyhow::anyhow!("failed to lock the macOS UI backend process state"))?;
-        let Some(mut session) = session.take() else {
-            return Ok(());
-        };
-        terminate_macos_process_tree(session.launched_pid)?;
-        session.finish_logging();
-        Ok(())
-    }
-
-    fn target_selector_arguments(&self) -> Result<Vec<String>> {
-        let pinned_pid = *self
-            .pinned_target_pid
-            .lock()
-            .map_err(|_| anyhow::anyhow!("failed to lock the macOS UI backend target state"))?;
-        Ok(match pinned_pid {
-            Some(pid) => vec!["--pid".to_owned(), pid.to_string()],
-            None => vec!["--bundle-id".to_owned(), self.bundle_id.clone()],
-        })
-    }
-
-    fn bridge_arguments(&self) -> Result<Option<Vec<String>>> {
-        let session = self
-            .launched_session
-            .lock()
-            .map_err(|_| anyhow::anyhow!("failed to lock the macOS UI backend process state"))?;
-        let Some(session) = session.as_ref() else {
-            return Ok(None);
-        };
-
-        Ok(Some(vec![
-            "--bridge-dir".to_owned(),
-            session
-                .bridge_directory
-                .to_str()
-                .context("macOS UI bridge directory contains invalid UTF-8")?
-                .to_owned(),
-            "--bridge-name".to_owned(),
-            session.bridge_notification_name.clone(),
-        ]))
-    }
-
-    fn set_pinned_target_pid(&self, pid: u32) -> Result<()> {
-        *self
-            .pinned_target_pid
-            .lock()
-            .map_err(|_| anyhow::anyhow!("failed to lock the macOS UI backend target state"))? =
-            Some(pid);
-        Ok(())
-    }
-
-    fn prepare_launch_support(&self, tempdir_context: &str) -> Result<PreparedMacosLaunchSupport> {
-        let launch_dir = tempdir().with_context(|| tempdir_context.to_owned())?;
-        let bridge_directory = launch_dir.path().join("ui-bridge");
-        ensure_dir(&bridge_directory)?;
-        let bridge_notification_name = format!(
-            "dev.orbi.ui.{}",
-            launch_dir
-                .path()
-                .file_name()
-                .and_then(|value| value.to_str())
-                .unwrap_or("bridge")
-        );
-        let log_pipe = launch_dir.path().join("inferior-stdio.pipe");
-
-        let mut mkfifo = Command::new("mkfifo");
-        mkfifo.arg(&log_pipe);
-        run_command(&mut mkfifo)?;
-
-        let log_pipe_anchor = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&log_pipe)
-            .with_context(|| {
-                format!("failed to open macOS UI log pipe `{}`", log_pipe.display())
-            })?;
-        let log_relay = MacosInferiorLogRelay::start(&log_pipe, &self.bundle_id, self.verbose);
-        let launch_environment = macos_ui_bridge_launch_environment(
-            self.selected_xcode.as_ref(),
-            &self.bridge_dylib_path,
-            &bridge_directory,
-            &bridge_notification_name,
-            &log_pipe,
-        )?;
-
-        Ok(PreparedMacosLaunchSupport {
-            launch_dir,
-            log_pipe_anchor,
-            log_relay,
-            bridge_directory,
-            bridge_notification_name,
-            launch_environment,
-        })
-    }
-
-    fn wait_for_trace_launch_registration(
-        &self,
-        pending: &PendingTraceLaunch,
-    ) -> Result<MacosTraceLaunchRegistration> {
-        let started = Instant::now();
-        let mut last_error = None;
-        while started.elapsed() < Duration::from_secs(10) {
-            if let Some(registration) = read_trace_launch_registration(&pending.registration_path)?
-            {
-                if registration.launch_id != pending.launch_id {
-                    last_error = Some(format!(
-                        "trace launch registration `{}` reported unexpected launch id `{}`",
-                        pending.registration_path.display(),
-                        registration.launch_id
-                    ));
-                } else if registration.bundle_id != self.bundle_id {
-                    last_error = Some(format!(
-                        "trace launch registration `{}` reported unexpected bundle `{}`",
-                        pending.registration_path.display(),
-                        registration.bundle_id
-                    ));
-                } else if !process_is_running(registration.pid)? {
-                    last_error = Some(format!(
-                        "trace launch registration `{}` reported stale pid `{}`",
-                        pending.registration_path.display(),
-                        registration.pid
-                    ));
-                } else {
-                    return Ok(registration);
+            .map_err(|_| anyhow::anyhow!("failed to lock the macOS UI helper process"))?;
+        if helper.has_exited() {
+            *helper = MacosHelperProcess::spawn(&self.helper_path)?;
+        }
+        match helper.request(command, params) {
+            Ok(value) => Ok(value),
+            Err(error) => {
+                let details = format!("{error:#}");
+                if helper.has_exited()
+                    || details.contains("Broken pipe")
+                    || details.contains("exited before replying")
+                {
+                    let _ = MacosHelperProcess::spawn(&self.helper_path)
+                        .map(|replacement| *helper = replacement);
                 }
+                Err(anyhow!(
+                    "macOS UI helper `{}` failed while running `{command}`: {details}",
+                    self.helper_path.display()
+                ))
             }
-            thread::sleep(Duration::from_millis(50));
-        }
-
-        match last_error {
-            Some(detail) => Err(anyhow::anyhow!(detail)),
-            None => bail!(
-                "timed out waiting for traced macOS app `{}` to register launch `{}`",
-                self.bundle_id,
-                pending.launch_id
-            ),
         }
     }
 
-    fn start_attached_log_session(
+    fn run(&self, command: &str, params: JsonValue) -> Result<()> {
+        self.request(command, params).map(|_| ())
+    }
+
+    fn restart_log_relay(&self) -> Result<()> {
+        let mut relay = self
+            .log_relay
+            .lock()
+            .map_err(|_| anyhow!("failed to lock macOS UI log relay"))?;
+        if relay.is_none() {
+            *relay = Some(MacosUiLogRelay::start(
+                &self.log_pipe_path,
+                &self.bundle_id,
+                self.verbose,
+            )?);
+        }
+        Ok(())
+    }
+
+    fn stop_log_relay(&self) {
+        if let Ok(mut relay) = self.log_relay.lock() {
+            *relay = None;
+        }
+    }
+
+    fn launch_with_open(
         &self,
         arguments: &[(String, String)],
-    ) -> Result<MacosLaunchedSession> {
-        let PreparedMacosLaunchSupport {
-            launch_dir,
-            log_pipe_anchor,
-            log_relay,
-            bridge_directory,
-            bridge_notification_name,
-            launch_environment,
-        } = self.prepare_launch_support("failed to create macOS UI launch tempdir")?;
-        let launch_arguments = macos_launch_arguments(arguments);
-        let bundle_path = self
-            .bundle_path
-            .to_str()
-            .context("macOS app bundle path contains invalid UTF-8")?;
-        let mut command = Command::new(&self.helper_path);
-        command.args(["launch-app", "--app-path", bundle_path]);
-        for argument in launch_arguments {
-            command.arg("--argument").arg(argument);
-        }
-        for (key, value) in launch_environment {
-            command.arg("--env").arg(format!("{key}={value}"));
-        }
-        let output = command_output(&mut command)
-            .with_context(|| format!("failed to launch `{}` without activation", self.bundle_id))?;
-        let launched: MacosLaunchedApplication =
-            serde_json::from_str(&output).context("failed to parse macOS launch helper output")?;
-
-        Ok(MacosLaunchedSession {
-            launched_pid: launched.pid,
-            _launch_dir: launch_dir,
-            log_pipe_anchor: Some(log_pipe_anchor),
-            log_relay: Some(log_relay),
-            bridge_directory,
-            bridge_notification_name,
-            previous_frontmost_pid: None,
-        })
-    }
-
-    fn prepare_pending_trace_launch(
-        &self,
-        previous_frontmost_pid: Option<u32>,
-    ) -> Result<Vec<(String, String)>> {
-        let PreparedMacosLaunchSupport {
-            launch_dir,
-            log_pipe_anchor,
-            log_relay,
-            bridge_directory,
-            bridge_notification_name,
-            mut launch_environment,
-        } = self.prepare_launch_support("failed to create macOS traced-session tempdir")?;
-        let launch_id = timestamp_slug();
-        let registration_path = bridge_directory.join(format!("trace-launch-{launch_id}.json"));
-        launch_environment.push((
-            "ORBI_MACOS_UI_TRACE_LAUNCH_ID".to_owned(),
-            launch_id.clone(),
-        ));
-        launch_environment.push((
-            "ORBI_MACOS_UI_TRACE_REGISTRATION_PATH".to_owned(),
-            registration_path.display().to_string(),
-        ));
-        launch_environment.push((
-            "ORBI_MACOS_UI_TRACE_EXPECTED_BUNDLE_ID".to_owned(),
-            self.bundle_id.clone(),
-        ));
-
-        *self
-            .pending_trace_launch
-            .lock()
-            .map_err(|_| anyhow::anyhow!("failed to lock the macOS traced launch state"))? =
-            Some(PendingTraceLaunch {
-                launch_dir,
-                log_pipe_anchor,
-                log_relay,
-                launch_id,
-                registration_path,
-                bridge_directory,
-                bridge_notification_name,
-                previous_frontmost_pid,
-            });
-
-        Ok(launch_environment)
-    }
-
-    fn window_capture_info(&self) -> Result<MacosWindowInfo> {
-        let started = Instant::now();
-        let mut last_error = None;
-        while started.elapsed() < Duration::from_secs(10) {
-            let mut command = Command::new(&self.helper_path);
-            let mut arguments = vec!["window-info".to_owned()];
-            arguments.extend(self.target_selector_arguments()?);
-            command.args(arguments);
-            let (success, stdout, stderr) = command_output_allow_failure(&mut command)?;
-            if success {
-                return serde_json::from_str(&stdout).context("failed to parse macOS window info");
-            }
-            let detail = stderr.trim();
-            if !detail.is_empty() {
-                last_error = Some(detail.to_owned());
-            }
-            thread::sleep(Duration::from_millis(100));
-        }
-
-        match last_error {
-            Some(detail) => bail!("{detail}"),
-            None => bail!(
-                "timed out waiting for a visible macOS window for `{}`",
-                self.bundle_id
-            ),
-        }
-    }
-
-    fn wait_for_actionable_app(&self) -> Result<()> {
-        let started = Instant::now();
-        let mut last_error = None;
-        while started.elapsed() < Duration::from_secs(10) {
-            let mut command = Command::new(&self.helper_path);
-            let mut arguments = vec!["describe-all".to_owned()];
-            arguments.extend(self.target_selector_arguments()?);
-            command.args(arguments);
-            let (success, _stdout, stderr) = command_output_allow_failure(&mut command)?;
-            if success {
-                return Ok(());
-            }
-            let detail = stderr.trim();
-            if !detail.is_empty() {
-                last_error = Some(detail.to_owned());
-            }
-            thread::sleep(Duration::from_millis(100));
-        }
-
-        match last_error {
-            Some(error) => Err(anyhow::anyhow!(error)),
-            None => bail!("timed out waiting for macOS app accessibility tree"),
-        }
-    }
-
-    fn wait_for_bridge_ready(&self) -> Result<()> {
-        let Some(bridge_arguments) = self.bridge_arguments()? else {
-            return Ok(());
-        };
-
-        let started = Instant::now();
-        let mut last_error = None;
-        while started.elapsed() < Duration::from_secs(5) {
-            let mut command = Command::new(&self.helper_path);
-            let mut arguments = vec!["bridge-ping".to_owned()];
-            arguments.extend(bridge_arguments.clone());
-            command.args(arguments);
-            let (success, _stdout, stderr) = command_output_allow_failure(&mut command)?;
-            if success {
-                return Ok(());
-            }
-            let detail = stderr.trim();
-            if !detail.is_empty() {
-                last_error = Some(detail.to_owned());
-            }
-            thread::sleep(Duration::from_millis(100));
-        }
-
-        match last_error {
-            Some(error) => Err(anyhow::anyhow!(error)),
-            None => bail!("timed out waiting for the injected macOS UI bridge"),
-        }
-    }
-
-    fn frontmost_application_pid(&self) -> Result<Option<u32>> {
-        let mut command = Command::new(&self.helper_path);
-        command.arg("frontmost-application");
-        let (success, stdout, _stderr) = command_output_allow_failure(&mut command)?;
-        if !success {
-            return Ok(None);
-        }
-        let info: MacosFrontmostApplication =
-            serde_json::from_str(&stdout).context("failed to parse macOS frontmost app")?;
-        Ok(info.pid)
-    }
-
-    fn restore_frontmost_application(
-        &self,
-        pid: Option<u32>,
-        ignored_pid: Option<u32>,
+        environment: &[(String, String)],
     ) -> Result<()> {
-        let Some(pid) = pid else {
-            return Ok(());
-        };
-        if Some(pid) == ignored_pid {
-            return Ok(());
+        self.restart_log_relay()?;
+
+        let mut command = Command::new("open");
+        command.args(["-g", "-n", "--stdout"]);
+        command.arg(&self.log_pipe_path);
+        command.arg("--stderr");
+        command.arg(&self.log_pipe_path);
+        for (key, value) in macos_ui_launch_environment(environment) {
+            command.arg("--env");
+            command.arg(format!("{key}={value}"));
         }
-
-        let pid_string = pid.to_string();
-        let mut command = Command::new(&self.helper_path);
-        command.args(["focus", "--pid", pid_string.as_str()]);
-        let _ = command_output_allow_failure(&mut command)?;
-        Ok(())
-    }
-
-    fn reopen_window(&self) -> Result<()> {
-        let started = Instant::now();
-        let mut last_error = None;
-        while started.elapsed() < Duration::from_secs(10) {
-            let mut command = Command::new(&self.helper_path);
-            let mut arguments = vec!["reopen-app".to_owned()];
-            arguments.extend(self.target_selector_arguments()?);
-            command.args(arguments);
-            let (success, _stdout, stderr) = command_output_allow_failure(&mut command)?;
-            if success {
-                return Ok(());
+        command.arg(&self.bundle_path);
+        if !arguments.is_empty() {
+            command.arg("--args");
+            for (key, value) in arguments {
+                command.arg(format!("-{key}"));
+                command.arg(value);
             }
-            let detail = stderr.trim();
-            if !detail.is_empty() {
-                last_error = Some(detail.to_owned());
-            }
-            thread::sleep(Duration::from_millis(100));
         }
 
-        match last_error {
-            Some(error) => Err(anyhow::anyhow!(error)),
-            None => bail!("timed out waiting to send macOS reopen AppleEvent"),
-        }
-    }
-}
-
-impl Drop for MacosBackend {
-    fn drop(&mut self) {
-        let _ = self.stop_video_recording();
-        let _ = self.stop_launched_process();
+        run_command(&mut command)
+            .with_context(|| format!("failed to launch `{}` with `open`", self.bundle_id))?;
+        self.run("waitForApp", json!({ "bundleId": self.bundle_id }))
     }
 }
 
@@ -565,30 +177,15 @@ impl UiBackend for MacosBackend {
         false
     }
 
-    fn video_extension(&self) -> &'static str {
-        "mov"
-    }
-
-    fn requires_running_target_for_recording(&self) -> bool {
-        true
-    }
-
     fn describe_all(&self) -> Result<JsonValue> {
-        let mut arguments = vec!["describe-all".to_owned()];
-        arguments.extend(self.target_selector_arguments()?);
-        let output = self.helper_output(&arguments)?;
-        serde_json::from_str(&output).context("failed to parse macOS accessibility tree")
+        self.request("describeAll", json!({ "bundleId": self.bundle_id }))
     }
 
     fn describe_point(&self, x: f64, y: f64) -> Result<JsonValue> {
-        let output = self.helper_output(&[
-            "describe-point".to_owned(),
-            "--x".to_owned(),
-            x.to_string(),
-            "--y".to_owned(),
-            y.to_string(),
-        ])?;
-        serde_json::from_str(&output).context("failed to parse macOS point accessibility data")
+        self.request(
+            "describePoint",
+            json!({ "bundleId": self.bundle_id, "x": x, "y": y }),
+        )
     }
 
     fn launch_app(
@@ -596,302 +193,67 @@ impl UiBackend for MacosBackend {
         bundle_id: &str,
         stop_app: bool,
         arguments: &[(String, String)],
+        environment: &[(String, String)],
     ) -> Result<()> {
         self.ensure_owned_bundle(bundle_id, "launchApp")?;
         if stop_app {
             self.stop_app(bundle_id)?;
         }
-        let has_running_session = if stop_app {
-            false
-        } else {
-            let mut launched_session = self.launched_session.lock().map_err(|_| {
-                anyhow::anyhow!("failed to lock the macOS UI backend process state")
-            })?;
-            if let Some(existing_session) = launched_session.as_ref() {
-                if process_is_running(existing_session.launched_pid)? {
-                    true
-                } else {
-                    launched_session.take();
-                    *self.pinned_target_pid.lock().map_err(|_| {
-                        anyhow::anyhow!("failed to lock the macOS UI backend target state")
-                    })? = None;
-                    false
-                }
-            } else {
-                false
-            }
-        };
-        if has_running_session {
-            let result = (|| -> Result<()> {
-                self.reopen_window()?;
-                self.window_capture_info()?;
-                self.wait_for_actionable_app()?;
-                self.wait_for_bridge_ready()
-            })();
-            return result;
-        }
-
-        let session = self.start_attached_log_session(arguments)?;
-        let launched_pid = session.launched_pid;
-        self.set_pinned_target_pid(launched_pid)?;
-        *self
-            .launched_session
-            .lock()
-            .map_err(|_| anyhow::anyhow!("failed to lock the macOS UI backend process state"))? =
-            Some(session);
-        (|| -> Result<()> {
-            self.reopen_window()?;
-            self.window_capture_info()?;
-            self.wait_for_actionable_app()?;
-            self.wait_for_bridge_ready()
-        })()
+        self.launch_with_open(arguments, environment)
     }
 
     fn stop_app(&self, bundle_id: &str) -> Result<()> {
-        self.ensure_owned_bundle(bundle_id, "stopApp")?;
-        self.stop_launched_process()?;
-
-        let mut pinned_target_pid = self
-            .pinned_target_pid
-            .lock()
-            .map_err(|_| anyhow::anyhow!("failed to lock the macOS UI backend target state"))?;
-        if let Some(pid) = *pinned_target_pid {
-            terminate_macos_process_tree(pid)?;
-        }
-        *pinned_target_pid = None;
-        Ok(())
+        let result = self.run("stopApp", json!({ "bundleId": bundle_id }));
+        self.stop_log_relay();
+        result
     }
 
     fn clear_app_state(&self, bundle_id: &str) -> Result<()> {
         self.ensure_owned_bundle(bundle_id, "clearState")?;
-        self.stop_app(bundle_id)?;
-
-        // Keep the cleanup scoped to bundle-specific storage roots so Orbi does not
-        // touch shared containers or unrelated app data on the host Mac.
-        let home = std::env::var_os("HOME").context("HOME is not set")?;
-        let home = PathBuf::from(home);
-        let candidate_paths = [
-            home.join("Library")
-                .join("Preferences")
-                .join(format!("{bundle_id}.plist")),
-            home.join("Library")
-                .join("Application Support")
-                .join(bundle_id),
-            home.join("Library").join("Caches").join(bundle_id),
-            home.join("Library").join("HTTPStorages").join(bundle_id),
-            home.join("Library").join("WebKit").join(bundle_id),
-            home.join("Library")
-                .join("Saved Application State")
-                .join(format!("{bundle_id}.savedState")),
-            home.join("Library").join("Containers").join(bundle_id),
-        ];
-
-        for path in candidate_paths {
-            remove_path_if_exists(&path)?;
-        }
-
-        let mut defaults = Command::new("defaults");
-        defaults.args(["delete", bundle_id]);
-        let _ = command_output_allow_failure(&mut defaults)?;
-
-        if let Ok(user) = std::env::var("USER") {
-            let mut cfprefsd = Command::new("killall");
-            cfprefsd.args(["-u", user.as_str(), "cfprefsd"]);
-            let _ = command_output_allow_failure(&mut cfprefsd)?;
-        }
-
-        Ok(())
+        self.run(
+            "clearAppState",
+            json!({ "bundleId": bundle_id, "bundlePath": self.bundle_path }),
+        )
     }
 
     fn focus(&self) -> Result<()> {
-        let mut arguments = vec!["focus".to_owned()];
-        arguments.extend(self.target_selector_arguments()?);
-        self.run_helper(&arguments)
-    }
-
-    fn frontmost_application_pid(&self) -> Result<Option<u32>> {
-        MacosBackend::frontmost_application_pid(self)
-    }
-
-    fn pin_pending_trace_launch(&self) -> Result<()> {
-        let pending_trace_launch = self
-            .pending_trace_launch
-            .lock()
-            .map_err(|_| anyhow::anyhow!("failed to lock the macOS traced launch state"))?
-            .take();
-        let session = if let Some(mut pending) = pending_trace_launch {
-            let pid = match self.wait_for_trace_launch_registration(&pending) {
-                Ok(registration) => registration.pid,
-                Err(error) => {
-                    pending.log_relay.stop();
-                    return Err(error);
-                }
-            };
-            self.set_pinned_target_pid(pid)?;
-            MacosLaunchedSession {
-                launched_pid: pid,
-                _launch_dir: pending.launch_dir,
-                log_pipe_anchor: Some(pending.log_pipe_anchor),
-                log_relay: Some(pending.log_relay),
-                bridge_directory: pending.bridge_directory,
-                bridge_notification_name: pending.bridge_notification_name,
-                previous_frontmost_pid: pending.previous_frontmost_pid,
-            }
-        } else {
-            bail!("missing pending macOS trace launch registration")
-        };
-        *self
-            .launched_session
-            .lock()
-            .map_err(|_| anyhow::anyhow!("failed to lock the macOS UI backend process state"))? =
-            Some(session);
-        Ok(())
-    }
-
-    fn prepare_trace_launch_environment(
-        &self,
-        previous_frontmost_pid: Option<u32>,
-    ) -> Result<Vec<(String, String)>> {
-        self.prepare_pending_trace_launch(previous_frontmost_pid)
-    }
-
-    fn abort_pending_trace_launch(&self) -> Result<()> {
-        let pending = self
-            .pending_trace_launch
-            .lock()
-            .map_err(|_| anyhow::anyhow!("failed to lock the macOS traced launch state"))?
-            .take();
-        let Some(mut pending) = pending else {
-            return Ok(());
-        };
-
-        if let Some(registration) = read_trace_launch_registration(&pending.registration_path)?
-            && registration.launch_id == pending.launch_id
-            && registration.bundle_id == self.bundle_id
-        {
-            terminate_macos_process_tree(registration.pid)?;
-        }
-        pending.log_relay.stop();
-        Ok(())
-    }
-
-    fn prepare_external_running_target(&self) -> Result<()> {
-        if let Err(error) = self.reopen_window()
-            && !error.to_string().contains("procNotFound")
-        {
-            return Err(error);
-        }
-        self.window_capture_info()?;
-        self.wait_for_actionable_app()?;
-        self.wait_for_bridge_ready()?;
-
-        let restore_target = self
-            .launched_session
-            .lock()
-            .map_err(|_| anyhow::anyhow!("failed to lock the macOS UI backend process state"))?
-            .as_ref()
-            .and_then(|session| session.previous_frontmost_pid);
-        if let Some(previous_frontmost_pid) = restore_target {
-            let ignored_pid = *self
-                .pinned_target_pid
-                .lock()
-                .map_err(|_| anyhow::anyhow!("failed to lock the macOS UI backend target state"))?;
-            let restore_deadline = Instant::now() + Duration::from_secs(2);
-            while Instant::now() < restore_deadline {
-                if self.frontmost_application_pid()? == ignored_pid {
-                    self.restore_frontmost_application(Some(previous_frontmost_pid), ignored_pid)?;
-                }
-                thread::sleep(Duration::from_millis(50));
-            }
-        }
-        Ok(())
+        self.run("focus", json!({ "bundleId": self.bundle_id }))
     }
 
     fn tap_point(&self, x: f64, y: f64, duration_ms: Option<u32>) -> Result<()> {
-        let mut arguments = vec![
-            "tap".to_owned(),
-            "--x".to_owned(),
-            x.to_string(),
-            "--y".to_owned(),
-            y.to_string(),
-        ];
-        if let Some(bridge_arguments) = self.bridge_arguments()? {
-            arguments.extend(bridge_arguments);
-        }
-        arguments.extend(self.target_selector_arguments()?);
-        if let Some(duration_ms) = duration_ms {
-            arguments.push("--duration-ms".to_owned());
-            arguments.push(duration_ms.to_string());
-        }
-        self.run_helper(&arguments)?;
-        let mut last_tap = self
-            .last_tap_point
-            .lock()
-            .map_err(|_| anyhow::anyhow!("failed to lock the macOS UI backend tap state"))?;
-        *last_tap = Some((x, y));
-        Ok(())
+        self.run(
+            "tapPoint",
+            json!({
+                "bundleId": self.bundle_id,
+                "x": x,
+                "y": y,
+                "durationMs": duration_ms,
+            }),
+        )
     }
 
     fn activate_selector(&self, selector: &UiSelector) -> Result<bool> {
-        if selector.id.is_none() && selector.text.is_none() {
-            return Ok(false);
-        }
-
-        let matched_center = self
-            .describe_all()
-            .ok()
-            .and_then(|tree| find_visible_element_by_selector(&tree, selector))
-            .and_then(|element| element.frame.map(|frame| frame.center()));
-
-        let mut arguments = vec!["activate-element".to_owned()];
-        arguments.extend(self.target_selector_arguments()?);
-        if let Some(id) = selector.id.as_ref() {
-            arguments.push("--id".to_owned());
-            arguments.push(id.clone());
-        }
-        if let Some(text) = selector.text.as_ref() {
-            arguments.push("--text".to_owned());
-            arguments.push(text.clone());
-        }
-        self.run_helper(&arguments)?;
-        if let Some((x, y)) = matched_center {
-            let mut last_tap = self
-                .last_tap_point
-                .lock()
-                .map_err(|_| anyhow::anyhow!("failed to lock the macOS UI backend tap state"))?;
-            *last_tap = Some((x, y));
-        }
-        Ok(true)
+        let result = self.request(
+            "activateSelector",
+            json!({ "bundleId": self.bundle_id, "selector": selector_json(selector) }),
+        )?;
+        result
+            .as_bool()
+            .context("macOS UI helper returned a non-bool `activateSelector` result")
     }
 
     fn hover_point(&self, x: f64, y: f64) -> Result<()> {
-        let mut arguments = vec![
-            "move".to_owned(),
-            "--x".to_owned(),
-            x.to_string(),
-            "--y".to_owned(),
-            y.to_string(),
-        ];
-        if let Some(bridge_arguments) = self.bridge_arguments()? {
-            arguments.extend(bridge_arguments);
-        }
-        arguments.extend(self.target_selector_arguments()?);
-        self.run_helper(&arguments)
+        self.run(
+            "hoverPoint",
+            json!({ "bundleId": self.bundle_id, "x": x, "y": y }),
+        )
     }
 
     fn right_click_point(&self, x: f64, y: f64) -> Result<()> {
-        let mut arguments = vec![
-            "right-click".to_owned(),
-            "--x".to_owned(),
-            x.to_string(),
-            "--y".to_owned(),
-            y.to_string(),
-        ];
-        if let Some(bridge_arguments) = self.bridge_arguments()? {
-            arguments.extend(bridge_arguments);
-        }
-        arguments.extend(self.target_selector_arguments()?);
-        self.run_helper(&arguments)
+        self.run(
+            "rightClickPoint",
+            json!({ "bundleId": self.bundle_id, "x": x, "y": y }),
+        )
     }
 
     fn swipe_points(
@@ -901,39 +263,18 @@ impl UiBackend for MacosBackend {
         duration_ms: Option<u32>,
         delta: Option<u32>,
     ) -> Result<()> {
-        let mut arguments = vec![
-            "swipe".to_owned(),
-            "--start-x".to_owned(),
-            start.0.to_string(),
-            "--start-y".to_owned(),
-            start.1.to_string(),
-            "--end-x".to_owned(),
-            end.0.to_string(),
-            "--end-y".to_owned(),
-            end.1.to_string(),
-            "--duration-ms".to_owned(),
-            duration_ms.unwrap_or(500).to_string(),
-        ];
-        if let Some(delta) = delta {
-            arguments.push("--delta".to_owned());
-            arguments.push(delta.to_string());
-        }
-        arguments.extend(self.target_selector_arguments()?);
-        self.run_helper(&arguments)
-    }
-
-    fn select_menu_item(&self, path: &[String]) -> Result<()> {
-        if path.is_empty() {
-            bail!("`selectMenuItem` requires at least one menu label");
-        }
-
-        let mut arguments = vec!["menu-item".to_owned()];
-        arguments.extend(self.target_selector_arguments()?);
-        for item in path {
-            arguments.push("--item".to_owned());
-            arguments.push(item.clone());
-        }
-        self.run_helper(&arguments)
+        self.run(
+            "swipe",
+            json!({
+                "bundleId": self.bundle_id,
+                "startX": start.0,
+                "startY": start.1,
+                "endX": end.0,
+                "endY": end.1,
+                "durationMs": duration_ms,
+                "delta": delta,
+            }),
+        )
     }
 
     fn drag_points(
@@ -942,105 +283,54 @@ impl UiBackend for MacosBackend {
         end: (f64, f64),
         duration_ms: Option<u32>,
         delta: Option<u32>,
+        payload_hint: Option<&str>,
     ) -> Result<()> {
-        let previous_frontmost_pid = self.frontmost_application_pid()?;
-        self.focus()?;
-        thread::sleep(Duration::from_millis(150));
-
-        let mut arguments = vec![
-            "drag".to_owned(),
-            "--start-x".to_owned(),
-            start.0.to_string(),
-            "--start-y".to_owned(),
-            start.1.to_string(),
-            "--end-x".to_owned(),
-            end.0.to_string(),
-            "--end-y".to_owned(),
-            end.1.to_string(),
-            "--duration-ms".to_owned(),
-            duration_ms.unwrap_or(650).to_string(),
-        ];
-        if let Some(delta) = delta {
-            arguments.push("--delta".to_owned());
-            arguments.push(delta.to_string());
-        }
-        let result = self.run_helper(&arguments);
-        let target_pid = *self
-            .pinned_target_pid
-            .lock()
-            .map_err(|_| anyhow::anyhow!("failed to lock the macOS UI backend target state"))?;
-        let _ = self.restore_frontmost_application(previous_frontmost_pid, target_pid);
-        result
-    }
-
-    fn input_text(&self, text: &str) -> Result<()> {
-        let target_arguments = self.target_selector_arguments()?;
-        let mut arguments = vec!["text".to_owned()];
-        arguments.extend(target_arguments);
-        arguments.push("--text".to_owned());
-        arguments.push(text.to_owned());
-        self.run_helper(&arguments)
-    }
-
-    fn press_button(&self, button: UiHardwareButton, _duration_ms: Option<u32>) -> Result<()> {
-        bail!(
-            "`pressButton {}` is not supported by the current macOS UI backend",
-            button.summary()
+        self.run(
+            "drag",
+            json!({
+                "bundleId": self.bundle_id,
+                "startX": start.0,
+                "startY": start.1,
+                "endX": end.0,
+                "endY": end.1,
+                "durationMs": duration_ms,
+                "delta": delta,
+                "payloadHint": payload_hint,
+            }),
         )
     }
 
+    fn input_text(&self, text: &str) -> Result<()> {
+        self.run(
+            "inputText",
+            json!({ "bundleId": self.bundle_id, "text": text }),
+        )
+    }
+
+    fn press_button(&self, button: UiHardwareButton, _duration_ms: Option<u32>) -> Result<()> {
+        bail!("hardware button `{button:?}` is not supported by the macOS UI backend")
+    }
+
     fn press_key(&self, key: &UiKeyPress) -> Result<()> {
-        let (keycode, character) = match key.key {
-            UiPressKey::Enter => (36, None),
-            UiPressKey::Backspace => (51, None),
-            UiPressKey::Escape | UiPressKey::Back => (53, None),
-            UiPressKey::Space => (49, None),
-            UiPressKey::Tab => (48, None),
-            UiPressKey::Home => (115, None),
-            UiPressKey::LeftArrow => (123, None),
-            UiPressKey::RightArrow => (124, None),
-            UiPressKey::DownArrow => (125, None),
-            UiPressKey::UpArrow => (126, None),
-            UiPressKey::Character(character) => (
-                macos_keycode_for_character(character).with_context(|| {
-                    format!(
-                        "`pressKey {}` is not supported by the current macOS UI backend",
-                        key.summary()
-                    )
-                })?,
-                Some(character),
-            ),
-            UiPressKey::Lock
-            | UiPressKey::Power
-            | UiPressKey::VolumeUp
-            | UiPressKey::VolumeDown => {
-                bail!(
-                    "`pressKey {}` is not supported by the current macOS UI backend",
-                    key.summary()
-                )
-            }
-        };
-        let mut arguments = vec![
-            "key".to_owned(),
-            "--keycode".to_owned(),
-            keycode.to_string(),
-        ];
-        arguments.splice(1..1, self.target_selector_arguments()?);
-        if let Some(character) = character {
-            arguments.push("--character".to_owned());
-            arguments.push(character.to_string());
-        }
-        if !key.modifiers.is_empty() {
-            arguments.push("--modifiers".to_owned());
-            arguments.push(
-                key.modifiers
-                    .iter()
-                    .map(|modifier| macos_modifier_flag_name(*modifier))
-                    .collect::<Vec<_>>()
-                    .join(","),
-            );
-        }
-        self.run_helper(&arguments)
+        self.run(
+            "pressKey",
+            json!({
+                "bundleId": self.bundle_id,
+                "key": key_json(key.key),
+                "modifiers": modifiers_json(&key.modifiers),
+            }),
+        )
+    }
+
+    fn select_menu_item(&self, selection: &UiMenuSelection) -> Result<()> {
+        self.run(
+            "selectMenuItem",
+            json!({
+                "bundleId": self.bundle_id,
+                "source": selection.source.as_ref().map(selector_json),
+                "path": selection.path,
+            }),
+        )
     }
 
     fn press_key_code(
@@ -1049,175 +339,100 @@ impl UiBackend for MacosBackend {
         duration_ms: Option<u32>,
         modifiers: &[UiKeyModifier],
     ) -> Result<()> {
-        let mut arguments = vec![
-            "key".to_owned(),
-            "--keycode".to_owned(),
-            keycode.to_string(),
-        ];
-        arguments.splice(1..1, self.target_selector_arguments()?);
-        if let Some(duration_ms) = duration_ms {
-            arguments.push("--duration-ms".to_owned());
-            arguments.push(duration_ms.to_string());
-        }
-        if !modifiers.is_empty() {
-            arguments.push("--modifiers".to_owned());
-            arguments.push(
-                modifiers
-                    .iter()
-                    .map(|modifier| macos_modifier_flag_name(*modifier))
-                    .collect::<Vec<_>>()
-                    .join(","),
-            );
-        }
-        self.run_helper(&arguments)
+        self.run(
+            "pressKeyCode",
+            json!({
+                "bundleId": self.bundle_id,
+                "keyCode": keycode,
+                "durationMs": duration_ms,
+                "modifiers": modifiers_json(modifiers),
+            }),
+        )
     }
 
     fn press_key_sequence(&self, keycodes: &[u32]) -> Result<()> {
-        for keycode in keycodes {
-            self.press_key_code(*keycode, None, &[])?;
-        }
-        Ok(())
+        self.run(
+            "pressKeySequence",
+            json!({ "bundleId": self.bundle_id, "keyCodes": keycodes }),
+        )
     }
 
     fn take_screenshot(&self, path: &Path) -> Result<()> {
-        if let Some(parent) = path.parent() {
-            ensure_dir(parent)?;
-        }
-        let mut arguments = vec![
-            "screenshot-window".to_owned(),
-            "--output".to_owned(),
-            path.to_str()
-                .context("screenshot path contains invalid UTF-8")?
-                .to_owned(),
-        ];
-        arguments.splice(1..1, self.target_selector_arguments()?);
-        self.run_helper(&arguments)
+        self.run(
+            "takeScreenshot",
+            json!({ "bundleId": self.bundle_id, "path": path }),
+        )
     }
 
-    fn open_link(&self, url: &str) -> Result<()> {
-        let mut command = Command::new("open");
-        command.arg(url);
-        run_command(&mut command)
+    fn open_link(&self, _url: &str) -> Result<()> {
+        bail!("`openLink` is not supported by the background macOS UI backend")
     }
 
     fn clear_keychain(&self) -> Result<()> {
-        bail!("clearKeychain is not supported by the current macOS UI backend")
+        bail!("`clearKeychain` is not supported by the macOS UI backend")
     }
 
     fn set_location(&self, _latitude: f64, _longitude: f64) -> Result<()> {
-        bail!("setLocation is not supported by the current macOS UI backend")
+        bail!("`setLocation` is not supported by the macOS UI backend")
     }
 
     fn set_permissions(&self, _bundle_id: &str, _config: &UiPermissionConfig) -> Result<()> {
-        bail!("setPermissions is not supported by the current macOS UI backend")
+        bail!("`setPermissions` is not supported by the macOS UI backend")
     }
 
     fn travel(&self, _command: &UiTravel) -> Result<()> {
-        bail!("travel is not supported by the current macOS UI backend")
+        bail!("`travel` is not supported by the macOS UI backend")
     }
 
     fn add_media(&self, _paths: &[PathBuf]) -> Result<()> {
-        bail!("addMedia is not supported by the current macOS UI backend")
+        bail!("`addMedia` is not supported by the macOS UI backend")
     }
 
     fn install_dylib(&self, _path: &Path) -> Result<()> {
-        bail!("install-dylib is not supported by the current macOS UI backend")
+        bail!("`installDylib` is not supported by the macOS UI backend")
     }
 
     fn run_instruments(&self, _template: &str, _arguments: &[String]) -> Result<()> {
-        bail!("instruments is not supported by the current macOS UI backend")
+        bail!("`runInstruments` is not supported by the macOS UI backend")
     }
 
     fn update_contacts(&self, _path: &Path) -> Result<()> {
-        bail!("update-contacts is not supported by the current macOS UI backend")
+        bail!("`updateContacts` is not supported by the macOS UI backend")
     }
 
     fn list_crash_logs(&self, _query: &UiCrashQuery) -> Result<()> {
-        bail!("crash log commands are not supported by the current macOS UI backend")
+        bail!("`crash list` is not supported by the macOS UI backend")
     }
 
     fn show_crash_log(&self, _name: &str) -> Result<()> {
-        bail!("crash log commands are not supported by the current macOS UI backend")
+        bail!("`crash show` is not supported by the macOS UI backend")
     }
 
     fn delete_crash_logs(&self, _request: &UiCrashDeleteRequest) -> Result<()> {
-        bail!("crash log commands are not supported by the current macOS UI backend")
+        bail!("`crash delete` is not supported by the macOS UI backend")
     }
 
-    fn stream_logs(&self, arguments: &[String]) -> Result<()> {
-        let process_name = self
-            .executable_path
-            .file_name()
-            .and_then(|value| value.to_str())
-            .unwrap_or(self.bundle_id.as_str());
-        let mut command = Command::new("log");
-        command.arg("stream");
-        if arguments.is_empty() {
-            command.args(["--style", "compact", "--process", process_name]);
-        } else {
-            command.args(arguments);
-        }
-        run_command(&mut command)
+    fn stream_logs(&self, _arguments: &[String]) -> Result<()> {
+        bail!("`logs` is not supported by the macOS UI backend")
     }
 
     fn scroll_in_direction(&self, direction: UiSwipeDirection) -> Result<()> {
-        let point = self
-            .describe_all()
-            .ok()
-            .and_then(|tree| find_visible_scroll_container(&tree))
-            .map(|frame| frame.center())
-            .or_else(|| {
-                self.window_capture_info().ok().map(|window| {
-                    (
-                        window.frame.x + (window.frame.width / 2.0),
-                        window.frame.y + (window.frame.height / 2.0),
-                    )
-                })
-            })
-            .unwrap_or((0.0, 0.0));
-        let mut arguments = vec![
-            "scroll".to_owned(),
-            "--x".to_owned(),
-            point.0.to_string(),
-            "--y".to_owned(),
-            point.1.to_string(),
-            "--direction".to_owned(),
-            match direction {
-                UiSwipeDirection::Left => "left",
-                UiSwipeDirection::Right => "right",
-                UiSwipeDirection::Up => "up",
-                UiSwipeDirection::Down => "down",
-            }
-            .to_owned(),
-        ];
-        if let Some(bridge_arguments) = self.bridge_arguments()? {
-            arguments.extend(bridge_arguments);
-        }
-        arguments.extend(self.target_selector_arguments()?);
-        self.run_helper(&arguments)
+        self.run(
+            "scroll",
+            json!({ "bundleId": self.bundle_id, "direction": direction_json(direction) }),
+        )
     }
 
     fn scroll_at_point(&self, direction: UiSwipeDirection, point: (f64, f64)) -> Result<()> {
-        let mut arguments = vec![
-            "scroll-at-point".to_owned(),
-            "--x".to_owned(),
-            point.0.to_string(),
-            "--y".to_owned(),
-            point.1.to_string(),
-            "--direction".to_owned(),
-            match direction {
-                UiSwipeDirection::Left => "left",
-                UiSwipeDirection::Right => "right",
-                UiSwipeDirection::Up => "up",
-                UiSwipeDirection::Down => "down",
-            }
-            .to_owned(),
-        ];
-        if let Some(bridge_arguments) = self.bridge_arguments()? {
-            arguments.extend(bridge_arguments);
-        }
-        arguments.extend(self.target_selector_arguments()?);
-        self.run_helper(&arguments)
+        self.run(
+            "scroll",
+            json!({
+                "bundleId": self.bundle_id,
+                "direction": direction_json(direction),
+                "x": point.0,
+                "y": point.1,
+            }),
+        )
     }
 
     fn hide_keyboard(&self) -> Result<()> {
@@ -1225,647 +440,344 @@ impl UiBackend for MacosBackend {
     }
 
     fn start_video_recording(&mut self, path: &Path) -> Result<()> {
-        if self.active_video.is_some() {
-            bail!("video recording is already active for macOS");
+        if self.active_video_path.is_some() {
+            bail!(
+                "video recording is already active for {}",
+                self.target_name()
+            );
         }
         if let Some(parent) = path.parent() {
             ensure_dir(parent)?;
         }
-        let window_info = self.window_capture_info()?;
-        let rect = format!(
-            "{},{},{},{}",
-            window_info.frame.x.round() as i64,
-            window_info.frame.y.round() as i64,
-            window_info.frame.width.round() as i64,
-            window_info.frame.height.round() as i64
-        );
-
-        let mut command = Command::new("screencapture");
-        command.args([
-            "-x",
-            "-v",
-            &format!("-R{rect}"),
-            path.to_str().context("video path contains invalid UTF-8")?,
-        ]);
-        command.stdout(Stdio::null());
-        command.stderr(Stdio::null());
-        let child = command.spawn().with_context(|| {
-            format!(
-                "failed to start macOS video recording to {}",
-                path.display()
-            )
-        })?;
-        self.active_video = Some(ActiveVideoRecording {
-            path: path.to_path_buf(),
-            child,
-        });
+        self.run(
+            "startVideoRecording",
+            json!({ "bundleId": self.bundle_id, "path": path }),
+        )?;
+        self.active_video_path = Some(path.to_path_buf());
         Ok(())
     }
 
     fn stop_video_recording(&mut self) -> Result<()> {
-        let Some(mut recording) = self.active_video.take() else {
+        let Some(path) = self.active_video_path.take() else {
             return Ok(());
         };
-
-        if recording.child.try_wait()?.is_none() {
-            let mut interrupt = Command::new("kill");
-            interrupt.args(["-INT", &recording.child.id().to_string()]);
-            let _ = command_output_allow_failure(&mut interrupt)?;
+        self.run("stopVideoRecording", json!({}))?;
+        if !path.exists() {
+            bail!(
+                "macOS video recording finished without writing {}",
+                path.display()
+            );
         }
+        Ok(())
+    }
+}
 
-        let started = Instant::now();
-        while started.elapsed() < Duration::from_secs(5) {
-            if let Some(status) = recording.child.try_wait()? {
-                if !status.success() && !recording.path.exists() {
-                    bail!(
-                        "`screencapture -v` exited with {status} before writing {}",
-                        recording.path.display()
-                    );
-                }
-                return Ok(());
+impl Drop for MacosBackend {
+    fn drop(&mut self) {
+        let params = json!({ "bundleId": self.bundle_id, "force": true });
+        let Ok(mut helper) = self.helper.lock() else {
+            return;
+        };
+        if helper.has_exited() {
+            if let Ok(mut replacement) = MacosHelperProcess::spawn(&self.helper_path) {
+                let _ = replacement.request("stopApp", params);
             }
-            thread::sleep(Duration::from_millis(100));
+            return;
         }
+        let _ = helper.request("stopVideoRecording", json!({}));
+        let _ = helper.request("stopApp", params);
+        self.stop_log_relay();
+    }
+}
 
-        let _ = recording.child.kill();
-        let _ = recording.child.wait();
-        if recording.path.exists() {
-            return Ok(());
+struct MacosUiLogRelay {
+    anchor: Option<fs::File>,
+    relay: Option<MacosInferiorLogRelay>,
+}
+
+impl MacosUiLogRelay {
+    fn start(pipe_path: &Path, bundle_id: &str, verbose: bool) -> Result<Self> {
+        match fs::remove_file(pipe_path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to remove {}", pipe_path.display()));
+            }
         }
-
-        bail!(
-            "timed out waiting for macOS video recording to finish writing {}",
-            recording.path.display()
-        )
+        let mut mkfifo = Command::new("mkfifo");
+        mkfifo.arg(pipe_path);
+        run_command(&mut mkfifo)?;
+        let anchor = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(pipe_path)
+            .with_context(|| format!("failed to open macOS UI log pipe {}", pipe_path.display()))?;
+        let relay = MacosInferiorLogRelay::start(pipe_path, bundle_id, verbose);
+        Ok(Self {
+            anchor: Some(anchor),
+            relay: Some(relay),
+        })
     }
 }
 
-fn remove_path_if_exists(path: &Path) -> Result<()> {
-    if !path.exists() {
-        return Ok(());
-    }
-    if path.is_dir() {
-        fs::remove_dir_all(path).with_context(|| format!("failed to remove {}", path.display()))?;
-    } else {
-        fs::remove_file(path).with_context(|| format!("failed to remove {}", path.display()))?;
-    }
-    Ok(())
-}
-
-fn read_trace_launch_registration(path: &Path) -> Result<Option<MacosTraceLaunchRegistration>> {
-    let contents = match fs::read_to_string(path) {
-        Ok(contents) => contents,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
-            return Err(error).with_context(|| format!("failed to read {}", path.display()));
+impl Drop for MacosUiLogRelay {
+    fn drop(&mut self) {
+        self.anchor.take();
+        if let Some(mut relay) = self.relay.take() {
+            relay.stop();
         }
-    };
-    let registration = serde_json::from_str(&contents).with_context(|| {
-        format!(
-            "failed to parse macOS trace launch registration {}",
-            path.display()
-        )
-    })?;
-    Ok(Some(registration))
+    }
 }
 
-fn process_is_running(pid: u32) -> Result<bool> {
-    let mut command = Command::new("kill");
-    command.args(["-0", &pid.to_string()]);
-    let (success, _stdout, _stderr) = command_output_allow_failure(&mut command)?;
-    Ok(success)
+fn macos_ui_launch_environment(environment: &[(String, String)]) -> BTreeMap<String, String> {
+    let mut merged = BTreeMap::from([
+        ("IDEPreferLogStreaming".to_owned(), "YES".to_owned()),
+        ("OS_ACTIVITY_DT_MODE".to_owned(), "1".to_owned()),
+    ]);
+    for (key, value) in environment {
+        merged.insert(key.clone(), value.clone());
+    }
+    merged
 }
 
-fn terminate_macos_process_tree(pid: u32) -> Result<()> {
-    if !process_is_running(pid)? {
-        return Ok(());
+struct MacosHelperProcess {
+    child: Child,
+    stdin: ChildStdin,
+    stdout: BufReader<ChildStdout>,
+    next_id: u64,
+}
+
+impl MacosHelperProcess {
+    fn spawn(path: &Path) -> Result<Self> {
+        let mut child = Command::new(path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .with_context(|| format!("failed to start macOS UI helper {}", path.display()))?;
+        let stdin = child
+            .stdin
+            .take()
+            .context("macOS UI helper did not expose stdin")?;
+        let stdout = child
+            .stdout
+            .take()
+            .context("macOS UI helper did not expose stdout")?;
+        Ok(Self {
+            child,
+            stdin,
+            stdout: BufReader::new(stdout),
+            next_id: 1,
+        })
     }
 
-    terminate_macos_launch_descendants(pid, "TERM")?;
-    let mut terminate = Command::new("kill");
-    terminate.args(["-TERM", &pid.to_string()]);
-    let _ = command_output_allow_failure(&mut terminate)?;
+    fn request(&mut self, command: &str, params: JsonValue) -> Result<JsonValue> {
+        let id = self.next_id;
+        self.next_id += 1;
+        let request = json!({
+            "id": id,
+            "command": command,
+            "params": params,
+        });
+        serde_json::to_writer(&mut self.stdin, &request)
+            .context("failed to encode macOS UI helper request")?;
+        self.stdin
+            .write_all(b"\n")
+            .context("failed to write macOS UI helper request newline")?;
+        self.stdin
+            .flush()
+            .context("failed to flush macOS UI helper request")?;
 
-    let started = Instant::now();
-    while started.elapsed() < Duration::from_secs(2) {
-        if !process_is_running(pid)? {
-            return Ok(());
+        let mut line = String::new();
+        let bytes = self
+            .stdout
+            .read_line(&mut line)
+            .context("failed to read macOS UI helper response")?;
+        if bytes == 0 {
+            bail!("macOS UI helper exited before replying to `{command}`");
         }
-        thread::sleep(Duration::from_millis(50));
+        let response: HelperResponse = serde_json::from_str(&line).with_context(|| {
+            format!("failed to parse macOS UI helper response `{}`", line.trim())
+        })?;
+        if response.id != id {
+            bail!(
+                "macOS UI helper response id mismatch: expected {id}, got {}",
+                response.id
+            );
+        }
+        if !response.ok {
+            bail!(
+                "{}",
+                response
+                    .error
+                    .unwrap_or_else(|| format!("macOS UI helper command `{command}` failed"))
+            );
+        }
+        Ok(response.result.unwrap_or(JsonValue::Null))
     }
 
-    terminate_macos_launch_descendants(pid, "KILL")?;
-    let mut kill = Command::new("kill");
-    kill.args(["-KILL", &pid.to_string()]);
-    let _ = command_output_allow_failure(&mut kill)?;
-    Ok(())
-}
-
-fn terminate_macos_launch_descendants(parent_pid: u32, signal: &str) -> Result<()> {
-    let mut command = Command::new("pkill");
-    command.args([format!("-{signal}").as_str(), "-P", &parent_pid.to_string()]);
-    let _ = command_output_allow_failure(&mut command)?;
-    Ok(())
-}
-
-fn macos_launch_arguments(arguments: &[(String, String)]) -> Vec<String> {
-    arguments
-        .iter()
-        .flat_map(|(key, value)| [format!("-{key}"), value.clone()])
-        .collect()
-}
-
-fn macos_keycode_for_character(character: char) -> Result<u32> {
-    let uppercase = character.to_ascii_uppercase();
-    let keycode = match uppercase {
-        'A' => 0,
-        'S' => 1,
-        'D' => 2,
-        'F' => 3,
-        'H' => 4,
-        'G' => 5,
-        'Z' => 6,
-        'X' => 7,
-        'C' => 8,
-        'V' => 9,
-        'B' => 11,
-        'Q' => 12,
-        'W' => 13,
-        'E' => 14,
-        'R' => 15,
-        'Y' => 16,
-        'T' => 17,
-        '1' => 18,
-        '2' => 19,
-        '3' => 20,
-        '4' => 21,
-        '6' => 22,
-        '5' => 23,
-        '=' => 24,
-        '9' => 25,
-        '7' => 26,
-        '-' => 27,
-        '8' => 28,
-        '0' => 29,
-        ']' => 30,
-        'O' => 31,
-        'U' => 32,
-        '[' => 33,
-        'I' => 34,
-        'P' => 35,
-        'L' => 37,
-        'J' => 38,
-        '\'' => 39,
-        'K' => 40,
-        ';' => 41,
-        '\\' => 42,
-        ',' => 43,
-        '/' => 44,
-        'N' => 45,
-        'M' => 46,
-        '.' => 47,
-        '`' => 50,
-        _ => bail!("unsupported character `{character}` for macOS keyboard input"),
-    };
-    Ok(keycode)
-}
-
-fn macos_modifier_flag_name(modifier: UiKeyModifier) -> &'static str {
-    match modifier {
-        UiKeyModifier::Command => "command",
-        UiKeyModifier::Shift => "shift",
-        UiKeyModifier::Option => "option",
-        UiKeyModifier::Control => "control",
-        UiKeyModifier::Function => "function",
+    fn has_exited(&mut self) -> bool {
+        match self.child.try_wait() {
+            Ok(Some(_)) => true,
+            Ok(None) => false,
+            Err(_) => true,
+        }
     }
 }
 
-fn macos_requirement_message() -> &'static str {
-    "Orbi macOS UI automation requires Accessibility access on this Mac"
+impl Drop for MacosHelperProcess {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
 
-fn macos_ui_bridge_launch_environment(
-    selected_xcode: Option<&SelectedXcode>,
-    bridge_dylib_path: &Path,
-    bridge_directory: &Path,
-    bridge_notification_name: &str,
-    log_pipe_path: &Path,
-) -> Result<Vec<(String, String)>> {
-    let log_redirect_dylib = selected_xcode_log_redirect_dylib_path(selected_xcode)?;
-    let bridge_dylib_path = bridge_dylib_path
-        .to_str()
-        .context("macOS UI bridge dylib path contains invalid UTF-8")?;
-    let bridge_directory = bridge_directory
-        .to_str()
-        .context("macOS UI bridge directory contains invalid UTF-8")?;
-    let log_pipe_path = log_pipe_path
-        .to_str()
-        .context("macOS UI log pipe path contains invalid UTF-8")?;
-
-    Ok(vec![
-        ("NSUnbufferedIO".to_owned(), "YES".to_owned()),
-        ("OS_LOG_TRANSLATE_PRINT_MODE".to_owned(), "0x80".to_owned()),
-        (
-            "IDE_DISABLED_OS_ACTIVITY_DT_MODE".to_owned(),
-            "1".to_owned(),
-        ),
-        ("OS_LOG_DT_HOOK_MODE".to_owned(), "0x07".to_owned()),
-        ("CFLOG_FORCE_DISABLE_STDERR".to_owned(), "1".to_owned()),
-        (
-            "DYLD_INSERT_LIBRARIES".to_owned(),
-            format!("{}:{bridge_dylib_path}", log_redirect_dylib.display()),
-        ),
-        (
-            "ORBI_MACOS_UI_BRIDGE_DIR".to_owned(),
-            bridge_directory.to_owned(),
-        ),
-        (
-            "ORBI_MACOS_UI_BRIDGE_NOTIFICATION".to_owned(),
-            bridge_notification_name.to_owned(),
-        ),
-        (
-            "ORBI_MACOS_UI_LOG_PIPE".to_owned(),
-            log_pipe_path.to_owned(),
-        ),
-    ])
+#[derive(Debug, Deserialize)]
+struct HelperResponse {
+    id: u64,
+    ok: bool,
+    result: Option<JsonValue>,
+    error: Option<String>,
 }
 
 pub(crate) fn macos_doctor(project: &ProjectContext) -> Result<MacosDoctorStatus> {
-    let helper_path = ensure_macos_driver_binary(project)?;
-    let mut command = Command::new(helper_path);
-    command.arg("doctor");
-    let output = command_output(&mut command).with_context(macos_requirement_message)?;
-    serde_json::from_str(&output).context("failed to parse macOS UI doctor output")
+    let helper_path = ensure_macos_helper(project)?;
+    let mut helper = MacosHelperProcess::spawn(&helper_path)?;
+    let status = helper.request("checkPermissions", json!({}))?;
+    serde_json::from_value(status).context("failed to parse macOS UI helper doctor status")
 }
 
-fn ensure_macos_driver_binary(project: &ProjectContext) -> Result<PathBuf> {
-    ensure_embedded_macos_ui_artifact(project, &ORBI_MACOS_UI_DRIVER)
-}
-
-fn ensure_macos_bridge_dylib(project: &ProjectContext) -> Result<PathBuf> {
-    ensure_embedded_macos_ui_artifact(project, &ORBI_MACOS_UI_BRIDGE)
-}
-
-fn ensure_embedded_macos_ui_artifact(
-    project: &ProjectContext,
-    spec: &EmbeddedMacosUiArtifactSpec,
-) -> Result<PathBuf> {
-    if let Some(path) = std::env::var_os(spec.override_env_var) {
+fn ensure_macos_helper(project: &ProjectContext) -> Result<PathBuf> {
+    if let Some(path) = std::env::var_os(HELPER_OVERRIDE_ENV) {
         let path = PathBuf::from(path);
-        if !path.is_file() {
+        if !path.exists() {
             bail!(
-                "{} points to a missing macOS UI artifact: {}",
-                spec.override_env_var,
+                "{HELPER_OVERRIDE_ENV} points to {}, but that file does not exist",
                 path.display()
             );
         }
         return Ok(path);
     }
 
-    let tools_dir = embedded_macos_ui_artifact_dir(&project.app.global_paths.cache_dir, spec);
-    ensure_embedded_macos_ui_artifact_in_dir(&tools_dir, spec)
-}
-
-fn embedded_macos_ui_artifact_dir(cache_dir: &Path, spec: &EmbeddedMacosUiArtifactSpec) -> PathBuf {
-    cache_dir.join("macos-ui-artifacts").join(format!(
-        "{}-{}",
-        spec.name,
-        embedded_macos_ui_artifact_hash(spec.bytes)
-    ))
-}
-
-fn ensure_embedded_macos_ui_artifact_in_dir(
-    tools_dir: &Path,
-    spec: &EmbeddedMacosUiArtifactSpec,
-) -> Result<PathBuf> {
-    if !spec.available {
-        bail!("{}", spec.unavailable_reason);
-    }
-
-    ensure_dir(tools_dir)?;
-    let binary_path = tools_dir.join(spec.file_name);
-    if binary_path.exists() {
-        return Ok(binary_path);
-    }
-
-    let temporary_path = tools_dir.join(format!("{}.tmp", spec.file_name));
-    fs::write(&temporary_path, spec.bytes)
-        .with_context(|| format!("failed to write {}", temporary_path.display()))?;
-    set_embedded_macos_ui_artifact_permissions(&temporary_path)?;
-    if let Err(error) = fs::rename(&temporary_path, &binary_path) {
-        if binary_path.exists() {
-            let _ = fs::remove_file(&temporary_path);
-            return Ok(binary_path);
-        }
-        return Err(error).with_context(|| {
-            format!(
-                "failed to move {} into place at {}",
-                temporary_path.display(),
-                binary_path.display()
-            )
-        });
-    }
-    Ok(binary_path)
-}
-
-fn set_embedded_macos_ui_artifact_permissions(path: &Path) -> Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-
-        fs::set_permissions(path, fs::Permissions::from_mode(0o755))
-            .with_context(|| format!("failed to update {}", path.display()))?;
-    }
-
-    #[cfg(not(unix))]
-    {
-        let _ = path;
-    }
-
-    Ok(())
-}
-
-fn embedded_macos_ui_artifact_hash(bytes: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    let digest = hasher.finalize();
-    digest[..8]
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let sources = HELPER_SOURCES
         .iter()
-        .map(|byte| format!("{byte:02x}"))
+        .map(|source| manifest_dir.join(source))
+        .collect::<Vec<_>>();
+    let helper_hash = helper_source_hash(&sources)?;
+    let output_dir = project
+        .app
+        .global_paths
+        .cache_dir
+        .join("macos-ui-helper")
+        .join(helper_hash);
+    let helper_path = output_dir.join(HELPER_BINARY_NAME);
+    if helper_path.exists() {
+        return Ok(helper_path);
+    }
+
+    ensure_dir(&output_dir)?;
+    compile_macos_helper(
+        project.selected_xcode.as_ref(),
+        sources.as_slice(),
+        &helper_path,
+    )?;
+    Ok(helper_path)
+}
+
+fn helper_source_hash(sources: &[PathBuf]) -> Result<String> {
+    let mut hasher = Sha256::new();
+    for source in sources {
+        hasher.update(source.to_string_lossy().as_bytes());
+        hasher.update([0]);
+        let contents = fs::read(source).with_context(|| {
+            format!("failed to read macOS UI helper source {}", source.display())
+        })?;
+        hasher.update(contents);
+        hasher.update([0]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn compile_macos_helper(
+    selected_xcode: Option<&SelectedXcode>,
+    sources: &[PathBuf],
+    output_path: &Path,
+) -> Result<()> {
+    let mut command = xcrun_command(selected_xcode);
+    command
+        .args(["--sdk", "macosx", "swiftc", "-o"])
+        .arg(output_path)
+        .args(sources)
+        .args([
+            "-framework",
+            "AppKit",
+            "-framework",
+            "ApplicationServices",
+            "-framework",
+            "ScreenCaptureKit",
+            "-framework",
+            "AVFoundation",
+            "-framework",
+            "CoreGraphics",
+        ]);
+    run_command(&mut command).with_context(|| {
+        format!(
+            "failed to compile macOS UI helper to {}",
+            output_path.display()
+        )
+    })
+}
+
+fn selector_json(selector: &UiSelector) -> JsonValue {
+    json!({
+        "text": selector.text,
+        "id": selector.id,
+    })
+}
+
+fn key_json(key: UiPressKey) -> JsonValue {
+    match key {
+        UiPressKey::Character(character) => {
+            json!({ "kind": "Character", "value": character.to_string() })
+        }
+        UiPressKey::Home => json!({ "kind": "Home" }),
+        UiPressKey::Enter => json!({ "kind": "Enter" }),
+        UiPressKey::Backspace => json!({ "kind": "Backspace" }),
+        UiPressKey::Escape => json!({ "kind": "Escape" }),
+        UiPressKey::Space => json!({ "kind": "Space" }),
+        UiPressKey::Tab => json!({ "kind": "Tab" }),
+        UiPressKey::LeftArrow => json!({ "kind": "LeftArrow" }),
+        UiPressKey::RightArrow => json!({ "kind": "RightArrow" }),
+        UiPressKey::UpArrow => json!({ "kind": "UpArrow" }),
+        UiPressKey::DownArrow => json!({ "kind": "DownArrow" }),
+        UiPressKey::Lock
+        | UiPressKey::VolumeUp
+        | UiPressKey::VolumeDown
+        | UiPressKey::Back
+        | UiPressKey::Power => json!({ "kind": key.summary() }),
+    }
+}
+
+fn modifiers_json(modifiers: &[UiKeyModifier]) -> Vec<&'static str> {
+    modifiers
+        .iter()
+        .map(|modifier| match modifier {
+            UiKeyModifier::Command => "Command",
+            UiKeyModifier::Shift => "Shift",
+            UiKeyModifier::Option => "Option",
+            UiKeyModifier::Control => "Control",
+            UiKeyModifier::Function => "Function",
+        })
         .collect()
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{
-        EmbeddedMacosUiArtifactSpec, MacosBackend, embedded_macos_ui_artifact_hash,
-        ensure_embedded_macos_ui_artifact_in_dir, macos_launch_arguments,
-        macos_ui_bridge_launch_environment, read_trace_launch_registration,
-    };
-    use crate::apple::testing::ui::backend::UiBackend;
-    use crate::apple::xcode::SelectedXcode;
-    use std::fs;
-    use std::os::unix::fs::PermissionsExt;
-    use std::path::{Path, PathBuf};
-    use std::sync::Mutex;
-    use tempfile::tempdir;
-
-    #[test]
-    fn flattens_launch_argument_pairs_for_direct_launch() {
-        let arguments = macos_launch_arguments(&[
-            ("mockOpenAIOAuth".to_owned(), "instant_success".to_owned()),
-            ("mockOpenAIEmail".to_owned(), "qa@example.com".to_owned()),
-        ]);
-        assert_eq!(
-            arguments,
-            vec![
-                "-mockOpenAIOAuth".to_owned(),
-                "instant_success".to_owned(),
-                "-mockOpenAIEmail".to_owned(),
-                "qa@example.com".to_owned(),
-            ]
-        );
-    }
-
-    #[test]
-    fn launch_environment_includes_log_redirect_and_bridge_injection() {
-        let temp = tempdir().unwrap();
-        let developer_dir = temp.path().join("Xcode.app/Contents/Developer");
-        let log_redirect = developer_dir.join("usr/lib/libLogRedirect.dylib");
-        fs::create_dir_all(log_redirect.parent().unwrap()).unwrap();
-        fs::write(&log_redirect, b"").unwrap();
-
-        let selected_xcode = SelectedXcode {
-            version: "26.4".to_owned(),
-            build_version: "17E192".to_owned(),
-            app_path: PathBuf::from("/Applications/Xcode-26.4.app"),
-            developer_dir,
-        };
-        let bridge_dylib = temp.path().join("orbi-macos-ui-bridge.dylib");
-        let bridge_directory = temp.path().join("ui-bridge");
-        let log_pipe_path = temp.path().join("inferior-stdio.pipe");
-
-        let environment = macos_ui_bridge_launch_environment(
-            Some(&selected_xcode),
-            &bridge_dylib,
-            &bridge_directory,
-            "dev.orbi.ui.test",
-            &log_pipe_path,
-        )
-        .unwrap();
-
-        assert!(environment.contains(&("NSUnbufferedIO".to_owned(), "YES".to_owned())));
-        assert!(environment.contains(&(
-            "DYLD_INSERT_LIBRARIES".to_owned(),
-            format!("{}:{}", log_redirect.display(), bridge_dylib.display()),
-        )));
-        assert!(environment.contains(&(
-            "ORBI_MACOS_UI_BRIDGE_DIR".to_owned(),
-            bridge_directory.display().to_string(),
-        )));
-        assert!(environment.contains(&(
-            "ORBI_MACOS_UI_BRIDGE_NOTIFICATION".to_owned(),
-            "dev.orbi.ui.test".to_owned(),
-        )));
-        assert!(environment.contains(&(
-            "ORBI_MACOS_UI_LOG_PIPE".to_owned(),
-            log_pipe_path.display().to_string(),
-        )));
-    }
-
-    #[test]
-    fn reads_trace_launch_registration_file() {
-        let temp = tempdir().unwrap();
-        let registration_path = temp.path().join("trace-launch.json");
-        fs::write(
-            &registration_path,
-            r#"{"pid":4242,"launchId":"launch-1","bundleId":"sh.orbi.desktop"}"#,
-        )
-        .unwrap();
-
-        let registration = read_trace_launch_registration(&registration_path)
-            .unwrap()
-            .expect("registration should be present");
-        assert_eq!(registration.pid, 4242);
-        assert_eq!(registration.launch_id, "launch-1");
-        assert_eq!(registration.bundle_id, "sh.orbi.desktop");
-    }
-
-    #[test]
-    fn extracts_embedded_macos_ui_artifact_into_hashed_tool_directory() {
-        let temp = tempdir().unwrap();
-        let spec = EmbeddedMacosUiArtifactSpec {
-            name: "orbi-test-helper",
-            file_name: "helper",
-            bytes: b"embedded-helper",
-            override_env_var: "ORBI_INTERNAL_TEST_HELPER_PATH",
-            available: true,
-            unavailable_reason: "",
-        };
-        let cache_dir = temp.path().join("cache");
-        let tools_dir = super::embedded_macos_ui_artifact_dir(&cache_dir, &spec);
-
-        let artifact_path = ensure_embedded_macos_ui_artifact_in_dir(&tools_dir, &spec).unwrap();
-
-        assert_eq!(
-            artifact_path,
-            cache_dir
-                .join("macos-ui-artifacts")
-                .join(format!(
-                    "{}-{}",
-                    spec.name,
-                    embedded_macos_ui_artifact_hash(spec.bytes)
-                ))
-                .join("helper")
-        );
-        assert_eq!(fs::read(&artifact_path).unwrap(), spec.bytes);
-        assert!(artifact_path.exists());
-
-        #[cfg(unix)]
-        assert_ne!(
-            fs::metadata(&artifact_path).unwrap().permissions().mode() & 0o111,
-            0
-        );
-    }
-
-    #[test]
-    fn take_screenshot_uses_helper_window_capture_command() {
-        let temp = tempdir().unwrap();
-        let helper_path = temp.path().join("helper.sh");
-        let args_path = temp.path().join("helper-args.txt");
-        let screenshot_path = temp.path().join("artifacts").join("capture.png");
-
-        fs::write(
-            &helper_path,
-            format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\n",
-                args_path.display()
-            ),
-        )
-        .unwrap();
-        let mut permissions = fs::metadata(&helper_path).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&helper_path, permissions).unwrap();
-
-        let backend = MacosBackend {
-            helper_path,
-            bridge_dylib_path: temp.path().join("bridge.dylib"),
-            bundle_id: "sh.orbi.desktop".to_owned(),
-            bundle_path: Path::new("/tmp/Accord.app").to_path_buf(),
-            executable_path: Path::new("/tmp/Accord.app/Contents/MacOS/Accord").to_path_buf(),
-            selected_xcode: None,
-            verbose: false,
-            pinned_target_pid: Mutex::new(None),
-            launched_session: Mutex::new(None),
-            pending_trace_launch: Mutex::new(None),
-            last_tap_point: Mutex::new(None),
-            active_video: None,
-        };
-
-        backend.take_screenshot(&screenshot_path).unwrap();
-
-        let arguments = fs::read_to_string(args_path).unwrap();
-        assert_eq!(
-            arguments.lines().collect::<Vec<_>>(),
-            vec![
-                "screenshot-window",
-                "--bundle-id",
-                "sh.orbi.desktop",
-                "--output",
-                screenshot_path.to_str().unwrap(),
-            ]
-        );
-    }
-
-    #[test]
-    fn tap_point_routes_events_to_the_pinned_target_pid() {
-        let temp = tempdir().unwrap();
-        let helper_path = temp.path().join("helper.sh");
-        let args_path = temp.path().join("helper-args.txt");
-
-        fs::write(
-            &helper_path,
-            format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\n",
-                args_path.display()
-            ),
-        )
-        .unwrap();
-        let mut permissions = fs::metadata(&helper_path).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&helper_path, permissions).unwrap();
-
-        let backend = MacosBackend {
-            helper_path,
-            bridge_dylib_path: temp.path().join("bridge.dylib"),
-            bundle_id: "sh.orbi.desktop".to_owned(),
-            bundle_path: Path::new("/tmp/Accord.app").to_path_buf(),
-            executable_path: Path::new("/tmp/Accord.app/Contents/MacOS/Accord").to_path_buf(),
-            selected_xcode: None,
-            verbose: false,
-            pinned_target_pid: Mutex::new(Some(4242)),
-            launched_session: Mutex::new(None),
-            pending_trace_launch: Mutex::new(None),
-            last_tap_point: Mutex::new(None),
-            active_video: None,
-        };
-
-        backend.tap_point(12.0, 34.0, None).unwrap();
-
-        let arguments = fs::read_to_string(args_path).unwrap();
-        assert_eq!(
-            arguments.lines().collect::<Vec<_>>(),
-            vec!["tap", "--x", "12", "--y", "34", "--pid", "4242"]
-        );
-    }
-
-    #[test]
-    fn hover_point_routes_events_to_the_target_bundle() {
-        let temp = tempdir().unwrap();
-        let helper_path = temp.path().join("helper.sh");
-        let args_path = temp.path().join("helper-args.txt");
-
-        fs::write(
-            &helper_path,
-            format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\n",
-                args_path.display()
-            ),
-        )
-        .unwrap();
-        let mut permissions = fs::metadata(&helper_path).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&helper_path, permissions).unwrap();
-
-        let backend = MacosBackend {
-            helper_path,
-            bridge_dylib_path: temp.path().join("bridge.dylib"),
-            bundle_id: "sh.orbi.desktop".to_owned(),
-            bundle_path: Path::new("/tmp/Accord.app").to_path_buf(),
-            executable_path: Path::new("/tmp/Accord.app/Contents/MacOS/Accord").to_path_buf(),
-            selected_xcode: None,
-            verbose: false,
-            pinned_target_pid: Mutex::new(None),
-            launched_session: Mutex::new(None),
-            pending_trace_launch: Mutex::new(None),
-            last_tap_point: Mutex::new(None),
-            active_video: None,
-        };
-
-        backend.hover_point(90.0, 120.0).unwrap();
-
-        let arguments = fs::read_to_string(args_path).unwrap();
-        assert_eq!(
-            arguments.lines().collect::<Vec<_>>(),
-            vec![
-                "move",
-                "--x",
-                "90",
-                "--y",
-                "120",
-                "--bundle-id",
-                "sh.orbi.desktop",
-            ]
-        );
+fn direction_json(direction: UiSwipeDirection) -> &'static str {
+    match direction {
+        UiSwipeDirection::Left => "left",
+        UiSwipeDirection::Right => "right",
+        UiSwipeDirection::Up => "up",
+        UiSwipeDirection::Down => "down",
     }
 }

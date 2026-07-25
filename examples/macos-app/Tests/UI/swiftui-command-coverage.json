@@ -1,0 +1,193 @@
+{
+  "$schema": "../../../../schemas/orbi-ui-test.v1.json",
+  "appId": "dev.orbi.examples.macos",
+  "name": "macos-swiftui-command-coverage",
+  "steps": [
+    "launchApp",
+    {
+      "tapOn": "SwiftUI Coverage"
+    },
+    {
+      "assertVisible": {
+        "id": "swiftui-coverage-title"
+      }
+    },
+    {
+      "startRecording": "macos-swiftui-command-coverage"
+    },
+    {
+      "tapOn": {
+        "id": "swiftui-command-field"
+      }
+    },
+    {
+      "inputText": "Qux"
+    },
+    {
+      "assertVisible": "SwiftUI field value: Qux"
+    },
+    {
+      "pressKey": "!"
+    },
+    {
+      "assertVisible": "SwiftUI field value: Qux!"
+    },
+    {
+      "pressKeyCode": {
+        "keyCode": 51
+      }
+    },
+    {
+      "assertVisible": "SwiftUI field value: Qux"
+    },
+    {
+      "keySequence": [51]
+    },
+    {
+      "assertVisible": "SwiftUI field value: Qu"
+    },
+    {
+      "eraseText": 1
+    },
+    {
+      "assertVisible": "SwiftUI field value: Q"
+    },
+    {
+      "setClipboard": "ux"
+    },
+    "pasteText",
+    {
+      "assertVisible": "SwiftUI field value: Qux"
+    },
+    {
+      "copyTextFrom": {
+        "id": "swiftui-copy-source"
+      }
+    },
+    "pasteText",
+    {
+      "assertVisible": "SwiftUI field value: QuxSwiftUI copied value"
+    },
+    {
+      "tapOn": {
+        "id": "swiftui-tap-button"
+      }
+    },
+    {
+      "assertVisible": "SwiftUI tap recognized"
+    },
+    {
+      "doubleTapOn": {
+        "id": "swiftui-double-button"
+      }
+    },
+    {
+      "assertVisible": "SwiftUI double count 2"
+    },
+    {
+      "longPressOn": {
+        "element": {
+          "id": "swiftui-long-target"
+        },
+        "duration": "500ms"
+      }
+    },
+    {
+      "assertVisible": "SwiftUI long press recognized"
+    },
+    {
+      "hoverOn": {
+        "id": "swiftui-hover-target"
+      }
+    },
+    {
+      "assertVisible": "SwiftUI hover recognized"
+    },
+    {
+      "rightClickOn": {
+        "id": "swiftui-right-target"
+      }
+    },
+    {
+      "assertVisible": "SwiftUI right click recognized"
+    },
+    {
+      "dragAndDrop": {
+        "from": {
+          "id": "swiftui-drag-source"
+        },
+        "to": {
+          "id": "swiftui-drop-target"
+        },
+        "duration": "500ms",
+        "delta": 4
+      }
+    },
+    {
+      "assertVisible": "SwiftUI dropped swiftui-token"
+    },
+    {
+      "selectMenuItem": {
+        "from": {
+          "id": "swiftui-coverage-menu"
+        },
+        "item": "SwiftUI Menu Action"
+      }
+    },
+    {
+      "assertVisible": "SwiftUI menu selected"
+    },
+    {
+      "swipeOn": {
+        "element": {
+          "id": "swiftui-command-scroll"
+        },
+        "direction": "UP",
+        "duration": "500ms",
+        "delta": 4
+      }
+    },
+    {
+      "scrollOn": {
+        "element": {
+          "id": "swiftui-command-scroll"
+        },
+        "direction": "DOWN"
+      }
+    },
+    {
+      "scrollUntilVisible": {
+        "element": {
+          "id": "swiftui-scroll-footer"
+        },
+        "direction": "DOWN",
+        "timeout": "8s"
+      }
+    },
+    {
+      "assertVisible": {
+        "id": "swiftui-scroll-footer"
+      }
+    },
+    {
+      "assertNotVisible": "SwiftUI missing sentinel"
+    },
+    {
+      "extendedWaitUntil": {
+        "visible": {
+          "id": "swiftui-scroll-footer"
+        },
+        "notVisible": {
+          "text": "SwiftUI missing sentinel"
+        },
+        "timeout": "2s"
+      }
+    },
+    "waitForAnimationToEnd",
+    "hideKeyboard",
+    "stopRecording",
+    {
+      "takeScreenshot": "macos-swiftui-command-coverage"
+    }
+  ]
+}

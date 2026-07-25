@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
+use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -12,6 +13,7 @@ use super::super::{
     UiSwipeDirection, UiTravel,
 };
 use super::{ActiveVideoRecording, UiBackend};
+use crate::apple::profile::runtime_support::TRACE_DEFAULT_RELATIVE_OUTPUT;
 use crate::apple::simulator::{SimulatorDevice, select_simulator_device};
 use crate::apple::xcode::{SelectedXcode, xcrun_command};
 use crate::context::ProjectContext;
@@ -25,6 +27,36 @@ pub struct IosSimulatorBackend {
     bundle_id: String,
     active_video: Option<ActiveVideoRecording>,
     selected_xcode: Option<SelectedXcode>,
+    console_relay: Mutex<Option<SimulatorConsoleRelay>>,
+}
+
+struct SimulatorConsoleRelay {
+    child: Child,
+}
+
+impl SimulatorConsoleRelay {
+    fn start(command: &mut Command) -> Result<Self> {
+        command.stdin(Stdio::null());
+        command.stdout(Stdio::inherit());
+        command.stderr(Stdio::inherit());
+        let mut child = command
+            .spawn()
+            .context("failed to start simulator console relay")?;
+        thread::sleep(Duration::from_millis(250));
+        if let Some(status) = child.try_wait()?
+            && !status.success()
+        {
+            bail!("simulator launch console relay exited early with {status}");
+        }
+        Ok(Self { child })
+    }
+}
+
+impl Drop for SimulatorConsoleRelay {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
 
 impl IosSimulatorBackend {
@@ -46,6 +78,7 @@ impl IosSimulatorBackend {
             bundle_id: String::new(),
             active_video: None,
             selected_xcode: project.selected_xcode.clone(),
+            console_relay: Mutex::new(None),
         })
     }
 
@@ -106,6 +139,20 @@ impl IosSimulatorBackend {
         command.arg("--udid").arg(&self.device.udid);
         run_command(&mut command).with_context(super::idb_requirement_message)
     }
+
+    fn trace_file_path(&self, bundle_id: &str) -> Result<PathBuf> {
+        let mut command = xcrun_command(self.selected_xcode.as_ref());
+        command.args([
+            "simctl",
+            "get_app_container",
+            &self.device.udid,
+            bundle_id,
+            "data",
+        ]);
+        let container = command_output(&mut command)
+            .with_context(|| format!("failed to resolve simulator container for `{bundle_id}`"))?;
+        Ok(PathBuf::from(container.trim()).join(TRACE_DEFAULT_RELATIVE_OUTPUT))
+    }
 }
 
 impl UiBackend for IosSimulatorBackend {
@@ -141,16 +188,30 @@ impl UiBackend for IosSimulatorBackend {
         bundle_id: &str,
         stop_app: bool,
         arguments: &[(String, String)],
+        environment: &[(String, String)],
     ) -> Result<()> {
-        if stop_app {
-            self.stop_app(bundle_id)?;
+        if stop_app || !environment.is_empty() {
+            if stop_app {
+                self.stop_app(bundle_id)?;
+            }
             let mut command = xcrun_command(self.selected_xcode.as_ref());
-            command.args(["simctl", "launch", &self.device.udid, bundle_id]);
+            command.args([
+                "simctl",
+                "launch",
+                "--console-pty",
+                &self.device.udid,
+                bundle_id,
+            ]);
+            configure_simctl_child_environment(&mut command, environment);
             for (key, value) in arguments {
                 command.arg(format!("-{key}"));
                 command.arg(value);
             }
-            run_command_capture(&mut command).map(|_| ())
+            let relay = SimulatorConsoleRelay::start(&mut command)?;
+            if let Ok(mut active_relay) = self.console_relay.lock() {
+                *active_relay = Some(relay);
+            }
+            Ok(())
         } else {
             let mut command = Command::new("idb");
             command.args(["launch", "-f", bundle_id]);
@@ -167,6 +228,9 @@ impl UiBackend for IosSimulatorBackend {
         let mut command = xcrun_command(self.selected_xcode.as_ref());
         command.args(["simctl", "terminate", &self.device.udid, bundle_id]);
         let (success, stdout, stderr) = command_output_allow_failure(&mut command)?;
+        if let Ok(mut relay) = self.console_relay.lock() {
+            relay.take();
+        }
         if success {
             return Ok(());
         }
@@ -198,6 +262,32 @@ impl UiBackend for IosSimulatorBackend {
                 .context("bundle path contains invalid UTF-8")?,
         ]);
         run_command(&mut install)
+    }
+
+    fn remove_trace_file(&self, bundle_id: &str) -> Result<()> {
+        let path = self.trace_file_path(bundle_id)?;
+        match std::fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => {
+                Err(error).with_context(|| format!("failed to remove {}", path.display()))
+            }
+        }
+    }
+
+    fn collect_trace_file(&self, bundle_id: &str, destination: &Path) -> Result<()> {
+        let source = self.trace_file_path(bundle_id)?;
+        if let Some(parent) = destination.parent() {
+            ensure_dir(parent)?;
+        }
+        std::fs::copy(&source, destination).with_context(|| {
+            format!(
+                "failed to copy simulator trace {} to {}",
+                source.display(),
+                destination.display()
+            )
+        })?;
+        Ok(())
     }
 
     fn focus(&self) -> Result<()> {
@@ -689,6 +779,12 @@ impl UiBackend for IosSimulatorBackend {
             "timed out waiting for video recording to finish writing {}",
             recording.path.display()
         )
+    }
+}
+
+fn configure_simctl_child_environment(command: &mut Command, environment: &[(String, String)]) {
+    for (key, value) in environment {
+        command.env(format!("SIMCTL_CHILD_{key}"), value);
     }
 }
 

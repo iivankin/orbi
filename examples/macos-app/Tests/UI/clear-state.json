@@ -4,7 +4,11 @@
   "name": "macos-clear-state",
   "steps": [
     "clearState",
-    "launchApp",
+    {
+      "launchApp": {
+        "stopApp": false
+      }
+    },
     {
       "assertVisible": "Clean slate"
     },
@@ -17,12 +21,20 @@
       "assertVisible": "Persisted state restored"
     },
     "stopApp",
-    "launchApp",
+    {
+      "launchApp": {
+        "stopApp": false
+      }
+    },
     {
       "assertVisible": "Persisted state restored"
     },
     "clearState",
-    "launchApp",
+    {
+      "launchApp": {
+        "stopApp": false
+      }
+    },
     {
       "assertVisible": "Clean slate"
     },

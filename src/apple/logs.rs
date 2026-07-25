@@ -440,10 +440,25 @@ fn macos_inferior_message<'a>(line: &'a str, bundle_id: &str) -> &'a str {
     }
 
     if starts_with_timestamp(line) {
-        return "";
+        return macos_timestamped_log_message(line);
     }
 
     line
+}
+
+fn macos_timestamped_log_message(line: &str) -> &str {
+    let Some(process_marker) = line.find('[') else {
+        return "";
+    };
+    let after_process = &line[process_marker..];
+    let Some(after_pid_marker) = after_process.find("] ") else {
+        return "";
+    };
+    let message = &after_process[after_pid_marker + 2..];
+    if message.starts_with('[') {
+        return message.rsplit("] ").next().unwrap_or(message);
+    }
+    message
 }
 
 fn starts_with_timestamp(line: &str) -> bool {
@@ -460,6 +475,10 @@ fn is_macos_runtime_noise(line: &str) -> bool {
         || line.starts_with("os_unix.c:")
         || line.starts_with("cannot open file at line 51044")
         || line.contains("Unable to obtain a task name port right")
+        || line.contains("Unable to get synchronousRemoteObjectProxy")
+        || line.contains("Error registering app with intents framework")
+        || line.contains("Unable to re-register with Process Instance Registry")
+        || line.contains("Will NOT re-try to establish the connection")
         || line.contains("finishAndSendReply(), sendToModernProcess returned -609")
         || line.contains("AFIsDeviceGreymatterEligible Missing entitlements")
         || line.contains("[NSInputAnalytics didInsertText:] called without session beginning")
@@ -643,7 +662,7 @@ mod tests {
         let line = "2026-04-18 22:24:06.938478+0300 OrbiRunTrace1776540245_ExampleMacApp[31337:6482071] [app] ExampleMacApp launched\n";
         assert_eq!(
             filter_macos_inferior_line(line, "dev.orbi.examples.macos"),
-            None
+            Some("ExampleMacApp launched")
         );
     }
 

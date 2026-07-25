@@ -34,6 +34,7 @@ struct ExampleLandingView: View {
             )
             .onAppear {
                 Self.logger.notice("ExampleLandingView appeared")
+                print("ExampleLandingView print appeared")
             }
         }
     }

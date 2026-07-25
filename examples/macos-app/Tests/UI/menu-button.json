@@ -1,0 +1,25 @@
+{
+  "$schema": "../../../../schemas/orbi-ui-test.v1.json",
+  "appId": "dev.orbi.examples.macos",
+  "name": "macos-menu-button",
+  "steps": [
+    "launchApp",
+    {
+      "assertVisible": "Awaiting menu button action"
+    },
+    {
+      "selectMenuItem": {
+        "from": {
+          "id": "quick-actions-menu"
+        },
+        "item": "Confirm Default Action"
+      }
+    },
+    {
+      "assertVisible": "Menu button action triggered"
+    },
+    {
+      "takeScreenshot": "macos-menu-button"
+    }
+  ]
+}

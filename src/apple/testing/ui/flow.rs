@@ -189,10 +189,10 @@ fn commands_use_manual_recording(
                     return Ok(true);
                 }
             }
-            UiCommand::Repeat { commands, .. } | UiCommand::Retry { commands, .. } => {
-                if commands_use_manual_recording(flow_path, commands, visited)? {
-                    return Ok(true);
-                }
+            UiCommand::Repeat { commands, .. } | UiCommand::Retry { commands, .. }
+                if commands_use_manual_recording(flow_path, commands, visited)? =>
+            {
+                return Ok(true);
             }
             _ => {}
         }

@@ -4,10 +4,10 @@ use serde_json::json;
 
 use crate::support::{
     base_command, create_brew_idb_companion_install_mock, create_build_xcrun_mock,
-    create_fake_xcode_bundle, create_home, create_idb_mock, create_python3_fb_idb_install_mock,
-    create_runtime_download_xcodebuild_mock, create_runtime_installing_xcrun_mock,
-    create_ui_testing_workspace, format_failure_output, latest_ui_report_path, read_log,
-    run_and_capture, set_manifest_platforms, set_manifest_xcode,
+    create_fake_xcode_bundle, create_home, create_idb_mock, create_macos_ui_helper_mock,
+    create_python3_fb_idb_install_mock, create_runtime_download_xcodebuild_mock,
+    create_runtime_installing_xcrun_mock, create_ui_testing_workspace, format_failure_output,
+    latest_ui_report_path, read_log, run_and_capture, set_manifest_platforms, set_manifest_xcode,
 };
 use tempfile::tempdir;
 
@@ -38,7 +38,8 @@ fn orbi_test_runs_ui_flows_for_manifest_tests() {
     let log = read_log(&log_path);
     assert!(log.contains("xcrun simctl list devices available --json"));
     assert!(log.contains("xcrun simctl install IOS-UDID"));
-    assert!(log.contains("xcrun simctl launch IOS-UDID dev.orbi.fixture.ui"));
+    assert!(log.contains("xcrun simctl launch --console-pty"));
+    assert!(log.contains("IOS-UDID dev.orbi.fixture.ui"));
     assert!(log.contains("idb launch -f dev.orbi.fixture.ui -onboardingComplete true -seedUser qa@example.com --udid IOS-UDID"));
     assert!(log.contains("idb clear-keychain --udid IOS-UDID"));
     assert!(log.contains("idb uninstall dev.orbi.fixture.ui --udid IOS-UDID"));
@@ -135,39 +136,7 @@ fn orbi_ui_init_writes_json_flow_template() {
 }
 
 #[test]
-fn orbi_test_ui_trace_fails_on_ios_simulator() {
-    let temp = tempdir().unwrap();
-    let home = create_home(temp.path());
-    let mock_bin = temp.path().join("mock-bin");
-    let log_path = temp.path().join("mock.log");
-    fs::create_dir_all(&mock_bin).unwrap();
-    let workspace = create_ui_testing_workspace(temp.path());
-
-    let mut command = base_command(&workspace, &home, &mock_bin, &log_path);
-    command.args([
-        "--non-interactive",
-        "test",
-        "--ui",
-        "--platform",
-        "ios",
-        "--trace",
-        "memory",
-    ]);
-    let output = run_and_capture(&mut command);
-    assert!(!output.status.success());
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("simulator profiling is currently unavailable"));
-    assert!(stderr.contains("xctrace/InstrumentsCLI simulator path is unstable"));
-
-    let log = read_log(&log_path);
-    assert!(!log.contains("xcrun simctl install"));
-    assert!(!log.contains("idb launch"));
-    assert!(!log.contains("xcrun xctrace record"));
-}
-
-#[test]
-fn orbi_test_ui_trace_advances_past_macos_relaunch_planning() {
+fn orbi_test_runs_macos_ui_flow_with_background_semantic_helper() {
     let temp = tempdir().unwrap();
     let home = create_home(temp.path());
     let mock_bin = temp.path().join("mock-bin");
@@ -175,6 +144,76 @@ fn orbi_test_ui_trace_advances_past_macos_relaunch_planning() {
     let log_path = temp.path().join("mock.log");
     fs::create_dir_all(&mock_bin).unwrap();
     create_build_xcrun_mock(&mock_bin, &sdk_root);
+    let helper = create_macos_ui_helper_mock(&mock_bin);
+    let workspace = create_ui_testing_workspace(temp.path());
+    set_manifest_platforms(
+        workspace.join("orbi.json").as_path(),
+        json!({
+            "macos": "15.0"
+        }),
+    );
+    let flow = "{\n  \"$schema\": \"/tmp/.orbi/schemas/orbi-ui-test.v1.json\",\n  \"steps\": [\n    \"launchApp\",\n    {\n      \"startRecording\": \"after-login-video\"\n    },\n    {\n      \"assertVisible\": \"Continue\"\n    },\n    {\n      \"tapOn\": \"Continue\"\n    },\n    {\n      \"inputText\": \"hello orbi\"\n    },\n    {\n      \"selectMenuItem\": [\"Automation\", \"Trigger Shortcut\"]\n    },\n    \"stopRecording\",\n    {\n      \"takeScreenshot\": \"after-login\"\n    }\n  ]\n}\n";
+    fs::write(workspace.join("Tests/UI/advanced.json"), flow).unwrap();
+    fs::write(workspace.join("Tests/UI/login.json"), flow).unwrap();
+
+    let mut command = base_command(&workspace, &home, &mock_bin, &log_path);
+    command.env("ORBI_INTERNAL_MACOS_UI_HELPER_PATH", helper);
+    command.args(["--non-interactive", "test", "--ui", "--platform", "macos"]);
+    let output = run_and_capture(&mut command);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "{}",
+        format_failure_output(&stderr)
+    );
+
+    let log = read_log(&log_path);
+    assert!(log.contains("macos-helper checkPermissions"));
+    assert!(log.contains("open "));
+    assert!(log.contains("macos-helper waitForApp"));
+    assert!(log.contains("macos-helper describeAll"));
+    assert!(log.contains("macos-helper activateSelector"));
+    assert!(log.contains("macos-helper inputText"));
+    assert!(log.contains("macos-helper selectMenuItem"));
+    assert!(log.contains("macos-helper takeScreenshot"));
+    assert!(log.contains("macos-helper startVideoRecording"));
+    assert!(log.contains("macos-helper stopVideoRecording"));
+    assert!(!log.contains("macos-helper tapPoint"));
+    assert!(!log.contains("xcrun xctrace record"));
+
+    let report_path = latest_ui_report_path(workspace.join(".orbi/tests/ui").as_path());
+    let report = fs::read_to_string(&report_path).unwrap();
+    assert!(report.contains("orbi-ax-macos"));
+    assert!(report.contains("\"status\": \"passed\""));
+
+    let screenshot_path = report_path
+        .parent()
+        .unwrap()
+        .join("artifacts")
+        .join("after-login.png");
+    assert!(
+        screenshot_path.exists(),
+        "missing {}",
+        screenshot_path.display()
+    );
+    let video_path = report_path
+        .parent()
+        .unwrap()
+        .join("artifacts")
+        .join("after-login-video.mp4");
+    assert!(video_path.exists(), "missing {}", video_path.display());
+}
+
+#[test]
+fn orbi_test_runs_macos_ui_flow_with_orbi_trace_runtime() {
+    let temp = tempdir().unwrap();
+    let home = create_home(temp.path());
+    let mock_bin = temp.path().join("mock-bin");
+    let sdk_root = temp.path().join("sdk-root");
+    let log_path = temp.path().join("mock.log");
+    fs::create_dir_all(&mock_bin).unwrap();
+    create_build_xcrun_mock(&mock_bin, &sdk_root);
+    let helper = create_macos_ui_helper_mock(&mock_bin);
     let workspace = create_ui_testing_workspace(temp.path());
     set_manifest_platforms(
         workspace.join("orbi.json").as_path(),
@@ -183,17 +222,13 @@ fn orbi_test_ui_trace_advances_past_macos_relaunch_planning() {
         }),
     );
     fs::write(
-        workspace.join("Tests/UI/advanced.json"),
-        "{\n  \"$schema\": \"/tmp/.orbi/schemas/orbi-ui-test.v1.json\",\n  \"steps\": [\n    \"launchApp\",\n    {\n      \"assertVisible\": \"Continue\"\n    }\n  ]\n}\n",
-    )
-    .unwrap();
-    fs::write(
         workspace.join("Tests/UI/login.json"),
-        "{\n  \"$schema\": \"/tmp/.orbi/schemas/orbi-ui-test.v1.json\",\n  \"steps\": [\n    \"launchApp\",\n    {\n      \"assertVisible\": \"Continue\"\n    }\n  ]\n}\n",
+        "{\n  \"$schema\": \"/tmp/.orbi/schemas/orbi-ui-test.v1.json\",\n  \"appId\": \"dev.orbi.fixture.ui\",\n  \"name\": \"Login\",\n  \"steps\": [\n    \"launchApp\",\n    {\n      \"assertVisible\": \"Continue\"\n    }\n  ]\n}\n",
     )
     .unwrap();
 
     let mut command = base_command(&workspace, &home, &mock_bin, &log_path);
+    command.env("ORBI_INTERNAL_MACOS_UI_HELPER_PATH", helper);
     command.args([
         "--non-interactive",
         "test",
@@ -201,48 +236,42 @@ fn orbi_test_ui_trace_advances_past_macos_relaunch_planning() {
         "--platform",
         "macos",
         "--trace",
-        "cpu",
+        "--flow",
+        "login",
     ]);
     let output = run_and_capture(&mut command);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(!output.status.success());
     assert!(
-        !stderr.contains("only one `launchApp`"),
+        output.status.success(),
         "{}",
         format_failure_output(&stderr)
     );
-
-    let report_root = workspace.join(".orbi/tests/ui");
-    assert!(
-        report_root.exists(),
-        "missing UI test report root: {}",
-        format_failure_output(&stderr)
-    );
-    let report_path = latest_ui_report_path(report_root.as_path());
-    let report = fs::read_to_string(&report_path).unwrap();
-    assert!(report.contains("\"command\": \"launchApp\""));
-    assert!(report.contains("\"error\": \"could not find `Continue`"));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("trace: "));
 
     let log = read_log(&log_path);
-    assert!(log.contains("xcrun xctrace record --template Time Profiler"));
+    assert!(log.contains("open "));
+    assert!(log.contains("macos-helper waitForApp"));
+    assert!(log.contains("ORBI_TRACE_MODE"));
+    assert!(log.contains("ORBI_TRACE_OUTPUT"));
+    assert!(!log.contains("xcrun xctrace record"));
 
-    let profiles_dir = workspace.join(".orbi/artifacts/profiles");
-    let trace_count = fs::read_dir(&profiles_dir)
+    let traces_dir = workspace.join(".orbi/artifacts/profiles");
+    let trace_paths = fs::read_dir(&traces_dir)
         .unwrap()
-        .filter_map(Result::ok)
-        .filter(|entry| {
-            entry
-                .path()
-                .extension()
-                .and_then(|value| value.to_str())
-                .is_some_and(|extension| extension == "trace")
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.extension().and_then(|value| value.to_str()) == Some("json")
+                && path
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .is_some_and(|name| name.ends_with(".orbitrace.json"))
         })
-        .count();
-    assert!(
-        trace_count >= 2,
-        "expected at least 2 trace bundles in {}",
-        profiles_dir.display()
-    );
+        .collect::<Vec<_>>();
+    assert_eq!(trace_paths.len(), 1);
+    let trace = fs::read_to_string(&trace_paths[0]).unwrap();
+    assert!(trace.contains("\"format\":\"orbi.trace.v1\""));
+    assert!(trace.contains("\"mode\":\"cpu\""));
 }
 
 #[test]
@@ -442,7 +471,8 @@ fn orbi_ui_action_commands_forward_to_runner_and_idb() {
     let log = read_log(&log_path);
     assert!(log.contains("xcrun simctl list devices available --json"));
     assert!(log.contains("xcrun simctl install IOS-UDID"));
-    assert!(log.contains("xcrun simctl launch IOS-UDID dev.orbi.fixture.ui"));
+    assert!(log.contains("xcrun simctl launch --console-pty"));
+    assert!(log.contains("IOS-UDID dev.orbi.fixture.ui"));
     assert!(log.contains("idb focus --udid IOS-UDID"));
     assert!(log.contains("idb ui describe-all --udid IOS-UDID"));
     assert!(log.contains("idb ui tap 140 142 --udid IOS-UDID"));

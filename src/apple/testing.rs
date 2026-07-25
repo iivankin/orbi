@@ -8,9 +8,14 @@ use anyhow::{Context, Result, bail};
 pub(crate) mod ui;
 
 use crate::apple::build::external::resolve_swift_package_dependency;
+use crate::apple::build::toolchain::{DestinationKind, Toolchain};
+use crate::apple::profile::runtime_support::compile_trace_runtime_library;
+use crate::apple::runtime::profile_for_run;
 use crate::cli::TestArgs;
 use crate::context::ProjectContext;
-use crate::manifest::{ApplePlatform, SwiftPackageDependency, SwiftPackageSource, TargetManifest};
+use crate::manifest::{
+    ApplePlatform, SwiftPackageDependency, SwiftPackageSource, TargetKind, TargetManifest,
+};
 use crate::util::{
     collect_files_with_extensions, ensure_dir, print_success, resolve_path, run_command,
 };
@@ -40,13 +45,14 @@ pub fn run_tests(project: &ProjectContext, args: &TestArgs) -> Result<()> {
 
     let package = materialize_swift_testing_package(project, root_target, unit_tests)?;
     if let Some(kind) = args.trace {
+        let launch_environment = swift_testing_trace_environment(project, &package, kind)?;
         let trace = crate::apple::profile::start_optional_launched_command_trace(
             &project.root,
             project.selected_xcode.as_ref(),
             project.app.interactive,
             Some(kind),
             &swift_testing_command(&package),
-            &[],
+            &launch_environment,
             None,
         )?
         .expect("trace kind should produce a launched trace");
@@ -60,6 +66,31 @@ pub fn run_tests(project: &ProjectContext, args: &TestArgs) -> Result<()> {
         unit_tests.len()
     ));
     Ok(())
+}
+
+fn swift_testing_trace_environment(
+    project: &ProjectContext,
+    package: &GeneratedSwiftTestingPackage,
+    kind: crate::cli::ProfileKind,
+) -> Result<Vec<(String, String)>> {
+    let toolchain = Toolchain::resolve(
+        ApplePlatform::Macos,
+        swift_testing_macos_deployment_target(project),
+        DestinationKind::Device,
+        project.selected_xcode.as_ref(),
+    )?;
+    let profile = profile_for_run();
+    let runtime = compile_trace_runtime_library(
+        &toolchain,
+        &profile,
+        TargetKind::Executable,
+        &package.cache_path.join("trace-runtime"),
+        kind,
+    )?;
+    Ok(vec![(
+        "DYLD_INSERT_LIBRARIES".to_owned(),
+        runtime.dylib_path.display().to_string(),
+    )])
 }
 
 #[derive(Debug, Clone)]

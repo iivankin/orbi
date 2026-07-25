@@ -864,7 +864,7 @@ fn resolve_submit_receipt(
         requested_distribution,
     )?;
     receipts.retain(|receipt| receipt.submit_eligible);
-    receipts.sort_by(|left, right| right.created_at_unix.cmp(&left.created_at_unix));
+    receipts.sort_by_key(|receipt| std::cmp::Reverse(receipt.created_at_unix));
     if receipts.is_empty() {
         bail!("could not find a submit-eligible build receipt");
     }

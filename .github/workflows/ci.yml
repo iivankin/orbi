@@ -28,6 +28,9 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - name: Validate schema references
+        run: python3 tools/validate-schema-refs.py schemas/*.json
+
       - name: Format check
         run: cargo fmt --all --check
 

@@ -1,24 +1,17 @@
-mod export;
 mod inspect;
 mod recording;
+pub(crate) mod runtime_support;
+mod symbolicate;
 
 use crate::cli::ProfileKind;
 
 pub use self::inspect::inspect_trace_command;
 pub(crate) use self::recording::{
-    TraceRecording, ensure_simulator_profiling_supported, finish_started_trace,
-    start_optional_launched_command_trace, start_optional_launched_process_trace,
-    wait_for_launched_trace_exit,
+    default_trace_output, ensure_simulator_profiling_supported,
+    start_optional_launched_command_trace, trace_launch_environment, wait_for_launched_trace_exit,
 };
 
 impl ProfileKind {
-    pub(crate) fn trace_template(self) -> &'static str {
-        match self {
-            Self::Cpu => "Time Profiler",
-            Self::Memory => "Allocations",
-        }
-    }
-
     pub(crate) fn trace_label(self) -> &'static str {
         match self {
             Self::Cpu => "CPU",

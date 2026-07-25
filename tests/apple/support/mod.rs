@@ -23,9 +23,9 @@ pub use self::crypto::create_api_key;
 pub use self::tool_mocks::{
     create_brew_idb_companion_install_mock, create_build_xcrun_mock, create_codesign_mock,
     create_ditto_mock, create_hdiutil_mock, create_idb_mock, create_lldb_attach_mock,
-    create_passthrough_mock, create_python3_fb_idb_install_mock, create_quality_swift_mock,
-    create_security_mock, create_sw_vers_mock, create_testing_swift_mock, create_watch_xcrun_mock,
-    create_xcodebuild_mock,
+    create_macos_ui_helper_mock, create_passthrough_mock, create_python3_fb_idb_install_mock,
+    create_quality_swift_mock, create_security_mock, create_sw_vers_mock,
+    create_testing_swift_mock, create_watch_xcrun_mock, create_xcodebuild_mock,
 };
 pub use self::ui_helpers::{
     create_fake_xcode_bundle, create_runtime_download_xcodebuild_mock,
